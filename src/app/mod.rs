@@ -87,7 +87,7 @@ const CARD_KEEP_ROWS: i32 = 5;
 /// Only bounds the visible+prefetch window (a few dozen tiles), not the whole library, so
 /// it can be much higher than the original whole-library concern without reintroducing
 /// the freeze. Raised from 3, which took 7-10 frames to fill a 20-30 card window.
-const CARD_BUILD_BUDGET: usize = 10;
+const CARD_BUILD_BUDGET: usize = 2;
 
 /// How long the loading spinner waits for the whole window to become art-ready before
 /// revealing anyway — a fetch that fails (rather than being merely slow) never becomes
@@ -366,6 +366,9 @@ pub struct App {
     /// GPU-texture-building step is needed here.
     pub art: std::collections::HashMap<String, Pixmap>,
     pub(crate) art_loader: Option<crate::art::ArtLoader>,
+    /// The grid's current card size, refreshed every `prepare_tiles` call — read by
+    /// `select_host`'s `ArtLoader::spawn` so covers arrive pre-stretched to fit.
+    pub(crate) card_size: (u32, u32),
     pub(crate) pending_launch: Option<PendingLaunch>,
     /// Set by `drain_launch_check` on success — `main.rs` picks it up via
     /// `take_ready_launch` and starts the stream. Separate from `pending_launch`
@@ -512,9 +515,10 @@ pub struct App {
     /// The static "No host selected" hint line.
     pub(crate) nohost_tile: Option<Painter>,
     /// Whether the grid's initial build for the current library has finished — while
-    /// `false`, the grid shows [`Tile::Spinner`] instead of popping cards in one by one.
-    /// One-shot per library: only `prepare_tiles`'s full-reset branch sets it `false`
-    /// again; later scrolling into a fresh row does not.
+    /// `false`, the grid shows the loading spinner (`Tile::Spinner`) instead of
+    /// popping cards in one by one. One-shot per library: only `prepare_tiles`'s
+    /// full-reset branch sets it `false` again; later scrolling into a fresh row
+    /// does not.
     pub(crate) grid_reveal_ready: bool,
     /// The rasterized spinner tile, rebuilt every tick it's shown.
     pub(crate) spinner_tile: Option<Painter>,
@@ -597,6 +601,7 @@ impl App {
             home_status: None,
             art: std::collections::HashMap::new(),
             art_loader: None,
+            card_size: (0, 0),
             pending_launch: None,
             launch_ready: None,
             settings: store::load_settings(),
@@ -1152,6 +1157,7 @@ impl App {
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         let columns = ui::grid_columns(available_w);
         let (card_w, card_h) = ui::grid_card_size(available_w, columns);
+        self.card_size = (card_w, card_h);
 
         // Screen transitions are detected centrally here (rather than at every
         // `self.screen = ...` site): opening a modal starts its fade-in and

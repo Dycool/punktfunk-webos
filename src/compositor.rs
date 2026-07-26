@@ -67,7 +67,10 @@ pub enum Tile {
     /// content itself changes (a value/dropdown, or About's window
     /// recentering), never when the list merely scrolls within it.
     ScrollContent(Screen),
-    /// The loading spinner shown over the grid while it fills in (`ui::render_spinner_tile`).
+    /// The loading spinner shown over the grid while it fills in
+    /// (`ui::render_spinner_tile`) — rebuilt every tick it's shown, but that's just
+    /// an index pick + small `Pixmap` copy (frames are decoded at build time), so
+    /// one reused tile is cheap enough.
     Spinner,
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
     StatsOverlay,
