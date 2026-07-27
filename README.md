@@ -82,6 +82,8 @@ QEMU). Run `task --list` for everything.
 | `task deploy TV_HOST=... TELEMETRY=auto` | Same, but streams the app's logs live to this machine instead of a file on-device |
 | `task clean` | Remove build output and caches |
 
+**Build optimization**: Dev builds use thin LTO for speed (~2-3x faster iteration). For final release builds optimized for weak TV hardware, append `RELEASE_LTO=fat` to any build task: `task package RELEASE_LTO=fat` or `task deploy TV_HOST=... RELEASE_LTO=fat`.
+
 Set `TV_HOST` once in a local `.env` (copy `.env.example`) to skip typing it each time. Architecture
 and on-device gotchas live in [`docs/NOTES.md`](docs/NOTES.md) and `CLAUDE.md`.
 

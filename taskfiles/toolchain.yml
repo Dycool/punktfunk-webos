@@ -7,6 +7,7 @@ vars:
   SDL2_BACKPORT_RELEASE: release-2.30.12-webos.5
   SDL2_BACKPORT_VERSION: 2.30.12
   SDL2_BACKPORT_SONAME: libSDL2-2.0.so.0.3000.12
+  RELEASE_LTO: 'thin'
   DOCKER_MOUNTS: >-
     -v {{.ROOT_DIR}}:/workspace
     -v punktfunk-webos-toolchains:/workspace/.toolchains
@@ -139,9 +140,13 @@ tasks:
     internal: true
     requires:
       vars: [TARGET_TASK]
+    vars:
+      CODEGEN_UNITS: '{{if eq .RELEASE_LTO "fat"}}1{{else}}16{{end}}'
     cmds:
       - >-
         docker run --rm --platform linux/arm64 -e DEBIAN_FRONTEND=noninteractive
+        -e CARGO_PROFILE_RELEASE_LTO={{.RELEASE_LTO}}
+        -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS={{.CODEGEN_UNITS}}
         {{.DOCKER_MOUNTS}} {{.RUST_IMAGE}}
         sh -c '
           apt-get update -qq &&

@@ -39,10 +39,12 @@ vars:
 
 tasks:
   build:
-    desc: Cross-compile the release binary, inside Docker — the local dev entry point
+    desc: Cross-compile the release binary, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized build.
     cmds:
       - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:build}
+        vars:
+          TARGET_TASK: native:build
+          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
 
   check:
     desc: Quick cross-target `cargo check`, inside Docker — the local dev entry point
@@ -51,10 +53,12 @@ tasks:
         vars: {TARGET_TASK: native:check}
 
   package:
-    desc: Build and package dist/*.ipk, inside Docker — this is the one you usually want
+    desc: Build and package dist/*.ipk, inside Docker with thin LTO (fast). Override with RELEASE_LTO=fat for optimized.
     cmds:
       - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:package}
+        vars:
+          TARGET_TASK: native:package
+          RELEASE_LTO: '{{.RELEASE_LTO | default "thin"}}'
 
   lint:
     desc: Cross-target `cargo clippy` (the lint set in Cargo.toml's `[lints.clippy]`), inside Docker
@@ -181,6 +185,5 @@ tasks:
   clean:
     desc: Remove everything — dist/, .toolchains/, target/, and the Docker volumes
     cmds:
-      - rm -rf dist
-      - rm -rf .toolchains target
+      - rm -rf ./dist ./.toolchains ./target
       - docker volume rm -f punktfunk-webos-toolchains punktfunk-webos-target punktfunk-webos-cargo punktfunk-webos-apt-cache punktfunk-webos-apt-lists punktfunk-webos-tools

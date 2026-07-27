@@ -107,9 +107,9 @@ libc = "0.2"
 # reassembly, QUIC/packet parsing — all live in punktfunk-core and its deps, not this
 # crate, so cargo's defaults (no cross-crate LTO, 16 codegen units) leave the
 # optimizer unable to inline across exactly the boundaries that matter on this
-# hardware. Fat LTO + one codegen unit costs build time (the deploy loop already runs
-# in Docker; drop to lto = "thin" if it ever gets painful) in exchange for the best
-# codegen the pinned toolchain can produce — this directly cheapens today's software
-# AES path and the ChaCha20-Poly1305 one planned to replace it.
+# hardware. Fat LTO + one codegen unit costs build time (drop to lto = "thin" for
+# faster iteration in dev) in exchange for the best codegen the pinned toolchain can
+# produce — this directly cheapens today's software AES path and the ChaCha20-Poly1305
+# one planned to replace it.
 lto = "fat"
 codegen-units = 1
