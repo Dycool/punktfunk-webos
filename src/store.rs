@@ -47,6 +47,41 @@ pub struct KnownHost {
     /// can't be woken, so `app.rs` falls back to the plain unreachable message.
     #[serde(default)]
     pub mac: Vec<String>,
+    /// Up to `MAX_PINNED_GAMES` pinned `GameEntry::id`s for this host, in pin order.
+    /// `#[serde(default)]` so an older `known-hosts.json` still loads.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+}
+
+/// Max games pinned to one host's always-visible grid row at once.
+pub const MAX_PINNED_GAMES: usize = 5;
+
+/// The pin id for the "Desktop" card — not a `GameEntry::id`, but stored in
+/// `KnownHost::pinned` the same way so Desktop can be pinned/unpinned with the
+/// same hold-OK gesture as any game, and counts toward the same
+/// `MAX_PINNED_GAMES` cap. Pinned on a newly added host (see `addhost.rs`).
+pub const DESKTOP_PIN_ID: &str = "__desktop__";
+
+impl KnownHost {
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.pinned.iter().any(|p| p == id)
+    }
+
+    /// Whether toggling `id` would do anything: unpinning always can, pinning
+    /// only under `MAX_PINNED_GAMES`.
+    pub fn can_toggle_pin(&self, id: &str) -> bool {
+        self.is_pinned(id) || self.pinned.len() < MAX_PINNED_GAMES
+    }
+
+    /// Toggles `id`'s pinned state (a `GameEntry::id`, or `DESKTOP_PIN_ID`) —
+    /// a no-op when `can_toggle_pin` is false.
+    pub fn toggle_pin(&mut self, id: &str) {
+        match self.pinned.iter().position(|p| p == id) {
+            Some(i) => drop(self.pinned.remove(i)),
+            None if self.can_toggle_pin(id) => self.pinned.push(id.to_string()),
+            None => {}
+        }
+    }
 }
 
 fn known_hosts_path() -> PathBuf {
@@ -79,7 +114,9 @@ pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
 /// Upserts by `(host, port)`, keeping the existing fingerprint if the new record
 /// doesn't have one (a fresh mDNS discovery shouldn't clobber a paired fingerprint) —
 /// same reasoning for `mac`, learned separately (see `App::drain_discovery`) and not
-/// necessarily known again at the point something else re-upserts this host.
+/// necessarily known again at the point something else re-upserts this host. `pinned`
+/// is *always* kept from the existing record — only `KnownHost::toggle_pin` ever
+/// changes it, so no add/edit/re-pair flow may clobber it.
 pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
     if let Some(existing) = hosts.iter_mut().find(|h| h.host == new.host && h.port == new.port) {
         if new.fingerprint.is_none() {
@@ -88,6 +125,7 @@ pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
         if new.mac.is_empty() {
             new.mac.clone_from(&existing.mac);
         }
+        new.pinned.clone_from(&existing.pinned);
         *existing = new;
     } else {
         hosts.push(new);

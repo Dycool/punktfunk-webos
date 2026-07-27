@@ -4,7 +4,7 @@
 //! Split out of the former single-file `app.rs`; see `super`'s module docs.
 use super::*;
 use crate::store::{self};
-use crate::ui::{self, AddHostState, HostEntry, MenuEvent};
+use crate::ui::{self, AddHostState, HostEntry, MenuEvent, TextCache};
 use std::time::Instant;
 
 impl App {
@@ -13,15 +13,71 @@ impl App {
         self.entries.len() + 2
     }
 
-    /// Total grid nav positions: "Desktop" (only once `games_loaded`) + fetched
-    /// games. `0` (no cards at all) only when no host is selected yet, or one's
-    /// selected but hasn't answered a library fetch yet.
-    pub(crate) fn grid_len(&self) -> usize {
-        if self.selected_host.is_some() {
-            self.card_offset() + self.games.len()
-        } else {
+    /// The grid's shape at `columns` columns — see `GridLayout`. Cheap, but not
+    /// free (it scans `known_hosts` for the pin list), so a caller mapping many
+    /// indices should build it once rather than go through the `App` helpers
+    /// below.
+    pub(crate) fn grid_layout(&self, columns: usize) -> GridLayout {
+        let desktop_pinned = self.games_loaded
+            && self
+                .selected_known_host()
+                .is_some_and(|h| h.is_pinned(store::DESKTOP_PIN_ID));
+        let front_count = self.pinned_count + usize::from(desktop_pinned);
+        let pinned_rows = if front_count == 0 {
             0
+        } else {
+            front_count.div_ceil(columns.max(1))
+        };
+        GridLayout {
+            pinned_count: self.pinned_count,
+            desktop_pinned,
+            desktop_in_rest: self.games_loaded && !desktop_pinned,
+            front_count,
+            pinned_rows,
+            unpinned_start: pinned_rows * columns.max(1),
         }
+    }
+
+    /// Total grid nav positions — `0` (no cards at all) only when no host is
+    /// selected yet, or one's selected but hasn't answered a library fetch yet.
+    pub(crate) fn grid_len(&self, columns: usize) -> usize {
+        if self.selected_host.is_none() {
+            return 0;
+        }
+        self.grid_layout(columns).len(self.games.len())
+    }
+
+    pub(crate) fn pinned_rows(&self, columns: usize) -> usize {
+        self.grid_layout(columns).pinned_rows
+    }
+
+    /// The card at grid index `idx`, or `None` for the padding after a partial
+    /// pinned row, or out of range.
+    pub(crate) fn grid_card_at(&self, idx: usize, columns: usize) -> Option<GridCard<'_>> {
+        self.grid_layout(columns).card_at(&self.games, idx)
+    }
+
+    /// The pin id for whatever's at grid index `idx` — a `GameEntry::id`, or
+    /// `store::DESKTOP_PIN_ID` for "Desktop" — `None` for the padding after a
+    /// partial pinned row, or out of range.
+    pub(crate) fn pin_id_at_grid_idx(&self, idx: usize, columns: usize) -> Option<&str> {
+        match self.grid_card_at(idx, columns)? {
+            GridCard::Desktop => Some(store::DESKTOP_PIN_ID),
+            GridCard::Game(g) => Some(g.id.as_str()),
+        }
+    }
+
+    /// The inverse of `pin_id_at_grid_idx`: the grid index for pin id `id`
+    /// right now, used to keep focus on whatever was just pinned/unpinned even
+    /// though its index may have just changed under it.
+    pub(crate) fn grid_idx_for_pin_id(&self, id: &str, columns: usize) -> Option<usize> {
+        self.grid_layout(columns).idx_for_pin_id(&self.games, id)
+    }
+
+    /// Whether grid index `idx` is an actual card rather than empty padding
+    /// after a partial pinned row.
+    pub(crate) fn is_grid_card(&self, idx: usize, columns: usize) -> bool {
+        self.grid_card_at(idx, columns).is_some()
     }
 
     pub(crate) fn sidebar_index_for_selected(&self) -> usize {
@@ -48,38 +104,42 @@ impl App {
     /// `ConnectTarget` when a grid card is confirmed.
     pub fn handle_home_event(&mut self, ev: MenuEvent, screen_w: u32, screen_h: u32) -> Option<ConnectTarget> {
         let sidebar_len = self.sidebar_len();
-        let grid_len = self.grid_len();
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
         let columns = ui::grid_columns(available_w);
+        let grid_len = self.grid_len(columns);
 
         match ev {
-            MenuEvent::Up => match &mut self.home_focus {
-                HomeFocus::Sidebar(i) => *i = if *i == 0 { sidebar_len - 1 } else { *i - 1 },
+            MenuEvent::Up => match self.home_focus {
+                HomeFocus::Sidebar(i) => {
+                    self.home_focus = HomeFocus::Sidebar(if i == 0 { sidebar_len - 1 } else { i - 1 });
+                }
                 // Walking up the ⋯ column stays on it while the row above is still a
                 // host row; stepping off the top of the host list falls back to the row
                 // itself, since the utility rows have no actions button.
                 HomeFocus::SidebarMenu(i) => {
-                    let next = if *i == 0 { sidebar_len - 1 } else { *i - 1 };
+                    let next = if i == 0 { sidebar_len - 1 } else { i - 1 };
                     self.home_focus = Self::sidebar_focus_for(next, self.entries.len(), true);
                 }
                 HomeFocus::Grid(i) => {
-                    if *i >= columns {
-                        *i -= columns;
-                        let i = *i;
-                        self.ensure_grid_visible(i, columns, screen_w, screen_h);
+                    // The cell directly above can be empty padding after a partial
+                    // pinned row (see `is_grid_card`) — nothing to land on there.
+                    if i >= columns && self.is_grid_card(i - columns, columns) {
+                        let next = i - columns;
+                        self.home_focus = HomeFocus::Grid(next);
+                        self.ensure_grid_visible(next, columns, screen_w, screen_h);
                     }
                 }
             },
-            MenuEvent::Down => match &mut self.home_focus {
-                HomeFocus::Sidebar(i) => *i = (*i + 1) % sidebar_len,
+            MenuEvent::Down => match self.home_focus {
+                HomeFocus::Sidebar(i) => self.home_focus = HomeFocus::Sidebar((i + 1) % sidebar_len),
                 HomeFocus::SidebarMenu(i) => {
-                    let next = (*i + 1) % sidebar_len;
+                    let next = (i + 1) % sidebar_len;
                     self.home_focus = Self::sidebar_focus_for(next, self.entries.len(), true);
                 }
                 HomeFocus::Grid(i) => {
-                    let next = *i + columns;
-                    if next < grid_len {
-                        *i = next;
+                    let next = i + columns;
+                    if next < grid_len && self.is_grid_card(next, columns) {
+                        self.home_focus = HomeFocus::Grid(next);
                         self.ensure_grid_visible(next, columns, screen_w, screen_h);
                     }
                 }
@@ -110,7 +170,9 @@ impl App {
                     }
                 }
                 HomeFocus::Grid(i) => {
-                    if (i + 1) % columns != 0 && i + 1 < grid_len {
+                    // The next cell can be empty padding after a partial pinned row
+                    // (see `is_grid_card`) — nothing to land on there.
+                    if (i + 1) % columns != 0 && i + 1 < grid_len && self.is_grid_card(i + 1, columns) {
                         self.home_focus = HomeFocus::Grid(i + 1);
                         self.ensure_grid_visible(i + 1, columns, screen_w, screen_h);
                     }
@@ -132,7 +194,7 @@ impl App {
                     self.content_window = ui::ContentWindow::new();
                 }
                 HomeFocus::SidebarMenu(i) => self.open_host_menu(i),
-                HomeFocus::Grid(i) => self.confirm_grid_card(i),
+                HomeFocus::Grid(i) => self.confirm_grid_card(i, columns),
             },
             // Forgets the focused host (removes its persisted entry/fingerprint —
             // it'll reappear as "not paired" if still discoverable on the LAN).
@@ -147,18 +209,167 @@ impl App {
         }
         None
     }
-    /// `grid_card_rect`, translated by the current scroll offset — every
+
+    /// The pin id of the currently focused grid card (see `pin_id_at_grid_idx`),
+    /// or `None` for the sidebar, or the padding after a partial pinned row.
+    pub(crate) fn focused_pin_id(&self, columns: usize) -> Option<&str> {
+        match self.home_focus {
+            HomeFocus::Grid(idx) => self.pin_id_at_grid_idx(idx, columns),
+            HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_) => None,
+        }
+    }
+
+    /// Toggles the focused card's pinned state, persists, re-sorts pinned games
+    /// to the front, and keeps focus on the same card. Opens the pin-limit
+    /// alert instead of pinning past `store::MAX_PINNED_GAMES`. Starts the
+    /// fly-to-new-position animation (`pin_move_anim`) when the card's own tile
+    /// snapshots successfully — a render failure there just skips the
+    /// animation, not the pin toggle itself.
+    pub(crate) fn toggle_focused_pin(
+        &mut self,
+        text_cache: &mut TextCache,
+        fonts: &ui::Fonts,
+        screen_w: u32,
+        screen_h: u32,
+    ) {
+        let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
+        let columns = ui::grid_columns(available_w);
+        let HomeFocus::Grid(old_idx) = self.home_focus else {
+            return;
+        };
+        let Some(id) = self.pin_id_at_grid_idx(old_idx, columns).map(str::to_string) else {
+            return;
+        };
+        let Some(known) = self.selected_known_host() else {
+            return;
+        };
+        if !known.can_toggle_pin(&id) {
+            // At MAX_PINNED_GAMES already — explain instead of a silent no-op.
+            self.open_pin_limit();
+            return;
+        }
+
+        // Snapshot the moved card's own look and grid position *before* the
+        // toggle below — both read pin state live from `known_hosts`, so
+        // toggling first would capture a Desktop card already in its new spot.
+        let (card_w, card_h) = self.card_size;
+        let (title, art) = self.grid_card_content(old_idx, columns);
+        let old_rect = self.unscrolled_card_rect(old_idx, columns, ui::SIDEBAR_W as i32, available_w);
+        let snapshot = ui::render_card_tile(text_cache, fonts, card_w, card_h, title, art).ok();
+
+        let Some(known) = self.selected_known_host_mut() else {
+            return;
+        };
+        known.toggle_pin(&id);
+        let _ = store::save_known_hosts(&self.known_hosts);
+
+        self.reorder_games_by_pin();
+        // Rebuild the moved tiles quietly — unlike `drain_games`' fresh library
+        // load, this isn't a reason to hide the grid behind the spinner again
+        // (see `grid_reorder_dirty`'s docs).
+        self.grid_reorder_dirty = true;
+        if let Some(new_idx) = self.grid_idx_for_pin_id(&id, columns) {
+            self.home_focus = HomeFocus::Grid(new_idx);
+            self.ensure_grid_visible(new_idx, columns, screen_w, screen_h);
+            if let Some(tile) = snapshot {
+                let new_rect = self.unscrolled_card_rect(new_idx, columns, ui::SIDEBAR_W as i32, available_w);
+                self.pin_move_tile = Some(tile);
+                self.pin_move_anim = Some((Instant::now(), old_rect, new_rect));
+            }
+        }
+    }
+
+    /// Re-sorts `games` so the selected host's pinned games lead (in pin order,
+    /// `pinned_count` entries), the rest keeping their previous order. A pinned id
+    /// the host no longer reports is just dropped. Called on library (re)load and
+    /// on every pin toggle — callers are responsible for `grid_dirty`/
+    /// `grid_reorder_dirty` themselves, since a fresh load and a pin toggle want
+    /// different rebuild behavior (see `grid_reorder_dirty`'s docs).
+    pub(crate) fn reorder_games_by_pin(&mut self) {
+        let pinned_ids = self
+            .selected_host
+            .as_ref()
+            .and_then(|(h, p)| self.known_hosts.iter().find(|k| k.host == *h && k.port == *p))
+            .map(|k| k.pinned.clone())
+            .unwrap_or_default();
+        let mut pinned = Vec::new();
+        for id in &pinned_ids {
+            if let Some(pos) = self.games.iter().position(|g| &g.id == id) {
+                pinned.push(self.games.remove(pos));
+            }
+        }
+        self.pinned_count = pinned.len();
+        pinned.append(&mut self.games);
+        self.games = pinned;
+    }
+
+    /// Extra vertical offset for grid index `idx`'s row — `ui::PINNED_SECTION_GAP`
+    /// once, for every row from the "rest" section on, `0` for a row still inside
+    /// the pinned front block (see `pinned_rows`).
+    fn extra_row_gap(&self, idx: usize, columns: usize) -> i32 {
+        let pinned_rows = self.pinned_rows(columns);
+        if pinned_rows > 0 && idx / columns.max(1) >= pinned_rows {
+            ui::PINNED_SECTION_GAP
+        } else {
+            0
+        }
+    }
+
+    /// `grid_card_rect`, translated by `extra_row_gap` — everything except the
+    /// current scroll offset. Used for the pin-move animation's start/end rects,
+    /// which apply scroll themselves at draw time (see `App::pin_move_anim`).
+    pub(crate) fn unscrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
+        let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
+        let extra = self.extra_row_gap(idx, columns);
+        Rect::new(r.x(), r.y() + extra, r.width(), r.height())
+    }
+
+    /// `unscrolled_card_rect`, translated by the current scroll offset — every
     /// draw-list card position starts from this.
     pub(crate) fn scrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
-        let r = ui::grid_card_rect(idx, columns, grid_x, available_w);
+        let r = self.unscrolled_card_rect(idx, columns, grid_x, available_w);
         Rect::new(r.x(), r.y() - self.grid_scroll, r.width(), r.height())
+    }
+
+    /// Whether the pinned front block is followed by anything — false when
+    /// nothing's pinned, and when *everything* is, which would otherwise leave
+    /// the divider and its gap hanging under the last row.
+    fn has_pinned_divider(&self, columns: usize) -> bool {
+        let layout = self.grid_layout(columns);
+        layout.pinned_rows > 0 && layout.len(self.games.len()) > layout.unpinned_start
+    }
+
+    /// The divider between the pinned front block and the rest, centered in the
+    /// gap `extra_row_gap` adds there, scrolled like any other grid content.
+    pub(crate) fn pinned_separator_rect(&self, columns: usize, grid_x: i32, available_w: u32) -> Option<Rect> {
+        if !self.has_pinned_divider(columns) {
+            return None;
+        }
+        let rows = self.pinned_rows(columns);
+        let (_, card_h) = ui::grid_card_size(available_w, columns);
+        let y = ui::GRID_TOP_Y + rows as i32 * (card_h as i32 + ui::GRID_GAP) - ui::GRID_GAP / 2
+            + ui::PINNED_SECTION_GAP / 2
+            - self.grid_scroll;
+        Some(Rect::new(
+            grid_x + ui::GRID_PAD,
+            y,
+            available_w.saturating_sub(2 * ui::GRID_PAD as u32),
+            1,
+        ))
     }
 
     /// The largest useful `grid_scroll` for the current library/layout — 0 when
     /// everything already fits on screen.
     pub(crate) fn max_grid_scroll(&self, columns: usize, available_w: u32, screen_h: u32) -> i32 {
         let viewport_h = screen_h as i32 - ui::GRID_PAD - ui::GRID_TOP_Y;
-        (ui::grid_layer_height(self.grid_len(), columns, available_w) as i32 - 2 * ui::GRID_LAYER_PAD - viewport_h)
+        let extra = if self.has_pinned_divider(columns) {
+            ui::PINNED_SECTION_GAP
+        } else {
+            0
+        };
+        (ui::grid_layer_height(self.grid_len(columns), columns, available_w) as i32 + extra
+            - 2 * ui::GRID_LAYER_PAD
+            - viewport_h)
             .max(0)
     }
 
@@ -173,7 +384,7 @@ impl App {
         const FOCUS_MARGIN: i32 = 16;
         self.focus_anim = Some(Instant::now());
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
-        let r = ui::grid_card_rect(idx, columns, ui::SIDEBAR_W as i32, available_w);
+        let r = self.unscrolled_card_rect(idx, columns, ui::SIDEBAR_W as i32, available_w);
         let viewport_top = ui::GRID_TOP_Y;
         let viewport_bottom = screen_h as i32 - ui::GRID_PAD;
         let max_scroll = self.max_grid_scroll(columns, available_w, screen_h);
@@ -233,6 +444,7 @@ impl App {
         self.selected_host = Some((host.clone(), port));
         self.home_status = Some("Loading library…".into());
         self.games = Vec::new();
+        self.pinned_count = 0;
         self.games_loaded = false;
         self.art.clear();
         // Dropping the loader stops its worker (its request channel closes), so a host
@@ -306,6 +518,7 @@ impl App {
                 self.games = games;
                 self.games_loaded = true;
                 self.home_status = None;
+                self.reorder_games_by_pin();
             }
             Err(e) => {
                 tracing::warn!("library fetch failed ({host}:{mgmt_port}): {e}");
@@ -338,14 +551,15 @@ impl App {
             self.home_status = Some(reason);
         }
     }
-    /// Confirms a grid card ("Desktop" at `idx == 0`, or a game). Kicks off a fresh
-    /// reachability check first rather than handing back a `ConnectTarget` directly —
+    /// Confirms a grid card ("Desktop" or a game — see `grid_card_at`). Kicks off
+    /// a fresh reachability check first rather than handing back a `ConnectTarget`
+    /// directly —
     /// the grid being populated only proves the host answered once, when its library
     /// was last fetched, and it could have gone offline since (`session::connect`'s
     /// failure currently propagates uncaught, taking the whole process down — see
     /// `main.rs`'s docs). `main.rs`'s tick loop drains the result via
     /// `drain_launch_check`/`take_ready_launch`. No-ops if a check is already in flight.
-    pub(crate) fn confirm_grid_card(&mut self, idx: usize) {
+    pub(crate) fn confirm_grid_card(&mut self, idx: usize, columns: usize) {
         if self.pending_launch.is_some() {
             return;
         }
@@ -356,13 +570,10 @@ impl App {
             return;
         };
         let Some(fingerprint) = known.fingerprint else { return };
-        let launch = if self.games_loaded && idx == 0 {
-            None
-        } else {
-            let Some(game) = self.games.get(idx - self.card_offset()) else {
-                return;
-            };
-            Some(game.id.clone())
+        let launch = match self.grid_card_at(idx, columns) {
+            Some(GridCard::Desktop) => None,
+            Some(GridCard::Game(game)) => Some(game.id.clone()),
+            None => return,
         };
         let mgmt_port = known.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT);
         let identity = (self.identity.0.clone(), self.identity.1.clone());
