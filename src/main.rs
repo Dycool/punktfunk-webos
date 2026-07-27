@@ -23,6 +23,7 @@ mod gamepad;
 mod keyboard;
 #[cfg(target_os = "linux")]
 mod library;
+#[cfg(target_os = "linux")]
 mod logger;
 #[cfg(target_os = "linux")]
 mod mouse;

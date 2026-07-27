@@ -71,13 +71,6 @@ tasks:
     cmds:
       - cargo fmt
 
-  notices:
-    desc: >-
-      Regenerate THIRD-PARTY-NOTICES.txt (embedded into the About screen), inside Docker —
-      run this whenever the dependency tree changes
-    cmds:
-      - task: toolchain:docker-run
-        vars: {TARGET_TASK: native:notices}
 
   native:build:
     desc: >-
@@ -116,13 +109,6 @@ tasks:
       - rustup component add clippy
       - cargo clippy --target {{.TARGET}} --all-targets -- -D warnings
 
-  native:notices:
-    desc: >-
-      Regenerate THIRD-PARTY-NOTICES.txt, no Docker — reads the local cargo cache offline
-      (used by `notices`; see scripts/gen-third-party-notices.py for why there's no
-      cargo-about path).
-    cmds:
-      - python3 scripts/gen-third-party-notices.py --out THIRD-PARTY-NOTICES.txt
 
   native:package:
     desc: Build and package dist/*.ipk, no Docker (used by CI)
