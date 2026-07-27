@@ -187,6 +187,7 @@ pub fn render_focused_row_tile(
             entry.name(),
             entry.is_paired(),
             true,
+            false,
             menu_focused,
             online,
         )?;
@@ -223,37 +224,44 @@ pub fn render_wrapped_text_tile(
     Ok(p)
 }
 
-/// A worst-case stat line (max resolution + longest codec/HDR tag), measured to
-/// fix the overlay's width — see `render_stats_overlay_tile`.
-pub const STATS_OVERLAY_REF_LINE: &str = "3840x2160@120 HEVC HDR";
+/// A worst-case stat line, measured to fix the overlay's width — see
+/// `render_stats_overlay_tile`. The Drop/FEC/hold/buf line is the widest of the
+/// bunch once all four counters hit multiple digits.
+pub const STATS_OVERLAY_REF_LINE: &str = "Drop 99  FEC 99  hold yes  buf 99";
 
 /// The in-stream stats overlay panel: a translucent brand-dark rounded card with
-/// one line of text per stat. Rebuilt at the overlay's ~2Hz refresh with a
-/// THROWAWAY `TextCache` — the numeric lines change every refresh, so a
-/// persistent cache would only accumulate dead entries for the whole stream's
-/// duration.
+/// one line of text per stat, plus a small Green-button hint pinned to the
+/// bottom in a dimmer, smaller caption font. Rebuilt at the overlay's ~2Hz
+/// refresh with a THROWAWAY `TextCache` — the numeric lines change every
+/// refresh, so a persistent cache would only accumulate dead entries for the
+/// whole stream's duration.
 ///
 /// Width is FIXED — measured from `STATS_OVERLAY_REF_LINE` plus a safety margin,
 /// not from the live content — so the right-anchored panel keeps a constant left
 /// edge instead of jittering horizontally as the numbers change digit count.
 /// Lines are ellipsized to the inner width as a further safety, so an unexpectedly
-/// long line can never overflow the card.
-pub fn render_stats_overlay_tile(font: &Font, lines: &[String]) -> Result<Painter> {
+/// long line can never overflow the card. `lines[0]` (the mode/codec header) is
+/// the only one that pops; the rest are muted.
+pub fn render_stats_overlay_tile(font: &Font, caption_font: &Font, lines: &[String], hint: &str) -> Result<Painter> {
     let pad = 18i32;
     let safety = 16u32; // extra slack past the reference width, so nothing touches the edge
     let line_h = font.height() + 6;
+    let hint_h = caption_font.height() + 8; // includes a gap above it
     let inner_w = font.size_of(STATS_OVERLAY_REF_LINE).map_or(0, |(w, _)| w) + safety;
     let w = inner_w + 2 * pad as u32;
-    let h = (lines.len() as i32 * line_h + 2 * pad) as u32;
+    let h = (lines.len() as i32 * line_h + hint_h + 2 * pad) as u32;
     let mut p = Painter::new(w.max(1), h.max(1));
     let mut tc = TextCache::new();
-    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0xd2));
+    p.fill_rounded_rect(Rect::new(0, 0, w, h), 14, Color::RGBA(0x14, 0x10, 0x1f, 0x90));
     for (i, line) in lines.iter().enumerate() {
-        // First line (mode/codec header) pops; the measurements below are muted.
         let color = if i == 0 { WHITE } else { MUTED };
         let clipped = ellipsize(font, line, inner_w);
         draw_text(&mut p, &mut tc, font, &clipped, pad, pad + i as i32 * line_h, color)?;
     }
+    let hint_y = pad + lines.len() as i32 * line_h + (hint_h - caption_font.height());
+    let hint_w = caption_font.size_of(hint).map_or(0, |(w, _)| w) as i32;
+    let hint_x = pad + (w as i32 - 2 * pad - hint_w) / 2;
+    draw_text(&mut p, &mut tc, caption_font, hint, hint_x, hint_y, MUTED)?;
     Ok(p)
 }
 

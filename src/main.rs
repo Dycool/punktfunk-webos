@@ -856,12 +856,14 @@ mod real {
         let font_label = crate::ui::load_font(&ttf, display_mode.h as u32, 22, crate::ui::FontWeight::Medium)?;
         let font_value = crate::ui::load_font(&ttf, display_mode.h as u32, 20, crate::ui::FontWeight::Regular)?;
         let font_title = crate::ui::load_font(&ttf, display_mode.h as u32, 40, crate::ui::FontWeight::SemiBold)?;
+        let font_caption = crate::ui::load_font(&ttf, display_mode.h as u32, 14, crate::ui::FontWeight::Regular)?;
         let icon_font = crate::ui::load_icon_font(&ttf)?;
         let fonts = crate::ui::Fonts {
             label: &font_label,
             value: &font_value,
             title: &font_title,
             icon: &icon_font,
+            caption: &font_caption,
         };
 
         // Owned here, at the top of the menu/stream cycle, rather than re-declared in
@@ -970,15 +972,17 @@ mod real {
             }
 
             let mut scroll_acc = mouse::ScrollAccumulator::default();
-            // In-stream stats overlay (Settings toggle): refreshed at ~2Hz onto the
-            // otherwise-transparent stream window. Drawing composites OVER the
-            // punch-through video plane via the surface's per-pixel alpha — the same
-            // mechanism that lets the video show through the transparent clear. The
-            // window is never shown/hidden here (that's what crashed the old overlay
-            // attempt — see docs/NOTES.md).
-            let stats_enabled = settings.stats_overlay;
+            // In-stream stats overlay: refreshed at ~2Hz onto the otherwise-transparent
+            // stream window, composited OVER the punch-through video plane via the
+            // surface's per-pixel alpha. The window is never shown/hidden here (that's
+            // what crashed the old overlay attempt — see docs/NOTES.md). Starts from the
+            // Settings-screen default; the Green button below flips it live for the rest
+            // of this stream only, without writing back to `settings`.
+            let mut stats_enabled = settings.stats_overlay;
+            let mut green_held = false;
             let mut overlay_last: Option<Instant> = None;
             let mut overlay_prev_frames: u64 = 0;
+            let mut overlay_prev_bytes: u64 = 0;
             let mut overlay_prev_at = Instant::now();
             // None = dialog not shown; Some(0) = shown, "Disconnect" focused;
             // Some(1) = shown, "Cancel" focused (default on open — safer).
@@ -1060,15 +1064,24 @@ mod real {
                                 _ => {}
                             }
                         }
-                        // Scancode keys are real game input (Backspace/Escape/etc.
-                        // included) — forward only, never open the dialog.
-                        Event::KeyDown { scancode: Some(sc), .. } => {
-                            if let Some(ev) = keyboard::key_event(sc, true) {
+                        // Real game input (Backspace/Escape/etc. included) — forward
+                        // only, never open the dialog. `resolve_scancode` covers webOS
+                        // 26, which reports a connected HID keyboard's Escape with
+                        // `scancode: None` (webOS 5 always fills it in); recovering the
+                        // scancode from the keycode keeps it routed here instead of
+                        // falling through to the Magic Remote Back arm below.
+                        Event::KeyDown { scancode, keycode, .. }
+                            if keyboard::resolve_scancode(scancode, keycode).is_some() =>
+                        {
+                            if let Some(ev) =
+                                keyboard::key_event(keyboard::resolve_scancode(scancode, keycode).unwrap(), true)
+                            {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
-                        // Magic Remote Back (0x200003): no scancode, never
-                        // forwarded to the host — open the disconnect dialog.
+                        // Magic Remote Back (0x200003): a vendor keycode with no
+                        // physical key position, so `resolve_scancode` above never
+                        // resolves it — open the disconnect dialog.
                         Event::KeyDown {
                             keycode: Some(k),
                             scancode: None,
@@ -1080,8 +1093,12 @@ mod real {
                             disconnect_focus_dirty = true;
                             disconnect_focus_anim = Some(Instant::now());
                         }
-                        Event::KeyUp { scancode: Some(sc), .. } => {
-                            if let Some(ev) = keyboard::key_event(sc, false) {
+                        Event::KeyUp { scancode, keycode, .. }
+                            if keyboard::resolve_scancode(scancode, keycode).is_some() =>
+                        {
+                            if let Some(ev) =
+                                keyboard::key_event(keyboard::resolve_scancode(scancode, keycode).unwrap(), false)
+                            {
                                 let _ = session::send_input(&connected.client, &ev);
                             }
                         }
@@ -1149,6 +1166,27 @@ mod real {
                         }
                     }
                 }
+                // Green button: local-only stats-overlay toggle, edge-detected here
+                // (not via the event queue — see `ui::webos_green_button_down`'s docs
+                // on why the safe SDL2 event API can't see this key at all). Skipped
+                // while the disconnect dialog owns input, same as scancode forwarding.
+                let green_down = disconnect_dialog.is_none() && crate::ui::webos_green_button_down();
+                if green_down && !green_held {
+                    stats_enabled = !stats_enabled;
+                    if stats_enabled {
+                        overlay_last = None; // force an immediate redraw
+                    } else {
+                        // Nothing else clears the canvas once the overlay stops
+                        // drawing — wipe both buffers back to transparent so the
+                        // last frame doesn't stick over the video.
+                        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 0));
+                        canvas.clear();
+                        canvas.present();
+                        canvas.clear();
+                        canvas.present();
+                    }
+                }
+                green_held = green_down;
                 // Render the disconnect dialog when open. The card floats over
                 // the live video (transparent surroundings); the shell
                 // re-rasterizes only when the dialog opens, the focused
@@ -1226,9 +1264,13 @@ mod real {
                 {
                     overlay_last = Some(Instant::now());
                     let frames = connected.stats.frames.load(Ordering::Relaxed);
+                    let bytes = connected.stats.bytes.load(Ordering::Relaxed);
                     let dt = overlay_prev_at.elapsed().as_secs_f32().max(0.001);
                     let fps = (frames.saturating_sub(overlay_prev_frames)) as f32 / dt;
+                    // Measured (received bytes/dt), vs. `resolved_bitrate_kbps` (negotiated).
+                    let actual_kbps = (bytes.saturating_sub(overlay_prev_bytes)) as f32 * 8.0 / 1000.0 / dt;
                     overlay_prev_frames = frames;
+                    overlay_prev_bytes = bytes;
                     overlay_prev_at = Instant::now();
                     let mode = connected.client.mode();
                     let feed_ms = connected.stats.feed_us.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -1254,17 +1296,24 @@ mod real {
                                 backlog.to_string()
                             };
                             format!(
-                                "Dropped {} · hold {} · backlog {backlog}",
+                                "Drop {} · FEC {} · hold {} · buf {backlog}",
                                 connected.client.frames_dropped(),
+                                connected.client.fec_recovered_shards(),
                                 if holding { "yes" } else { "no" },
                             )
                         },
                         format!(
-                            "Feed {feed_ms:.1} ms · start {} Mbps",
+                            "Feed {feed_ms:.1} ms · {:.0}/{} Mbps",
+                            actual_kbps / 1000.0,
                             connected.client.resolved_bitrate_kbps / 1000,
                         ),
                     ];
-                    match crate::ui::render_stats_overlay_tile(fonts.value, &lines) {
+                    match crate::ui::render_stats_overlay_tile(
+                        fonts.value,
+                        fonts.caption,
+                        &lines,
+                        "Press green button to hide this overlay",
+                    ) {
                         Ok(tile) => {
                             let (tw, th) = (tile.width(), tile.height());
                             compositor.upload(&texture_creator, Tile::StatsOverlay, &tile)?;
