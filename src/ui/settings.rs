@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{CodecPref, Settings, VideoBackend};
+use crate::store::{CodecPref, ColorRangeOverride, LogLevelOverride, Settings, VideoBackend};
 
 /// User-requested presets: 1080p, 1440p, 4K.
 pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
@@ -35,13 +35,38 @@ pub const ROW_VIDEO_BACKEND: usize = 4;
 /// on that row's value (see `codec_options`), and adjacency is what makes the
 /// dependency discoverable without explaining it in copy.
 pub const ROW_CODEC: usize = 5;
-pub const ROW_STATS_OVERLAY: usize = 6;
-pub const ROW_AUDIO: usize = 7;
-/// Not a setting — a link to `Screen::About`. It lives in this list (rather than as
-/// separate chrome) because that is where every other punktfunk client puts the
-/// version + licences, and a `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 8;
-pub const SETTINGS_ROW_COUNT: usize = 9;
+pub const ROW_AUDIO: usize = 6;
+/// Forces the VUI range flag sent to the decoder — see `store::ColorRangeOverride`.
+/// Debug aid for the washed-out-colour investigation.
+pub const ROW_COLOR_RANGE: usize = 7;
+/// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
+/// A debug aid, not something a normal user needs to find quickly.
+pub const ROW_DIAGNOSTICS: usize = 8;
+/// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
+/// client puts the version + licences at the very bottom of Settings, and a
+/// `RowKind::Action` row costs nothing extra to render.
+pub const ROW_ABOUT: usize = 9;
+pub const SETTINGS_ROW_COUNT: usize = 10;
+
+/// Diagnostics modal row indices (see `diagnostics_rows`). Log level keeps index
+/// 0 so its dropdown's `(Screen, row)` tile key stays stable.
+pub const DIAG_ROW_LOG_LEVEL: usize = 0;
+pub const DIAG_ROW_STATS_OVERLAY: usize = 1;
+pub const DIAGNOSTICS_ROW_COUNT: usize = 2;
+
+pub const COLOR_RANGE_OPTIONS: [ColorRangeOverride; 3] = [
+    ColorRangeOverride::Auto,
+    ColorRangeOverride::Full,
+    ColorRangeOverride::Limited,
+];
+
+pub fn color_range_label(o: ColorRangeOverride) -> &'static str {
+    match o {
+        ColorRangeOverride::Auto => "Automatic",
+        ColorRangeOverride::Full => "Full",
+        ColorRangeOverride::Limited => "Limited",
+    }
+}
 
 /// Cycle through options, wrapping.
 pub fn cycle<T: Copy + PartialEq>(options: &[T], current: T, forward: bool) -> T {
@@ -150,19 +175,6 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             menu: None,
         },
         FocusRow {
-            icon: ICON_SUN,
-            label: "Stats overlay".into(),
-            value: if settings.stats_overlay {
-                "On".into()
-            } else {
-                "Off".into()
-            },
-            kind: RowKind::Toggle,
-            fraction: 0.0,
-            danger: false,
-            menu: None,
-        },
-        FocusRow {
             icon: ICON_SIGNAL,
             label: "Audio".into(),
             value: audio_label(settings.audio_channels),
@@ -171,9 +183,72 @@ pub fn settings_rows(settings: &Settings) -> Vec<FocusRow> {
             danger: false,
             menu: None,
         },
+        FocusRow {
+            icon: ICON_SUN,
+            label: "Color range".into(),
+            value: color_range_label(settings.color_range_override).into(),
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow::action(ICON_WRENCH, "Diagnostics"),
         // The build version rides along as this row's value, so it's visible without
-        // opening the screen — matching where the other clients surface it.
+        // opening the screen — matching where the other clients surface it. Last row:
+        // every other punktfunk client puts version + licences at the very bottom.
         FocusRow::action_with_value(ICON_INFO, "About & licenses", format!("v{VERSION}")),
+    ]
+}
+
+pub const LOG_LEVEL_OPTIONS: [LogLevelOverride; 4] = [
+    LogLevelOverride::Debug,
+    LogLevelOverride::Info,
+    LogLevelOverride::Warn,
+    LogLevelOverride::Error,
+];
+
+pub fn log_level_label(l: LogLevelOverride) -> &'static str {
+    match l {
+        LogLevelOverride::Debug => "Debug",
+        LogLevelOverride::Info => "Info",
+        LogLevelOverride::Warn => "Warn",
+        LogLevelOverride::Error => "Error",
+    }
+}
+
+/// Diagnostics' one dropdown row — options list + current index, same shape as
+/// `dropdown_options`/`dropdown_current_index` but for `Screen::Diagnostics`
+/// rather than a `Settings` row (there is no row-index namespace to share).
+pub fn log_level_dropdown_options() -> Vec<String> {
+    LOG_LEVEL_OPTIONS.iter().map(|&l| log_level_label(l).to_string()).collect()
+}
+
+pub fn log_level_dropdown_current_index(level: LogLevelOverride) -> usize {
+    LOG_LEVEL_OPTIONS.iter().position(|&o| o == level).unwrap_or(0)
+}
+
+/// Diagnostics modal rows: log level (dropdown) + stats overlay (toggle).
+/// Order must match `DIAG_ROW_*`.
+pub fn diagnostics_rows(settings: &Settings) -> Vec<FocusRow> {
+    vec![
+        FocusRow {
+            icon: ICON_MONITOR,
+            label: "Log level".into(),
+            value: log_level_label(settings.log_level_override).into(),
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
+        FocusRow {
+            icon: ICON_SUN,
+            label: "Stats overlay".into(),
+            value: if settings.stats_overlay { "On".into() } else { "Off".into() },
+            kind: RowKind::Toggle,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+        },
     ]
 }
 
@@ -241,6 +316,10 @@ pub fn dropdown_options(settings: &Settings, row_index: usize) -> Vec<String> {
             .map(|&p| codec_label(p).to_string())
             .collect(),
         ROW_AUDIO => AUDIO_CHANNELS.iter().map(|(_, s)| (*s).to_string()).collect(),
+        ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
+            .iter()
+            .map(|&o| color_range_label(o).to_string())
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -267,6 +346,10 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
         ROW_AUDIO => AUDIO_CHANNELS
             .iter()
             .position(|(c, _)| *c == settings.audio_channels)
+            .unwrap_or(0),
+        ROW_COLOR_RANGE => COLOR_RANGE_OPTIONS
+            .iter()
+            .position(|&o| o == settings.color_range_override)
             .unwrap_or(0),
         _ => 0,
     }
@@ -305,6 +388,11 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
         ROW_AUDIO => {
             if let Some((channels, _)) = AUDIO_CHANNELS.get(choice_index) {
                 settings.audio_channels = *channels;
+            }
+        }
+        ROW_COLOR_RANGE => {
+            if let Some(&o) = COLOR_RANGE_OPTIONS.get(choice_index) {
+                settings.color_range_override = o;
             }
         }
         _ => {}
@@ -356,14 +444,16 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             apply_dropdown_choice(settings, ROW_CODEC, next);
             true
         }
-        ROW_STATS_OVERLAY => {
-            settings.stats_overlay = !settings.stats_overlay;
-            true
-        }
         ROW_AUDIO => {
             let idx = dropdown_current_index(settings, ROW_AUDIO);
             let next = cycle_index(idx, AUDIO_CHANNELS.len(), forward);
             apply_dropdown_choice(settings, ROW_AUDIO, next);
+            true
+        }
+        ROW_COLOR_RANGE => {
+            let idx = dropdown_current_index(settings, ROW_COLOR_RANGE);
+            let next = cycle_index(idx, COLOR_RANGE_OPTIONS.len(), forward);
+            apply_dropdown_choice(settings, ROW_COLOR_RANGE, next);
             true
         }
         _ => false,
