@@ -55,6 +55,15 @@ pub enum Tile {
     /// Modal scrollable content at unscrolled position. GPU crops/repositions via
     /// `TexCropped`; rebuilds only when content changes, not on scroll.
     ScrollContent(Screen),
+    /// Bottom-edge fade over a scrollable modal's content, composited between
+    /// `ScrollContent` and the focused row so it hints at more rows without dimming
+    /// whatever is focused. Static (a fixed alpha ramp), stretched to the list width —
+    /// not keyed by Screen, since one texture serves every scrollable modal.
+    ScrollFade,
+    /// The same fade mirrored for the top edge, shown while content is scrolled off above.
+    /// A second tile rather than a flipped blit: `DrawCmd` has no flip, and the ramp is
+    /// 8x44 px.
+    ScrollFadeTop,
     /// Spinner frame texture, keyed by frame index. Held in VRAM until stream starts.
     SpinnerFrame(usize),
     /// The in-stream stats overlay panel (`ui::render_stats_overlay_tile`).
@@ -158,10 +167,11 @@ impl Compositor {
                 if a == 0 || a == 255 {
                     self.staging.extend_from_slice(px);
                 } else {
-                    // premultiplied -> straight: c * 255 / a
-                    self.staging.push(((u16::from(px[0]) * 255) / a).min(255) as u8);
-                    self.staging.push(((u16::from(px[1]) * 255) / a).min(255) as u8);
-                    self.staging.push(((u16::from(px[2]) * 255) / a).min(255) as u8);
+                    // premultiplied -> straight: c * 255 / a, rounded (not floored) so the
+                    // round-trip doesn't bias colours down — see `fill_vertical_fade`.
+                    self.staging.push((((u16::from(px[0]) * 255) + a / 2) / a).min(255) as u8);
+                    self.staging.push((((u16::from(px[1]) * 255) + a / 2) / a).min(255) as u8);
+                    self.staging.push((((u16::from(px[2]) * 255) + a / 2) / a).min(255) as u8);
                     self.staging.push(px[3]);
                 }
             }
