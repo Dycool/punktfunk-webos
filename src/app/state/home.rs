@@ -257,15 +257,14 @@ impl App {
         let rest_ids: Vec<String> = (layout.unpinned_start..layout.len(self.games.len()))
             .filter_map(|idx| layout.pin_id_at(&self.games, idx).map(str::to_string))
             .collect();
+        // Re-arm the pop clock unconditionally (not gated on a built tile like the old
+        // per-`CardTile` clock): a not-yet-built card has no visible pop to replay, and
+        // its clock is overwritten with a fresh one when `prepare_grid` builds it.
         if !was_pinned {
-            if let Some(card) = self.card_tiles.get_mut(id) {
-                card.pop_since = Some(now);
-            }
+            self.card_pop.insert(id.to_string(), now);
         }
         for pin_id in rest_ids {
-            if let Some(card) = self.card_tiles.get_mut(&pin_id) {
-                card.pop_since = Some(now);
-            }
+            self.card_pop.insert(pin_id, now);
         }
     }
 
@@ -303,10 +302,10 @@ impl App {
         }
     }
 
-    /// Eased 0..=1 progress of pin id `id`'s zoom-in (see `CardTile::pop_since`)
+    /// Eased 0..=1 progress of pin id `id`'s zoom-in (see `card_pop`)
     /// — 1.0, full size, for anything not animating.
     pub(crate) fn card_pop_frac(&self, id: &str) -> f32 {
-        ui::anim_frac(self.card_tiles.get(id).and_then(|c| c.pop_since), crate::app::CARD_POP)
+        ui::anim_frac(self.card_pop.get(id).copied(), crate::app::CARD_POP)
     }
 
     /// Whether the pinned front block is followed by anything — false when
@@ -348,7 +347,7 @@ impl App {
         let viewport_bottom = screen_h as i32 - ui::GRID_PAD;
         let max_scroll = self.max_grid_scroll(columns, available_w, screen_h);
         let card_top = r.y() - FOCUS_MARGIN;
-        let card_bottom = r.y() + r.height() as i32 + FOCUS_MARGIN;
+        let card_bottom = r.bottom() + FOCUS_MARGIN;
         let mut target = self.grid_scroll_target;
         if card_top - target < viewport_top {
             target = card_top - viewport_top;
