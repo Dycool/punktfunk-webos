@@ -2,11 +2,11 @@
 //!
 //! Split out of the former single-file `ui.rs`; see `super`'s module docs.
 use super::*;
-use crate::discovery::DiscoveredHost;
-use crate::store::KnownHost;
+use crate::services::discovery::DiscoveredHost;
+use crate::services::store::KnownHost;
+use crate::ui::render::Color;
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::pixels::Color;
-use sdl2::rect::Rect;
 
 // Sized for a 10-foot TV viewing distance, not a desktop/phone screen.
 pub const SIDEBAR_W: u32 = 460;
@@ -218,18 +218,19 @@ pub fn draw_sidebar_row(
         icon_size,
     );
     let color = if focused { WHITE } else { MUTED };
-    draw_icon(painter, text_cache, fonts.icon, icon_rect, glyph, color)?;
+    draw_icon(painter, text_cache, fonts.raster, fonts.icon, icon_rect, glyph, color)?;
     // Ellipsized to prevent overflow; reserve_right prevents running under ⋯ button.
     let text_x = icon_pad + icon_size as i32 + 16;
     let max_w = drawn.width().saturating_sub(text_x as u32 + 20 + reserve_right);
-    let label = ellipsize(fonts.label, label, max_w);
+    let label = ellipsize(fonts.raster, fonts.label, label, max_w);
     draw_text(
         painter,
         text_cache,
+        fonts.raster,
         fonts.label,
         &label,
         drawn.x() + text_x,
-        drawn.y() + (drawn.height() as i32 - fonts.label.height()) / 2,
+        drawn.y() + (drawn.height() as i32 - fonts.raster.height(fonts.label)) / 2,
         color,
     )?;
     Ok(())
@@ -301,7 +302,15 @@ pub fn draw_sidebar_menu_button(
         SIDEBAR_MENU_GLYPH,
     );
     let color = if menu_focused || row_focused { WHITE } else { MUTED };
-    draw_icon(painter, text_cache, fonts.icon, glyph_rect, ICON_MORE, color)
+    draw_icon(
+        painter,
+        text_cache,
+        fonts.raster,
+        fonts.icon,
+        glyph_rect,
+        ICON_MORE,
+        color,
+    )
 }
 
 pub fn draw_utility_row(

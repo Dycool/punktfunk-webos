@@ -1,61 +1,24 @@
 //! Pre-stream UI: Home screen (sidebar + game grid) with modals (Pairing/Settings/Add-host).
 //! `ui.rs` owns drawing/input-mapping, `store.rs` owns persistence, `discovery.rs` owns mDNS.
+//!
+//! Per-screen `impl App` blocks are split by concern: `state` (event handling, transitions)
+//! and `view` (geometry + draw-list building). Keeping them under `app` lets `ui`/`core`
+//! stay dependency leaves — neither reaches back into `App`.
+pub(crate) mod state;
+pub(crate) mod view;
+
 use std::time::{Duration, Instant};
 
+use crate::ui::render::Rect;
 use anyhow::Result;
-use sdl2::rect::Rect;
 use tiny_skia::Pixmap;
 
-use crate::compositor::{DrawCmd, Tile};
-use crate::library::GameEntry;
-use crate::store::{self, KnownHost, Settings};
+pub use crate::core::model::ConnectTarget;
+use crate::core::model::GameEntry;
+pub use crate::core::screen::{HomeFocus, PairingFocus, Screen};
+use crate::services::store::{self, KnownHost, Settings};
+use crate::ui::render::{DrawCmd, TileId as Tile};
 use crate::ui::{self, AddHostState, HostEntry, MenuEvent, Painter};
-
-mod about;
-mod addhost;
-mod diagnostics;
-mod edithost;
-mod experimental;
-mod forget;
-mod home;
-mod hostmenu;
-mod pairing;
-mod pinlimit;
-mod reach;
-mod sendlogs;
-mod settings;
-mod speedtest;
-mod wake;
-mod wakesettings;
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Screen {
-    Home,
-    Pairing,
-    Settings,
-    AddHost,
-    Wake,
-    ForgetHost,
-    HostMenu,
-    EditHost,
-    About,
-    SpeedTest,
-    WakeSettings,
-    PinLimit,
-    /// Log level debug aid (see `app/diagnostics.rs`).
-    Diagnostics,
-    /// Experimental/unstable toggles (see `app/experimental.rs`).
-    Experimental,
-    /// "Send logs to developer" confirmation (see `app/sendlogs.rs`).
-    SendLogs,
-}
-
-/// Pairing modal's focused input: PIN row or "Request access" button.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PairingFocus {
-    Pin,
-    RequestAccess,
-}
 
 /// Rows beyond viewport kept rasterized (prevents scroll stalls).
 const CARD_PREFETCH_ROWS: i32 = 2;
@@ -117,15 +80,7 @@ pub struct WakeState {
     /// `true` while running silently (auto-send before prompt shown).
     pub(crate) silent: bool,
     pub(crate) last_probe: Option<Instant>,
-    pub(crate) probe_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
-}
-
-/// Home screen focus location.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum HomeFocus {
-    Sidebar(usize),
-    SidebarMenu(usize),
-    Grid(usize),
+    pub(crate) probe_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
 }
 
 /// Grid card: Desktop or game (both pinnable).
@@ -144,10 +99,10 @@ pub(crate) struct CardTile {
 /// Grid layout shape: pinned block (owns whole rows) + rest section (padding-aware).
 #[derive(Clone, Copy)]
 pub(crate) struct GridLayout {
-    pinned_count: usize,
+    pub(crate) pinned_count: usize,
     pub(crate) desktop_pinned: bool,
-    desktop_in_rest: bool,
-    front_count: usize,
+    pub(crate) desktop_in_rest: bool,
+    pub(crate) front_count: usize,
     pub(crate) pinned_rows: usize,
     pub(crate) unpinned_start: usize,
 }
@@ -212,15 +167,6 @@ impl GridLayout {
     }
 }
 
-/// Stream connection target.
-pub struct ConnectTarget {
-    pub host: String,
-    pub port: u16,
-    pub fingerprint: [u8; 32],
-    /// Library entry id to launch, or `None` for desktop.
-    pub launch: Option<String>,
-}
-
 /// Pending launch awaiting pre-flight reachability check.
 pub(crate) struct PendingLaunch {
     pub(crate) host: String,
@@ -228,7 +174,7 @@ pub(crate) struct PendingLaunch {
     pub(crate) fingerprint: [u8; 32],
     pub(crate) launch: Option<String>,
     pub(crate) title: String,
-    pub(crate) rx: std::sync::mpsc::Receiver<crate::library::GamesLoaded>,
+    pub(crate) rx: std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>,
     /// Card index for `launch_anim`.
     pub(crate) idx: usize,
 }
@@ -334,7 +280,7 @@ pub(crate) enum ScrollContentKey {
 pub struct App {
     pub screen: Screen,
     pub known_hosts: Vec<KnownHost>,
-    pub discovered: std::sync::mpsc::Receiver<crate::discovery::DiscoveredHost>,
+    pub discovered: std::sync::mpsc::Receiver<crate::services::discovery::DiscoveredHost>,
     /// `None` if mDNS daemon didn't start. `Some` lets Drop shut it down explicitly.
     pub(crate) discovery_daemon: Option<mdns_sd::ServiceDaemon>,
     pub entries: Vec<HostEntry>,
@@ -345,11 +291,11 @@ pub struct App {
     pub(crate) pinned_count: usize,
     /// Host answered library fetch (gates Desktop card).
     pub(crate) games_loaded: bool,
-    pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::library::GamesLoaded>>,
+    pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
     pub home_status: Option<String>,
     /// Cover art pixmaps by game id.
     pub art: std::collections::HashMap<String, Pixmap>,
-    pub(crate) art_loader: Option<crate::art::ArtLoader>,
+    pub(crate) art_loader: Option<crate::services::art::ArtLoader>,
     /// Current grid card size (updated in `prepare_tiles`).
     pub(crate) card_size: (u32, u32),
     pub(crate) pending_launch: Option<PendingLaunch>,
@@ -404,20 +350,20 @@ pub struct App {
     pub send_logs_focused: usize,
     /// Delivers the background log upload's result; `None` when no upload is in
     /// flight. Drained each tick by `drain_send_logs`.
-    pub(crate) send_logs_rx: Option<std::sync::mpsc::Receiver<sendlogs::SendLogsMsg>>,
+    pub(crate) send_logs_rx: Option<std::sync::mpsc::Receiver<crate::app::state::sendlogs::SendLogsMsg>>,
     /// The sidebar row `Screen::EditHost` is editing, `None` otherwise.
     pub edit_host_index: Option<usize>,
     /// The in-flight/finished speed test, `None` when that screen isn't open.
-    pub(crate) speed_test: Option<speedtest::SpeedTestState>,
+    pub(crate) speed_test: Option<crate::app::state::speedtest::SpeedTestState>,
     /// Delivers the background probe's progress/result — dropping it cancels.
-    pub(crate) speed_test_rx: Option<std::sync::mpsc::Receiver<speedtest::SpeedTestMsg>>,
+    pub(crate) speed_test_rx: Option<std::sync::mpsc::Receiver<crate::app::state::speedtest::SpeedTestMsg>>,
     /// Which of the finished test's two buttons has focus.
     pub speed_test_focused: usize,
     /// The host being measured, for the status line.
     pub speed_test_name: String,
     /// Last known reachability per `(host, port)` — see `app::reach`.
     pub(crate) reachable: std::collections::HashMap<(String, u16), bool>,
-    pub(crate) reach_rx: Option<std::sync::mpsc::Receiver<reach::Reachability>>,
+    pub(crate) reach_rx: Option<std::sync::mpsc::Receiver<crate::app::state::reach::Reachability>>,
     pub(crate) reach_last: Option<Instant>,
     /// Whether webOS's on-screen keyboard is currently up, polled from
     /// `SDL_IsScreenKeyboardShown` each tick by `main.rs` — it moves the address form out
@@ -610,7 +556,7 @@ impl App {
     pub fn new(identity: (String, String)) -> Self {
         let known_hosts = store::load_known_hosts();
         let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        let (discovered, discovery_daemon) = match crate::discovery::browse() {
+        let (discovered, discovery_daemon) = match crate::services::discovery::browse() {
             Some((rx, daemon)) => (rx, Some(daemon)),
             None => (std::sync::mpsc::channel().1, None),
         };
@@ -729,10 +675,10 @@ impl App {
         // (never a race) if it finishes first.
         // Applies the persisted "Show logs" preference to the otherwise-ephemeral overlay.
         if app.settings.show_logs {
-            crate::real::set_log_overlay_enabled(true);
+            crate::runtime::set_log_overlay_enabled(true);
         }
         std::thread::spawn(ui::spinner_frames);
-        std::thread::spawn(crate::device::supports_av1);
+        std::thread::spawn(crate::platform::webos::device::supports_av1);
         app
     }
 
@@ -1031,7 +977,14 @@ impl App {
     /// Button index under `(x, y)` for a two-button confirm modal with `subtitle`, or
     /// `None` off both buttons — every confirm modal's hover arm shares this, against the
     /// same `confirm_dialog_layout` geometry the modal is drawn with.
-    fn confirm_button_at(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str, x: i32, y: i32) -> Option<usize> {
+    fn confirm_button_at(
+        screen_w: u32,
+        screen_h: u32,
+        fonts: &ui::Fonts,
+        subtitle: &str,
+        x: i32,
+        y: i32,
+    ) -> Option<usize> {
         let (_, content) = ui::confirm_dialog_layout(screen_w, screen_h, fonts, subtitle);
         ui::confirm_button_at(content, x, y)
     }
@@ -1759,7 +1712,7 @@ impl App {
             // The pinned badge tile — built once, composited over the focused
             // card in `draw_list` rather than baked into individual card tiles.
             if self.pin_badge_tile.is_none() {
-                self.pin_badge_tile = Some(ui::render_pin_badge_tile(text_cache, fonts.icon)?);
+                self.pin_badge_tile = Some(ui::render_pin_badge_tile(text_cache, fonts.raster, fonts.icon)?);
                 updated.push(Tile::PinBadge);
             }
 
@@ -1813,6 +1766,7 @@ impl App {
             if self.nohost_tile.is_none() {
                 self.nohost_tile = Some(ui::render_text_tile(
                     text_cache,
+                    fonts.raster,
                     fonts.label,
                     "No host selected — pick one from the list, or add one.",
                     ui::MUTED,
@@ -1829,7 +1783,8 @@ impl App {
                 if stale {
                     let avail = screen_w.saturating_sub(ui::SIDEBAR_W);
                     let max_w = avail.saturating_sub(2 * ui::GRID_PAD as u32);
-                    let tile = ui::render_wrapped_text_tile(text_cache, fonts.label, s, max_w, ui::MUTED, 6)?;
+                    let tile =
+                        ui::render_wrapped_text_tile(text_cache, fonts.raster, fonts.label, s, max_w, ui::MUTED, 6)?;
                     self.status_tile = Some((s.clone(), tile));
                     updated.push(Tile::Status);
                 }
@@ -1985,11 +1940,14 @@ impl App {
             // on the card but text.
             Screen::SpeedTest => matches!(
                 self.speed_test,
-                Some(speedtest::SpeedTestState::Done { .. }) | Some(speedtest::SpeedTestState::Failed(_))
+                Some(crate::app::state::speedtest::SpeedTestState::Done { .. })
+                    | Some(crate::app::state::speedtest::SpeedTestState::Failed(_))
             )
             .then(|| {
                 let recommended = match &self.speed_test {
-                    Some(speedtest::SpeedTestState::Done { outcome, .. }) => Self::recommended_kbps(outcome),
+                    Some(crate::app::state::speedtest::SpeedTestState::Done { outcome, .. }) => {
+                        Self::recommended_kbps(outcome)
+                    }
                     _ => None,
                 };
                 ModalFocusKey::SpeedTestButton(self.speed_test_focused, Self::speed_test_apply_label(recommended))
@@ -2057,13 +2015,20 @@ impl App {
                     Screen::Pairing => match self.pairing_focus {
                         PairingFocus::Pin => ui::render_pairing_digit_tile(
                             text_cache,
+                            fonts.raster,
                             fonts.title,
                             self.pin_digits[self.pin_digit_index],
                         )?,
                         PairingFocus::RequestAccess => {
                             let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
                             let btn = Self::pairing_request_button_rect(card, fonts);
-                            ui::render_pairing_button_tile(text_cache, fonts.label, btn.width(), btn.height())?
+                            ui::render_pairing_button_tile(
+                                text_cache,
+                                fonts.raster,
+                                fonts.label,
+                                btn.width(),
+                                btn.height(),
+                            )?
                         }
                     },
                     Screen::ForgetHost => {
@@ -2128,7 +2093,9 @@ impl App {
                         let rect =
                             ui::confirm_button_rect(self.speed_test_buttons_rect(card, fonts), self.speed_test_focused);
                         let recommended = match &self.speed_test {
-                            Some(speedtest::SpeedTestState::Done { outcome, .. }) => Self::recommended_kbps(outcome),
+                            Some(crate::app::state::speedtest::SpeedTestState::Done { outcome, .. }) => {
+                                Self::recommended_kbps(outcome)
+                            }
                             _ => None,
                         };
                         let apply_label = Self::speed_test_apply_label(recommended);
@@ -2226,7 +2193,15 @@ impl App {
                 let overlay_h = options.len() as u32 * ui::DROPDOWN_OPTION_H;
                 let mut p = Painter::new(content_w, overlay_h.max(1));
                 let rect = Rect::new(0, 0, content_w, overlay_h);
-                ui::draw_dropdown_overlay(&mut p, text_cache, fonts.value, &options, usize::MAX, rect)?;
+                ui::draw_dropdown_overlay(
+                    &mut p,
+                    text_cache,
+                    fonts.raster,
+                    fonts.value,
+                    &options,
+                    usize::MAX,
+                    rect,
+                )?;
                 self.dropdown_overlay_tile = Some((overlay_key, p));
                 updated.push(Tile::DropdownOverlay);
             }
@@ -2235,7 +2210,7 @@ impl App {
             let stale = !matches!(&self.dropdown_focus_tile, Some((k, _)) if *k == key);
             if stale {
                 let option = options.get(dd.focused).map_or("", String::as_str);
-                let tile = ui::render_dropdown_option_tile(text_cache, fonts.value, option, content_w)?;
+                let tile = ui::render_dropdown_option_tile(text_cache, fonts.raster, fonts.value, option, content_w)?;
                 self.dropdown_focus_tile = Some((key, tile));
                 updated.push(Tile::DropdownFocusOption);
             }
@@ -2312,7 +2287,7 @@ impl App {
                         if let Some((_, wrapped)) = &self.about_wrapped {
                             let stride = self.scroll_stride(fonts) as u32;
                             let mut p = Painter::new(content.width().max(1), (len as u32 * stride).max(1));
-                            ui::draw_about_window(&mut p, fonts.value, wrapped, new_start, len)?;
+                            ui::draw_about_window(&mut p, fonts.raster, fonts.value, wrapped, new_start, len)?;
                             self.content_window = ui::ContentWindow { start: new_start, len };
                             self.scroll_content_tile = Some(((Screen::About, ScrollContentKey::About(new_start)), p));
                             updated.push(Tile::ScrollContent(Screen::About));
@@ -2361,7 +2336,7 @@ impl App {
                 let card = ui::about_card_rect(screen_w, screen_h);
                 let body = ui::about_body_rect(card, fonts);
                 let total = self.about_wrapped.as_ref().map_or(0, |(_, v)| v.len());
-                let visible = ui::about_visible_lines(body, fonts.value);
+                let visible = ui::about_visible_lines(body, fonts.raster, fonts.value);
                 Some((total, visible, card, body))
             }
             _ => None,
@@ -2441,7 +2416,7 @@ impl App {
     fn scroll_stride_for(&self, screen: Screen, fonts: &ui::Fonts) -> i32 {
         match screen {
             Screen::Settings => ui::SETTINGS_ROW_H as i32 + ui::SETTINGS_ROW_GAP,
-            Screen::About => ui::about_line_stride(fonts.value),
+            Screen::About => ui::about_line_stride(fonts.raster, fonts.value),
             _ => 1,
         }
     }
@@ -2483,7 +2458,7 @@ impl App {
     /// params are only for pure geometry — `ui::modal_header_end_y` and
     /// friends — needed to position a modal's focused-widget tile without
     /// re-rendering its header). The GPU executes it (`Compositor::execute`).
-    pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> Vec<DrawCmd> {
+    pub fn draw_list(&self, screen_w: u32, screen_h: u32, fonts: &ui::Fonts) -> ui::render::DrawList {
         let mut cmds = Vec::new();
         let grid_x = ui::SIDEBAR_W as i32;
         let available_w = screen_w.saturating_sub(ui::SIDEBAR_W);
@@ -2556,7 +2531,7 @@ impl App {
                 if sep.y() >= 0 && sep.y() <= screen_h as i32 {
                     cmds.push(DrawCmd::Fill {
                         rect: sep,
-                        color: sdl2::pixels::Color::RGBA(0xff, 0xff, 0xff, 0x20),
+                        color: crate::ui::render::Color::RGBA(0xff, 0xff, 0xff, 0x20),
                     });
                 }
             }
@@ -2633,7 +2608,7 @@ impl App {
         }
         if self.home_status.is_some() {
             if let Some((_, p)) = &self.status_tile {
-                let line_h = fonts.label.height() + 6;
+                let line_h = fonts.raster.height(fonts.label) + 6;
                 let box_h = 2 * line_h as u32 + 2 * STATUS_BG_PAD as u32;
                 let box_y = screen_h as i32 - box_h as i32;
                 cmds.push(DrawCmd::Fill {
@@ -2683,7 +2658,7 @@ impl App {
         if !matches!(screen, Screen::Home) {
             cmds.push(DrawCmd::Fill {
                 rect: Rect::new(0, 0, screen_w, screen_h),
-                color: sdl2::pixels::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
+                color: crate::ui::render::Color::RGBA(0, 0, 0, (f32::from(ui::MODAL_SCRIM.a) * m) as u8),
             });
             let dy = ((1.0 - m) * 26.0) as i32;
             let modal_base = Rect::new(0, dy, screen_w, screen_h);
@@ -2827,7 +2802,8 @@ impl App {
                 }
                 Screen::SpeedTest => matches!(
                     self.speed_test,
-                    Some(speedtest::SpeedTestState::Done { .. }) | Some(speedtest::SpeedTestState::Failed(_))
+                    Some(crate::app::state::speedtest::SpeedTestState::Done { .. })
+                        | Some(crate::app::state::speedtest::SpeedTestState::Failed(_))
                 )
                 .then(|| {
                     let card = self.speed_test_card_rect(screen_w, screen_h, fonts);
@@ -2971,7 +2947,7 @@ impl App {
             }
             cmds.push(DrawCmd::Fill {
                 rect: Rect::new(0, 0, screen_w, screen_h),
-                color: sdl2::pixels::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
+                color: crate::ui::render::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
             });
         }
         cmds
@@ -2984,7 +2960,8 @@ impl App {
         &self,
         painter: &mut Painter,
         text_cache: &mut crate::ui::TextCache,
-        icon_font: &sdl2::ttf::Font,
+        raster: &dyn ui::TextRaster,
+        icon_font: ui::FontId,
         card: Rect,
     ) -> Result<()> {
         // No backdrop here: the scrim behind the modal is a GPU fill in
@@ -2994,6 +2971,7 @@ impl App {
         ui::draw_icon(
             painter,
             text_cache,
+            raster,
             icon_font,
             ui::modal_close_rect(card),
             ui::ICON_CLOSE,
