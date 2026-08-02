@@ -7,24 +7,23 @@ pub(super) fn run_inner() -> Result<()> {
     // the app into the launcher — see `keyboard.rs`'s LGui/RGui mapping and
     // `gamepad.rs`'s BTN_GUIDE mapping, which need these to actually reach the app
     // instead). Must be set before window creation — confirmed on-device these
-    // hints only latch at creation time, so there's no way to scope them to just
-    // the stream: the tradeoff is the remote's own physical Home button no longer
-    // opens webOS's launcher either, in the menu or mid-stream (accepted — the
-    // priority is that no keyboard/gamepad input can ever reach the TV OS, only
-    // the Magic Remote can).
+    // hints only latch at creation time.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
     // Distinct from KEYS_BACK: without it webOS closes (SIGTERMs) the app on its own
     // Back/exit gesture — a held or root-level Back — before the app can act on the key,
     // which is what killed the app mid-hold. aurora-tv, moonlight-tv, ihsplay and
     // RetroArch all pair EXIT with BACK for exactly this.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT", "true");
+    // Captured (=true): webOS classes a USB keyboard's Windows/Super key as a
+    // Home-class key, gated here together with the remote's Home button — there's no
+    // separate policy for them. Capturing is the only way the keyboard key reaches
+    // the app to forward to the host (VK_LWIN/VK_RWIN, see `keyboard.rs`). The cost
+    // is the remote's Home no longer opens the launcher natively, so we detect it in
+    // the input loop (bare keycode, no scancode) and relaunch it via `luna::launch_home`.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
-    // The hints above stop the key itself from backgrounding the app, but webOS's
-    // card-switcher ribbon overlay is gated separately — without this it can still
-    // pop the launcher UI on top even though the app stays foregrounded (confirmed
-    // pairing in aurora-tv's app.c).
+    // Suppress webOS's launcher ribbon overlay from popping over the foregrounded app.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "false");
     // Linear texture filtering (SDL defaults to nearest) — the focus pop
     // scales card textures slightly, which shimmers without it.
@@ -236,6 +235,7 @@ pub(super) fn run_inner() -> Result<()> {
         let mut log_fade = crate::ui::ModalFade::<()>::new();
         let mut green_held = false;
         let mut yellow_held = false;
+        let mut home_held = false;
         // Blue button flips pacing live via `stats.pacing_enabled` (`video_pump` reads it
         // per frame). Pure PTS math, no decoder state — safe to toggle mid-stream.
         let mut blue_held = false;
@@ -362,6 +362,12 @@ pub(super) fn run_inner() -> Result<()> {
                     // to the host as real HID mouse input during a stream instead of
                     // driving local UI focus (see `mouse.rs`).
                     Event::MouseMotion { x, y, .. } => {
+                        // webOS re-materializes its system cursor on pointer activity,
+                        // undoing the one-shot hide at stream start (most visibly when
+                        // launched with a mouse in motion) — re-assert so it stays hidden.
+                        if settings.cursor_capture && sdl.mouse().is_cursor_showing() {
+                            sdl.mouse().show_cursor(false);
+                        }
                         let ev = mouse::move_event(x, y, display_mode.w as u32, display_mode.h as u32);
                         let _ = session::send_input(&connected.client, &ev);
                     }
@@ -402,6 +408,11 @@ pub(super) fn run_inner() -> Result<()> {
             if exit_gesture_fired(&mut exit_held) && !disconnect.is_open() {
                 tracing::info!("EXIT gesture — opening disconnect dialog");
                 disconnect.open(1);
+            }
+            // Home key re-opens the webOS launcher (captured so a keyboard's Super key
+            // can reach the host); a long Back fires EXIT above, never this.
+            if home_key_fired(&mut home_held) {
+                crate::platform::webos::luna::launch_home();
             }
             // Green button: local-only stats-overlay toggle, edge-detected here (raw
             // scancode poll — the safe SDL2 event API can't see this key at all).
