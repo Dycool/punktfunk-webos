@@ -1,0 +1,112 @@
+name: webOS Homebrew
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: Name of the artifact holding the built .ipk
+        required: true
+        type: string
+      release_tag:
+        description: Release tag to attach the .ipk and manifest to (empty = no release)
+        required: false
+        default: ''
+        type: string
+  workflow_dispatch:
+    inputs:
+      artifact:
+        description: Name of the artifact holding the built .ipk
+        required: true
+        default: io.dyptan.punktfunk.webos
+        type: string
+      release_tag:
+        description: Release tag to attach the .ipk and manifest to (empty = no release)
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  manifest:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: dist
+
+      - name: Resolve latest dev-toolbox-cli release
+        id: toolbox
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view --repo webosbrew/dev-toolbox-cli \
+            --json tagName --jq '"tag=" + .tagName' >> "$GITHUB_OUTPUT"
+
+      - name: Cache dev-toolbox-cli packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/webosbrew-toolbox
+          key: webosbrew-toolbox-${{ steps.toolbox.outputs.tag }}-amd64
+
+      - name: Install webosbrew/dev-toolbox-cli
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLBOX_TAG: ${{ steps.toolbox.outputs.tag }}
+        run: |
+          set -euo pipefail
+          DEBS="$HOME/.cache/webosbrew-toolbox"
+          mkdir -p "$DEBS"
+          if ! ls "$DEBS"/*_amd64.deb >/dev/null 2>&1; then
+            gh release download "$TOOLBOX_TAG" --repo webosbrew/dev-toolbox-cli \
+              --dir "$DEBS" --pattern '*_amd64.deb'
+          fi
+          sudo apt-get install -y --no-install-recommends "$DEBS"/*.deb
+
+      - name: Verify .ipk against firmware symbol data
+        run: |
+          set -uo pipefail
+          # webOS 5.x+ only: NDL DirectMedia/DirectVideo don't exist before that.
+          # Markdown so the same text reads as a table in the job summary.
+          webosbrew-ipk-verify dist/*.ipk --fw-releases '>=5' \
+            --details --format markdown | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Generate Homebrew manifest
+        run: |
+          set -euo pipefail
+          IPK="$(ls dist/*.ipk)"
+          APP_ID="$(basename "$IPK" | cut -d_ -f1)"
+          webosbrew-gen-manifest \
+            --pkgfile "$IPK" \
+            --icon "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/packaging/icon_large.png" \
+            --link "https://github.com/${GITHUB_REPOSITORY}" \
+            --root false \
+            --output "dist/${APP_ID}.manifest.json"
+          # gen-manifest only knows the local file name; point ipkUrl at the release asset.
+          TAG='${{ inputs.release_tag }}'
+          if [ -n "$TAG" ]; then
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$IPK")"
+            jq --arg url "$URL" '.ipkUrl = $url' "dist/${APP_ID}.manifest.json" > "$RUNNER_TEMP/m.json"
+            mv "$RUNNER_TEMP/m.json" "dist/${APP_ID}.manifest.json"
+          fi
+          cat "dist/${APP_ID}.manifest.json"
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}-manifest
+          path: dist/*.manifest.json
+
+      - name: Attach .ipk and manifest to the release
+        if: inputs.release_tag != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: |
+            dist/*.ipk
+            dist/*.manifest.json
