@@ -1,7 +1,9 @@
 pub mod audio;
 pub mod compositor;
+pub mod cursor;
 pub mod device;
 pub mod dualsense;
+pub mod evmouse;
 pub mod game_mode;
 pub mod gamepad;
 pub mod input;
