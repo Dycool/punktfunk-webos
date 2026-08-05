@@ -27,11 +27,14 @@ pub enum ArtLoaded {
 }
 
 /// Which variant of a game's art a request wants.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArtKind {
     Card,
     Hero,
 }
+
+/// Number of `ArtKind` variants — the width of `ArtLoader::requested`.
+const ART_KINDS: usize = 2;
 
 /// An image the UI wants soon.
 struct ArtRequest {
@@ -78,15 +81,26 @@ fn crop_to_aspect(img: image::DynamicImage, aspect: f32) -> image::DynamicImage 
 const RAW_CACHE_MAGIC: u32 = 0x50465232;
 /// Hero decoded-pixel cache magic ("PFH1").
 const HERO_CACHE_MAGIC: u32 = 0x50464831;
-/// Filename suffix for a decoded hero, also what `prune_hero_cache` matches on.
+/// Filename suffixes that mark a hero's two cache files — see [`cache_class`].
 const HERO_RAW_SUFFIX: &str = ".hero.raw";
-/// How many decoded heroes are kept on disk. At a few MB each this bounds the cache at
-/// tens of MB while still covering everything recently launched.
-const HERO_RAW_CACHE_KEEP: usize = 8;
+const HERO_BYTES_SUFFIX: &str = ".hero";
+
+/// Per-host disk budget for card art (encoded bytes plus the decoded `.raw`). A cover caps at
+/// 360×480 straight RGBA, so ~0.7 MB decoded each: an unbounded cache is ~140 MB for a
+/// 200-game library, on a TV with no disk to spare. At this budget roughly 80 covers stay
+/// resident, which is far more than the grid window, and a miss costs one LAN fetch.
+const CARD_CACHE_BUDGET: u64 = 56 * 1024 * 1024;
+/// Per-host disk budget for hero art. ~2.7 MB per decoded hero at [`MAX_HERO_WIDTH`], so this
+/// keeps the last ~8 launched. Its own budget rather than a share of the card one because the
+/// two compete on nothing: a full grid of covers must not evict the hero of the game being
+/// launched, and one launch must not evict the visible grid.
+const HERO_CACHE_BUDGET: u64 = 24 * 1024 * 1024;
+/// Card writes between prunes. Pruning walks the host's directory, so doing it per cover would
+/// put a `read_dir` on every grid fetch; heroes are few and large enough to prune every time.
+const CARD_PRUNE_EVERY: u32 = 24;
 
 fn cache_root() -> PathBuf {
-    let home = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
-    home.join("art-cache")
+    crate::services::paths::app_dir().join("art-cache")
 }
 
 fn cache_name(id: &str) -> String {
@@ -116,36 +130,26 @@ fn raw_cache_path(dir: &std::path::Path, game_id: &str, kind: ArtKind) -> PathBu
 fn bytes_cache_path(dir: &std::path::Path, game_id: &str, kind: ArtKind) -> PathBuf {
     match kind {
         ArtKind::Card => dir.join(cache_name(game_id)),
-        ArtKind::Hero => dir.join(format!("{}.hero", cache_name(game_id))),
+        ArtKind::Hero => dir.join(format!("{}{HERO_BYTES_SUFFIX}", cache_name(game_id))),
     }
 }
 
-/// Staging name for a write-then-rename. Appends to the whole filename rather than
-/// replacing an extension, which would make `id.raw` and `id` stage to the same path.
-fn tmp_path(path: &std::path::Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".tmp");
-    PathBuf::from(name)
-}
-
-/// Write-then-rename (prevents truncated cache files on kill mid-write).
+/// Write-then-rename (prevents truncated cache files on kill mid-write). Header and pixels go
+/// as two writes so a full-image copy isn't made just to prepend 12 bytes. Best-effort: a cache
+/// that can't be written costs a re-fetch, nothing more.
 fn write_raw(path: &std::path::Path, magic: u32, width: u32, height: u32, pixels: &[u8]) {
-    let mut buf = Vec::with_capacity(12 + pixels.len());
-    buf.extend_from_slice(&magic.to_le_bytes());
-    buf.extend_from_slice(&width.to_le_bytes());
-    buf.extend_from_slice(&height.to_le_bytes());
-    buf.extend_from_slice(pixels);
-    let tmp = tmp_path(path);
-    if std::fs::write(&tmp, &buf).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    let mut header = [0u8; 12];
+    header[0..4].copy_from_slice(&magic.to_le_bytes());
+    header[4..8].copy_from_slice(&width.to_le_bytes());
+    header[8..12].copy_from_slice(&height.to_le_bytes());
+    let _ = crate::services::store::write_atomic_parts(path, &[&header, pixels], "art raw cache");
 }
 
 /// Read raw cache, if present and written with this magic (and so this pixel convention —
 /// card pixels are premultiplied, hero pixels straight, and the two must never be
 /// mistaken for each other).
 fn read_raw(path: &std::path::Path, magic: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let buf = std::fs::read(path).ok()?;
+    let mut buf = std::fs::read(path).ok()?;
     if u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) != magic {
         return None;
     }
@@ -154,38 +158,66 @@ fn read_raw(path: &std::path::Path, magic: u32) -> Option<(u32, u32, Vec<u8>)> {
     if buf.len() - 12 != width as usize * height as usize * 4 {
         return None;
     }
-    Some((width, height, buf.get(12..)?.to_vec()))
+    // Shift the payload down over the header rather than copying it out: the pixels are the
+    // whole file, and this way the read's allocation is the one handed on.
+    buf.drain(..12);
+    Some((width, height, buf))
 }
 
-fn write_card_cache(path: &std::path::Path, pixmap: &Pixmap) {
-    write_raw(path, RAW_CACHE_MAGIC, pixmap.width(), pixmap.height(), pixmap.data());
-}
-
-fn read_card_cache(path: &std::path::Path) -> Option<Pixmap> {
-    let (width, height, pixels) = read_raw(path, RAW_CACHE_MAGIC)?;
-    Pixmap::from_vec(pixels, IntSize::from_wh(width, height)?)
-}
-
-/// Keeps the newest `HERO_RAW_CACHE_KEEP` decoded heroes and deletes the rest. They are
-/// megabytes each, so unlike card art they can't all be kept — but a decode is far too
-/// slow here to redo on the launch path, so the recently played ones stay resident.
-fn prune_hero_cache(dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut heroes: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.to_string_lossy().ends_with(HERO_RAW_SUFFIX))
-        .filter_map(|p| {
-            let modified = p.metadata().and_then(|m| m.modified()).ok()?;
-            Some((modified, p))
-        })
-        .collect();
-    if heroes.len() <= HERO_RAW_CACHE_KEEP {
-        return;
+/// Which budget a cached file counts against. Heroes are matched first: `x.hero.raw` ends with
+/// both suffixes. `None` for a staging file, which no budget owns — a `.tmp` left behind by a
+/// kill mid-write is deleted outright by [`prune_cache`].
+fn cache_class(path: &std::path::Path) -> Option<ArtKind> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    if name.ends_with(".tmp") {
+        return None;
     }
-    heroes.sort_by_key(|(modified, _)| *modified);
-    for (_, path) in heroes.iter().take(heroes.len() - HERO_RAW_CACHE_KEEP) {
-        let _ = std::fs::remove_file(path);
+    if name.ends_with(HERO_RAW_SUFFIX) || name.ends_with(HERO_BYTES_SUFFIX) {
+        return Some(ArtKind::Hero);
+    }
+    Some(ArtKind::Card)
+}
+
+/// Holds one host's cache inside its per-kind budget, oldest file first.
+///
+/// The quota is per host directory, so a host with a huge library cannot evict another host's
+/// art — and forgetting a host (`clear_host_cache`) reclaims exactly its own share.
+///
+/// Eviction is by write time, not use time: nothing here touches a file it serves from cache, and
+/// an extra `utimes` per grid card is not worth the sharper policy. So a re-fetch after eviction
+/// is possible for art the user is still looking at, which costs one LAN request.
+fn prune_cache(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(ArtKind, std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        let Some(kind) = cache_class(&path) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let Ok(meta) = path.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        files.push((kind, modified, meta.len(), path));
+    }
+    files.sort_by_key(|(_, modified, _, _)| *modified);
+
+    for (kind, budget) in [(ArtKind::Card, CARD_CACHE_BUDGET), (ArtKind::Hero, HERO_CACHE_BUDGET)] {
+        let mut total: u64 = files
+            .iter()
+            .filter(|(k, ..)| *k == kind)
+            .map(|(_, _, len, _)| *len)
+            .sum();
+        if total <= budget {
+            continue;
+        }
+        for (_, _, len, path) in files.iter().filter(|(k, ..)| *k == kind) {
+            if total <= budget {
+                break;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                total -= len;
+            }
+        }
+        tracing::debug!("art: pruned {:?} cache in {} to {total} bytes", kind, dir.display());
     }
 }
 
@@ -207,8 +239,12 @@ fn resize_pixmap(src: &Pixmap, w: u32, h: u32) -> Option<Pixmap> {
 
 /// `worker`'s fixed, per-host config — bundled to keep its arg count sane.
 struct WorkerConfig {
+    /// Which protocol's art transport to open — see `backend::ArtFetch`. This module knows
+    /// nothing about how a cover is fetched, only that `ArtRequest::paths` are handles the
+    /// backend understands.
+    backend: &'static dyn crate::backend::HostBackend,
     host: String,
-    mgmt_port: u16,
+    query_port: u16,
     identity: (String, String),
     fingerprint: Option<[u8; 32]>,
     dir: PathBuf,
@@ -221,32 +257,32 @@ struct WorkerConfig {
 pub struct ArtLoader {
     tx: Sender<ArtRequest>,
     rx: Receiver<ArtLoaded>,
-    /// Ids already handed to the worker, so scrolling over the same card repeatedly
-    /// doesn't queue it repeatedly.
-    requested: HashSet<String>,
-    /// Same, for hero art — a separate set because focus moving back and forth over a
-    /// card must not re-queue its (much larger) hero either.
-    hero_requested: HashSet<String>,
+    /// Ids already handed to the worker, so scrolling over the same card repeatedly doesn't
+    /// queue it repeatedly. Kept per kind (indexed by `ArtKind as usize`) because focus moving
+    /// back and forth over a card must not re-queue its much larger hero either, and the two
+    /// are forgotten independently.
+    requested: [HashSet<String>; ART_KINDS],
 }
 
 impl ArtLoader {
-    /// Spawn loader. `mgmt_port` is what's dialed (separate from identity `port`).
+    /// Spawn loader. `query_port` is what's dialed (separate from identity `port`).
     /// Card dimensions determine cover stretch-to size.
     pub fn spawn(
+        backend: &'static dyn crate::backend::HostBackend,
         host: String,
         port: u16,
-        mgmt_port: u16,
+        query_port: u16,
         identity: (String, String),
         fingerprint: Option<[u8; 32]>,
-        card_w: u32,
-        card_h: u32,
+        (card_w, card_h): (u32, u32),
     ) -> Self {
         let (tx_req, rx_req) = std::sync::mpsc::channel::<ArtRequest>();
         let (tx_done, rx_done) = std::sync::mpsc::channel::<ArtLoaded>();
         let dir = cache_dir(&host, port);
         let config = WorkerConfig {
+            backend,
             host,
-            mgmt_port,
+            query_port,
             identity,
             fingerprint,
             dir,
@@ -260,38 +296,50 @@ impl ArtLoader {
         Self {
             tx: tx_req,
             rx: rx_done,
-            requested: HashSet::new(),
-            hero_requested: HashSet::new(),
+            requested: Default::default(),
         }
     }
 
-    /// Asks for `game`'s cover if it hasn't been asked for already. Cheap enough to call
-    /// for every card in the prefetch window every frame.
-    pub fn request(&mut self, game: &GameEntry) {
-        if self.requested.contains(&game.id) {
+    /// Queues one request unless `game_id` has already been asked for in `kind`. The id is
+    /// remembered even when there are no candidate paths: a game with no art at all must not
+    /// be re-queued every frame forever.
+    ///
+    /// `paths` is a closure so the already-requested case — the overwhelmingly common one, since
+    /// these are called for the whole prefetch window every frame — builds no path strings at all.
+    fn queue(&mut self, game_id: &str, kind: ArtKind, paths: impl FnOnce() -> Vec<String>) {
+        let requested = &mut self.requested[kind as usize];
+        // Membership before insert: an already-requested id shouldn't pay for an allocation
+        // just to be looked up.
+        if requested.contains(game_id) {
             return;
         }
-        // Remember the id either way: a game with no art at all must not be re-queued
-        // every frame forever.
-        self.requested.insert(game.id.clone());
-        // Preference order: portrait (right aspect), then header, then hero.
-        let paths: Vec<String> = [
-            game.art.portrait.as_deref(),
-            game.art.header.as_deref(),
-            game.art.hero.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(str::to_string)
-        .collect();
+        requested.insert(game_id.to_string());
+        let paths = paths();
         if paths.is_empty() {
             return;
         }
         // A closed channel means the worker is gone; the card keeps its placeholder.
         let _ = self.tx.send(ArtRequest {
-            game_id: game.id.clone(),
-            kind: ArtKind::Card,
+            game_id: game_id.to_string(),
+            kind,
             paths,
+        });
+    }
+
+    /// Asks for `game`'s cover if it hasn't been asked for already. Cheap enough to call
+    /// for every card in the prefetch window every frame.
+    pub fn request(&mut self, game: &GameEntry) {
+        self.queue(&game.id, ArtKind::Card, || {
+            // Preference order: portrait (right aspect), then header, then hero.
+            [
+                game.art.portrait.as_deref(),
+                game.art.header.as_deref(),
+                game.art.hero.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect()
         });
     }
 
@@ -303,21 +351,12 @@ impl ArtLoader {
     /// there'd be almost nothing left of it, and the connecting screen falls back to
     /// its plain black fade perfectly well.
     pub fn request_hero(&mut self, game: &GameEntry) {
-        if !self.hero_requested.insert(game.id.clone()) {
-            return;
-        }
-        let paths: Vec<String> = [game.art.hero.as_deref(), game.art.header.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(str::to_string)
-            .collect();
-        if paths.is_empty() {
-            return;
-        }
-        let _ = self.tx.send(ArtRequest {
-            game_id: game.id.clone(),
-            kind: ArtKind::Hero,
-            paths,
+        self.queue(&game.id, ArtKind::Hero, || {
+            [game.art.hero.as_deref(), game.art.header.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::to_string)
+                .collect()
         });
     }
 
@@ -325,13 +364,17 @@ impl ArtLoader {
     /// when a hero arrives too late to be of use and is dropped — without this the game
     /// would never get another chance at one, even though its bytes are now cached.
     pub fn forget_hero(&mut self, game_id: &str) {
-        self.hero_requested.remove(game_id);
+        self.forget_kind(ArtKind::Hero, game_id);
     }
 
     /// Forgets that `game_id` was requested, so a later scroll back re-requests it. Served
     /// from the disk cache, so this costs a decode rather than a round-trip.
     pub fn forget(&mut self, game_id: &str) {
-        self.requested.remove(game_id);
+        self.forget_kind(ArtKind::Card, game_id);
+    }
+
+    fn forget_kind(&mut self, kind: ArtKind, game_id: &str) {
+        self.requested[kind as usize].remove(game_id);
     }
 
     /// Drains everything decoded since the last call.
@@ -348,21 +391,27 @@ impl ArtLoader {
 
 fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoaded>) {
     let WorkerConfig {
+        backend,
         host,
-        mgmt_port,
+        query_port,
         identity,
         fingerprint,
         dir,
         card_w,
         card_h,
     } = config;
-    let (host, mgmt_port, fingerprint, card_w, card_h) = (host.as_str(), *mgmt_port, *fingerprint, *card_w, *card_h);
+    let (host, query_port, fingerprint, card_w, card_h) = (host.as_str(), *query_port, *fingerprint, *card_w, *card_h);
     let _ = std::fs::create_dir_all(dir);
-    // One mTLS agent reused for every fetch — a fresh `ureq::Agent` per cover means a
-    // fresh TCP+TLS handshake including client-cert auth, real avoidable cost that scales
-    // with library size (see `library::agent`). Built lazily, so a fully cached library
-    // never opens a connection at all.
-    let mut agent = None;
+    // Once at startup: the budgets are also enforced here, so a directory left over an upgrade
+    // (or by a kill before the write-triggered prune below) is brought inside them without
+    // waiting for this session to write anything.
+    prune_cache(dir);
+    // Card writes since the last prune — see `CARD_PRUNE_EVERY`.
+    let mut card_writes: u32 = 0;
+    // One transport reused for every fetch, so the connection (and, for punktfunk, the
+    // client-cert handshake) is paid once rather than per cover — real avoidable cost that
+    // scales with library size. Built lazily, so a fully cached library never connects at all.
+    let mut fetcher = None;
 
     // Local queue rather than straight `recv()`: a hero request gates the connecting
     // screen, so it has to jump whatever card-art backlog the grid has just queued. A
@@ -386,13 +435,15 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
         // fetched for, so the encoded-bytes layer below is not enough on its own.
         let raw_cached = raw_cache_path(dir, &req.game_id, req.kind);
         let cached_raw = match req.kind {
-            ArtKind::Card => read_card_cache(&raw_cached).map(|pixmap| {
-                let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
-                ArtLoaded::Card {
-                    game_id: req.game_id.clone(),
-                    pixmap: sized,
-                }
-            }),
+            ArtKind::Card => read_raw(&raw_cached, RAW_CACHE_MAGIC)
+                .and_then(|(width, height, pixels)| Pixmap::from_vec(pixels, IntSize::from_wh(width, height)?))
+                .map(|pixmap| {
+                    let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
+                    ArtLoaded::Card {
+                        game_id: req.game_id.clone(),
+                        pixmap: sized,
+                    }
+                }),
             ArtKind::Hero => read_raw(&raw_cached, HERO_CACHE_MAGIC).map(|(width, height, pixels)| ArtLoaded::Hero {
                 game_id: req.game_id.clone(),
                 image: HeroImage { width, height, pixels },
@@ -409,19 +460,19 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
         let bytes = match std::fs::read(&cached) {
             Ok(b) if !b.is_empty() => b,
             _ => {
-                if agent.is_none() {
-                    match crate::services::library::agent(identity, fingerprint) {
-                        Ok(a) => agent = Some(a),
+                if fetcher.is_none() {
+                    match backend.art_fetcher(host, query_port, identity, fingerprint) {
+                        Ok(f) => fetcher = Some(f),
                         Err(e) => {
-                            tracing::warn!("art: {} building mTLS agent failed: {e}", req.game_id);
+                            tracing::warn!("art: {} opening art transport failed: {e}", req.game_id);
                             continue;
                         }
                     }
                 }
-                let Some(a) = agent.as_ref() else { continue };
+                let Some(f) = fetcher.as_ref() else { continue };
                 let mut fetched = None;
                 for path in &req.paths {
-                    match crate::services::library::fetch_art(a, host, mgmt_port, path) {
+                    match f.fetch(path) {
                         Ok(b) => {
                             fetched = Some(b);
                             break;
@@ -433,12 +484,8 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                     continue;
                 };
                 // Write-then-rename, never truncate-in-place: a kill mid-write would
-                // otherwise leave a truncated file that gets served from cache forever
-                // (same discipline, and the same reason, as `store::write_atomic`).
-                let tmp = tmp_path(&cached);
-                if std::fs::write(&tmp, &fetched).is_ok() {
-                    let _ = std::fs::rename(&tmp, &cached);
-                }
+                // otherwise leave a truncated file that gets served from cache forever.
+                let _ = crate::services::store::write_atomic_parts(&cached, &[&fetched], "art bytes cache");
                 fetched
             }
         };
@@ -488,7 +535,8 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                 // Left straight-alpha (no `premultiply_rgba`): it is uploaded as a raw
                 // texture, and SDL's blend mode expects straight alpha.
                 write_raw(&raw_cached, HERO_CACHE_MAGIC, width, height, &buf);
-                prune_hero_cache(dir);
+                prune_cache(dir);
+                card_writes = 0;
                 ArtLoaded::Hero {
                     game_id: req.game_id,
                     image: HeroImage {
@@ -507,7 +555,18 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
                     tracing::warn!("art: {} Pixmap::from_vec failed ({width}x{height})", req.game_id);
                     continue;
                 };
-                write_card_cache(&raw_cached, &pixmap);
+                write_raw(
+                    &raw_cached,
+                    RAW_CACHE_MAGIC,
+                    pixmap.width(),
+                    pixmap.height(),
+                    pixmap.data(),
+                );
+                card_writes += 1;
+                if card_writes >= CARD_PRUNE_EVERY {
+                    prune_cache(dir);
+                    card_writes = 0;
+                }
                 let sized = resize_pixmap(&pixmap, card_w, card_h).unwrap_or(pixmap);
                 ArtLoaded::Card {
                     game_id: req.game_id,
@@ -518,5 +577,29 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
         if tx.send(loaded).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `.hero.raw` ends with `.raw` too, so the order the suffixes are tested in is the whole
+    /// of keeping the two budgets apart.
+    #[test]
+    fn hero_files_are_not_counted_as_card_art() {
+        let dir = std::path::Path::new("/cache");
+        assert_eq!(cache_class(&dir.join("123.hero.raw")), Some(ArtKind::Hero));
+        assert_eq!(cache_class(&dir.join("123.hero")), Some(ArtKind::Hero));
+        assert_eq!(cache_class(&dir.join("123.raw")), Some(ArtKind::Card));
+        assert_eq!(cache_class(&dir.join("123")), Some(ArtKind::Card));
+        assert_eq!(cache_class(&dir.join("123.hero.raw.tmp")), None);
+    }
+
+    /// Each host gets its own directory, so one host's library can't crowd out another's.
+    #[test]
+    fn hosts_get_separate_cache_directories() {
+        assert_ne!(cache_dir("10.0.0.2", 47989), cache_dir("10.0.0.3", 47989));
+        assert_ne!(cache_dir("10.0.0.2", 47989), cache_dir("10.0.0.2", 47984));
     }
 }

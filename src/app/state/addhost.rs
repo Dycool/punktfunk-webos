@@ -2,7 +2,7 @@
 use crate::app::App;
 use crate::core::screen::{HomeFocus, Screen};
 use crate::services::store::{self, KnownHost};
-use crate::ui::{HostEntry, MenuEvent};
+use crate::ui::MenuEvent;
 
 impl App {
     /// Handles menu event on add-host modal. Left/Right stand in for backspace (no dot
@@ -34,17 +34,23 @@ impl App {
                 name: host.clone(),
                 host: host.clone(),
                 port,
-                fingerprint: None,
                 mgmt_port: None,
                 mac: Vec::new(),
                 // upsert_known_host keeps an existing record's wol_auto
                 wol_auto: false,
                 // upsert_known_host keeps an existing record's pins
                 pinned: vec![store::DESKTOP_PIN_ID.to_string()],
+                // Defaults: punktfunk protocol and unpaired trust. `upsert_known_host` keeps
+                // an existing record's trust, so re-adding a paired host doesn't unpair it.
+                ..store::KnownHost::default()
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
-        self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
+        // The record above is punktfunk, because that is what a bare address means here. If the
+        // address turns out to be a `GameStream` host, the probe rewrites it — see
+        // `App::probe_gamestream_fallback`, which is a no-op unless the toggle is on.
+        self.probe_gamestream_fallback(host.clone(), port);
+        self.rebuild_entries();
         self.home_focus = HomeFocus::Sidebar(
             self.entries
                 .iter()

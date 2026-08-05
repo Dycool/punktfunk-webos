@@ -15,6 +15,7 @@ pub(crate) enum HostAction {
     Connect,
     Pair,
     SpeedTest,
+    QuitApp,
     Wake,
     Edit,
     Forget,
@@ -42,10 +43,14 @@ impl App {
             return Vec::new();
         };
         let saved = matches!(entry, HostEntry::Known(_));
+        let paired = entry.is_paired();
+        // Affordances a protocol doesn't have are *omitted*, never shown-and-failing, so adding a
+        // protocol touches no view code. See `backend::BackendCaps`.
+        let caps = crate::backend::backend_for(entry.protocol()).caps();
         let mut rows = vec![
             (
                 HostAction::Connect,
-                if entry.is_paired() {
+                if paired {
                     FocusRow::action(crate::ui::ICON_TV, "Connect")
                 } else {
                     // The hint goes in the value column like every other Action row's,
@@ -55,14 +60,39 @@ impl App {
             ),
             (
                 HostAction::Pair,
-                FocusRow::action(crate::ui::ICON_LOCK, "Pair with PIN…"),
-            ),
-            (
-                HostAction::SpeedTest,
-                FocusRow::action(crate::ui::ICON_SIGNAL, "Test network speed…"),
+                // The same cap that decides the pairing modal's layout decides its label here:
+                // a protocol with request-access takes a PIN *from* the host, one without
+                // generates its own for the user to carry the other way.
+                FocusRow::action(
+                    crate::ui::ICON_LOCK,
+                    if caps.request_access {
+                        "Pair with PIN…"
+                    } else {
+                        "Show pairing PIN…"
+                    },
+                ),
             ),
         ];
-        if !entry.mac().is_empty() {
+        // Both this and "Wake host" below need a paired host: the probe runs over the real
+        // data plane (so it needs the host to accept this client's certificate), and waking a
+        // host we can't then connect to is a dead end.
+        if caps.speed_test && paired {
+            rows.push((
+                HostAction::SpeedTest,
+                FocusRow::action(crate::ui::ICON_SIGNAL, "Test network speed…"),
+            ));
+        }
+        // Only for a paired host: `/cancel` authorizes by client certificate, so on an unpaired one
+        // the row could only ever fail. Whether anything *is* running would take a round trip, and
+        // the menu is built synchronously each frame — so the row is always offered and the
+        // outcome says which it was (see `App::start_quit_app`).
+        if caps.quit_app && paired {
+            rows.push((
+                HostAction::QuitApp,
+                FocusRow::action(crate::ui::ICON_CLOSE, "Close running app"),
+            ));
+        }
+        if paired && !entry.mac().is_empty() {
             // The one row with a ⋯: Confirm wakes now, the button holds the per-host
             // wake settings (`Screen::WakeSettings`). Same affordance and the same
             // Right-to-reach-it gesture as a sidebar host row's. Always built
@@ -94,17 +124,19 @@ impl App {
             .map_or_else(String::new, |e| e.name().to_string())
     }
 
-    /// `address:port`, plus the pairing state — the menu's subtitle.
+    /// `address:port`, the pairing state, and the protocol where it isn't the default one — the
+    /// menu's subtitle. punktfunk hosts stay unlabelled: naming the protocol on every host would
+    /// be noise, whereas a `GameStream` host's reduced feature set is worth flagging.
     pub(crate) fn host_menu_subtitle(&self) -> String {
         self.host_menu_index
             .and_then(|i| self.entries.get(i))
             .map_or_else(String::new, |e| {
-                format!(
-                    "{}:{} · {}",
-                    e.host(),
-                    e.port(),
-                    if e.is_paired() { "paired" } else { "not paired" }
-                )
+                let paired = if e.is_paired() { "paired" } else { "not paired" };
+                let protocol = match e.protocol() {
+                    crate::core::protocol::Protocol::Punktfunk => "",
+                    crate::core::protocol::Protocol::GameStream => " · GameStream",
+                };
+                format!("{}:{} · {paired}{protocol}", e.host(), e.port())
             })
     }
 
@@ -159,6 +191,7 @@ impl App {
                 self.open_pairing(idx);
             }
             HostAction::SpeedTest => self.open_speed_test(idx),
+            HostAction::QuitApp => self.start_quit_app(idx),
             HostAction::Wake => {
                 let Some(entry) = self.entries.get(idx) else { return };
                 let (host, port) = (entry.host().to_string(), entry.port());

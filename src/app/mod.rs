@@ -191,6 +191,9 @@ pub(crate) enum ModalShellKey {
     },
     Pairing {
         digits: [u8; 4],
+        /// The `GameStream` display-PIN, which is part of the shell rather than a focus tile —
+        /// nothing on that layout is focusable, so a changed PIN would otherwise not redraw.
+        shown: Option<String>,
         status: Option<String>,
         busy: bool,
         hover_close: bool,
@@ -226,6 +229,7 @@ pub(crate) enum ModalShellKey {
     Experimental {
         video_pacing: bool,
         game_mode: bool,
+        gamestream: bool,
         hover_close: bool,
     },
     /// Fixed warning copy + two buttons; only the close (X) hover varies.
@@ -248,6 +252,9 @@ pub struct App {
     pub(crate) pinned_count: usize,
     /// Host answered library fetch (gates Desktop card).
     pub(crate) games_loaded: bool,
+    /// Cached `games` position of the host's own desktop entry — recomputed with the
+    /// library and its pin order, since `grid_layout` needs it several times per redraw.
+    pub(crate) desktop_pos: Option<usize>,
     pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
     pub home_status: Option<String>,
     /// Cover art pixmaps by game id.
@@ -321,6 +328,16 @@ pub struct App {
     pub(crate) reachable: std::collections::HashMap<(String, u16), bool>,
     pub(crate) reach_rx: Option<std::sync::mpsc::Receiver<crate::app::state::reach::Reachability>>,
     pub(crate) reach_last: Option<Instant>,
+    /// `GameStream` hosts mDNS found that are currently hidden because the same machine also
+    /// answers punktfunk — see `App::refresh_gamestream_shadowing`. Held rather than dropped so
+    /// the row can appear the moment the punktfunk side goes away, without waiting out another
+    /// browse cycle.
+    pub(crate) shadowed_gamestream: Vec<crate::services::discovery::DiscoveredHost>,
+    /// Delivers the "close what the host is running" worker's one status line; `None` when none is
+    /// in flight. See `app::state::gamestream`.
+    pub(crate) quit_app_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Delivers a manually added address's `GameStream` probe, and only when it found one.
+    pub(crate) gs_probe_rx: Option<std::sync::mpsc::Receiver<crate::app::state::gamestream::GsProbed>>,
     /// Whether webOS's on-screen keyboard is currently up, polled from
     /// `SDL_IsScreenKeyboardShown` each tick by `main.rs` — it moves the address form out
     /// from under the panel (see `App::keyboard_modal_card`).
@@ -344,6 +361,11 @@ pub struct App {
     pub pairing_focus: PairingFocus,
     pub pairing_status: Option<String>,
     pub pairing_busy: bool,
+    /// The PIN *we* generated for a `GameStream` host to display, if that's the ceremony in
+    /// flight. `Some` is what makes the modal the display-PIN layout rather than the entry one —
+    /// see `App::pairing_is_display_pin` and `app::view::pairing`. `None` for punktfunk, whose PIN
+    /// comes from the host and is typed into `pin_digits`.
+    pub(crate) pairing_pin_shown: Option<String>,
     /// Index into `entries` currently being paired — captured when entering
     /// `Screen::Pairing`.
     pub(crate) pairing_entry: usize,
@@ -461,10 +483,14 @@ pub(crate) struct PairingOutcome {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) name: String,
+    /// Which protocol's ceremony this was, so `drain_pairing` records the right one on a host
+    /// it may be saving for the first time (a discovered-but-unsaved row).
+    pub(crate) protocol: crate::core::protocol::Protocol,
     pub(crate) mgmt_port: Option<u16>,
     pub(crate) mac: Vec<String>,
-    /// The host's now-verified fingerprint, or a user-displayable error.
-    pub(crate) result: Result<[u8; 32], String>,
+    /// What we now trust about the host, or a user-displayable error. Not a bare fingerprint
+    /// because only punktfunk produces one — see `core::protocol::HostTrust`.
+    pub(crate) result: Result<crate::core::protocol::HostTrust, String>,
 }
 
 impl Drop for App {
@@ -475,11 +501,27 @@ impl Drop for App {
     }
 }
 
+/// The sidebar's saved-host rows. `GameStream` hosts are filtered out while the Experimental
+/// toggle is off, so turning it back off restores the pre-`GameStream` sidebar exactly — the
+/// records stay in `known-hosts.json` rather than being forgotten, since the toggle is meant to
+/// be reversible.
+fn known_entries(known_hosts: &[store::KnownHost], gamestream_enabled: bool) -> Vec<HostEntry> {
+    known_hosts
+        .iter()
+        .filter(|h| gamestream_enabled || h.protocol != store::Protocol::GameStream)
+        .cloned()
+        .map(HostEntry::Known)
+        .collect()
+}
+
 impl App {
     pub fn new(identity: (String, String)) -> Self {
         let known_hosts = store::load_known_hosts();
-        let entries = known_hosts.iter().cloned().map(HostEntry::Known).collect();
-        let (discovered, discovery_daemon) = match crate::services::discovery::browse() {
+        // Before the browse, which needs the `GameStream` toggle to know what to look for.
+        let settings = store::load_settings();
+        let entries = known_entries(&known_hosts, settings.gamestream_enabled);
+        let backends = crate::backend::browse_backends(settings.gamestream_enabled);
+        let (discovered, discovery_daemon) = match crate::services::discovery::browse(backends) {
             Some((rx, daemon)) => (rx, Some(daemon)),
             None => (std::sync::mpsc::channel().1, None),
         };
@@ -494,6 +536,7 @@ impl App {
             games: Vec::new(),
             pinned_count: 0,
             games_loaded: false,
+            desktop_pos: None,
             games_rx: None,
             home_status: None,
             art: std::collections::HashMap::new(),
@@ -502,7 +545,7 @@ impl App {
             launch_ready: None,
             launch_anim: None,
             launch_anim_idx: None,
-            settings: store::load_settings(),
+            settings,
             settings_writer: store::SettingsWriter::spawn(),
             settings_focused: 0,
             scroll: ui::ScrollWindow::new(),
@@ -527,6 +570,9 @@ impl App {
             reachable: Self::new_reachability(),
             reach_rx: None,
             reach_last: None,
+            shadowed_gamestream: Vec::new(),
+            quit_app_rx: None,
+            gs_probe_rx: None,
             keyboard_shown: false,
             about_lines: Vec::new(),
             about_wrapped: None,
@@ -537,6 +583,7 @@ impl App {
             pairing_focus: PairingFocus::Pin,
             pairing_status: None,
             pairing_busy: false,
+            pairing_pin_shown: None,
             pairing_entry: 0,
             hover_close: false,
             identity,
@@ -570,7 +617,7 @@ impl App {
             if let Some(h) = app
                 .known_hosts
                 .iter()
-                .find(|h| h.host == host && h.port == port && h.fingerprint.is_some())
+                .find(|h| h.host == host && h.port == port && h.is_paired())
             {
                 let (host, port, mgmt_port) = (h.host.clone(), h.port, h.mgmt_port);
                 app.select_host(host, port, mgmt_port);
@@ -590,6 +637,116 @@ impl App {
         app
     }
 
+    /// Tears down the mDNS browse and starts a new one for the currently enabled backends, so the
+    /// running service-type set matches `Settings::gamestream_enabled`. The browse set is chosen
+    /// once per daemon (`services::discovery::browse`), so without this the `_nvstream._tcp`
+    /// browse thread outlives the toggle going off and never appears when it goes on.
+    pub(crate) fn restart_discovery(&mut self) {
+        if let Some(daemon) = self.discovery_daemon.take() {
+            // The browse workers' receivers error out on shutdown, which ends their threads and
+            // closes the aggregate channel — the old `discovered` receiver is replaced below
+            // either way, so nothing is left draining it.
+            let _ = daemon.shutdown();
+        }
+        let backends = crate::backend::browse_backends(self.settings.gamestream_enabled);
+        match crate::services::discovery::browse(backends) {
+            Some((rx, daemon)) => {
+                self.discovered = rx;
+                self.discovery_daemon = Some(daemon);
+            }
+            // A daemon that won't start leaves discovery off for the rest of the session, same as
+            // at startup; an empty receiver just never yields.
+            None => self.discovered = std::sync::mpsc::channel().1,
+        }
+    }
+
+    /// Rebuilds the sidebar from `known_hosts`, dropping any discovered-but-unsaved rows. Every
+    /// caller that mutates `known_hosts` goes through this rather than collecting the list
+    /// itself, so the `GameStream` visibility filter can't be forgotten at one site.
+    pub(crate) fn rebuild_entries(&mut self) {
+        self.set_entries(known_entries(&self.known_hosts, self.settings.gamestream_enabled));
+    }
+
+    /// Re-applies the `GameStream` visibility filter, keeping the discovered-but-unsaved rows
+    /// that survive it. Unlike [`Self::rebuild_entries`] — where a save/forget has made the
+    /// discovered rows stale — a toggle says nothing about the punktfunk hosts mDNS already
+    /// found, and re-finding them would mean waiting out another browse cycle.
+    pub(crate) fn refilter_entries(&mut self) {
+        let mut entries = known_entries(&self.known_hosts, self.settings.gamestream_enabled);
+        // Appended after the known ones, which is where `drain_discovery` keeps them.
+        entries.extend(
+            self.entries
+                .iter()
+                .filter(|e| matches!(e, HostEntry::Discovered(_)) && self.protocol_visible(e.protocol()))
+                .cloned(),
+        );
+        self.set_entries(entries);
+    }
+
+    /// The one place the sidebar row list is replaced: keeps focus on the row the user is on and
+    /// marks the layer dirty, neither of which any caller should have to remember.
+    fn set_entries(&mut self, entries: Vec<HostEntry>) {
+        let before = self.entries.len();
+        self.entries = entries;
+        self.reanchor_sidebar_focus(before);
+        // The sidebar layer is a cached tile keyed by nothing but this flag (see `prepare_tiles`),
+        // so a rebuilt row list that doesn't set it leaves the previous host list on screen.
+        self.sidebar_dirty = true;
+    }
+
+    /// Whether rows speaking `protocol` are shown at all — the `GameStream` toggle, asked in the
+    /// one form every filter here needs.
+    pub(crate) fn protocol_visible(&self, protocol: crate::core::protocol::Protocol) -> bool {
+        self.settings.gamestream_enabled || protocol != crate::core::protocol::Protocol::GameStream
+    }
+
+    /// Keeps sidebar focus on the row the user is actually on after the host list changed
+    /// length (`before` is what it was). Focus is a flat index over hosts + "Add host" +
+    /// "Settings", and the two utility rows are identified purely by their index — see
+    /// `compose_sidebar_focus`, which only draws the bottom-pinned highlight for
+    /// `entries.len() + 1` — so leaving a stale index there puts "Settings" mid-list.
+    fn reanchor_sidebar_focus(&mut self, before: usize) {
+        let now = self.entries.len();
+        let (HomeFocus::Sidebar(i) | HomeFocus::SidebarMenu(i)) = self.home_focus else {
+            return; // grid focus doesn't index the sidebar
+        };
+        if now == before {
+            return;
+        }
+        // A ⋯ belongs to a host row, so it survives only while that row does.
+        if matches!(self.home_focus, HomeFocus::SidebarMenu(_)) && i < now {
+            return;
+        }
+        // Past the hosts are the two utility rows, which move with the list's length; a host
+        // index only needs clamping into what's left.
+        let i = if i >= before { i - before + now } else { i.min(now) };
+        self.home_focus = HomeFocus::Sidebar(i);
+    }
+
+    /// Whether `addr:port` already has a sidebar row, saved or merely discovered.
+    pub(crate) fn host_listed(&self, addr: &str, port: u16) -> bool {
+        self.known_hosts.iter().any(|h| h.host == addr && h.port == port)
+            || self
+                .entries
+                .iter()
+                .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == addr && d.port == port))
+    }
+
+    /// The port of every row at `addr` speaking `protocol` — saved or merely discovered. With
+    /// `addr` they key into `reachable`, which is how `App::gamestream_shadowed` asks whether a
+    /// machine's other protocol is answering.
+    pub(crate) fn ports_at(&self, addr: &str, protocol: crate::core::protocol::Protocol) -> Vec<u16> {
+        self.known_hosts
+            .iter()
+            .filter(|h| h.host == addr && h.protocol == protocol)
+            .map(|h| h.port)
+            .chain(self.entries.iter().filter_map(|e| match e {
+                HostEntry::Discovered(d) if d.addr == addr && d.protocol == protocol => Some(d.port),
+                _ => None,
+            }))
+            .collect()
+    }
+
     /// Merges freshly-discovered hosts into the entry list (known hosts keep their
     /// paired status; a discovered host not yet known gets appended), learns each
     /// known host's Wake-on-LAN MAC(s) from its live advert while it's awake to
@@ -598,6 +755,7 @@ impl App {
     /// actually changed — `main.rs`'s render loop uses this to skip a redraw when a
     /// discovery tick found nothing new (see its dirty-flag docs).
     pub fn drain_discovery(&mut self) -> bool {
+        let before = self.entries.len();
         let mut changed = false;
         let mut mac_learned = false;
         let mut woke = None;
@@ -605,6 +763,19 @@ impl App {
         // `found.host` — `DiscoveredHost` (discovery.rs) only has `addr`, `WakeState`/
         // `KnownHost` only have `host`; both hold the same kind of value (network address).
         while let Ok(found) = self.discovered.try_recv() {
+            // The browse itself is chosen once, in `App::new`, so a toggle flipped since then can
+            // still be delivering `GameStream` adverts.
+            if !self.protocol_visible(found.protocol) {
+                continue;
+            }
+            // A host advertising both protocols is one host, and punktfunk is the better half of
+            // it — so its `GameStream` side is parked, not dropped, and appears if that half stops
+            // answering. See `App::refresh_gamestream_shadowing`.
+            if found.protocol == crate::core::protocol::Protocol::GameStream && self.gamestream_shadowed(&found.addr) {
+                tracing::debug!("mdns: parking GameStream advert from {} (punktfunk up)", found.addr);
+                self.park_gamestream(found);
+                continue;
+            }
             #[allow(clippy::suspicious_operation_groupings)]
             if let Some(w) = &self.wake {
                 if found.addr == w.host && found.port == w.port {
@@ -622,17 +793,7 @@ impl App {
                     mac_learned = true;
                 }
             }
-            #[allow(clippy::suspicious_operation_groupings)]
-            let already_known = self
-                .known_hosts
-                .iter()
-                .any(|h| h.host == found.addr && h.port == found.port);
-            if !already_known
-                && !self
-                    .entries
-                    .iter()
-                    .any(|e| matches!(e, HostEntry::Discovered(d) if d.addr == found.addr && d.port == found.port))
-            {
+            if !self.host_listed(&found.addr, found.port) {
                 self.entries.push(HostEntry::Discovered(found));
                 changed = true;
             }
@@ -644,7 +805,12 @@ impl App {
             self.wake_succeeded(host, port, mgmt_port, "mDNS");
             changed = true;
         }
+        // A punktfunk host can have resolved only now, which parks the `GameStream` row this
+        // same drain (or an earlier one) added for the same machine.
+        changed |= self.refresh_gamestream_shadowing();
         if changed {
+            // Rows were appended and can have been parked, so the utility rows have moved.
+            self.reanchor_sidebar_focus(before);
             self.sidebar_dirty = true;
         }
         changed
@@ -1029,8 +1195,10 @@ impl App {
                 *focused = row;
                 changed
             }
+            // Nothing on the display-PIN layout is focusable, so there is no hover target.
+            Screen::Pairing if self.pairing_is_display_pin() => false,
             Screen::Pairing => {
-                let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                 if Self::pairing_request_button_rect(card, fonts).contains_point((x, y)) {
                     let changed = self.pairing_focus != PairingFocus::RequestAccess;
                     self.pairing_focus = PairingFocus::RequestAccess;
@@ -1206,7 +1374,7 @@ impl App {
         Some(match self.screen {
             Screen::Home => return None,
             Screen::Settings => self.settings_layout(screen_w, screen_h).0,
-            Screen::Pairing => Self::pairing_card_rect(screen_w, screen_h, fonts),
+            Screen::Pairing => self.pairing_card_rect(screen_w, screen_h, fonts),
             Screen::AddHost => self.address_card_rect(screen_w, screen_h, fonts),
             Screen::Wake => Self::wake_card_rect(screen_w, screen_h, self.wake.as_ref()?, fonts),
             Screen::ForgetHost => {
@@ -1359,10 +1527,12 @@ impl App {
                 self.handle_settings_event(MenuEvent::Confirm, screen_h);
                 None
             }
+            // The display-PIN layout has no button to click.
+            Screen::Pairing if self.pairing_is_display_pin() => None,
             Screen::Pairing => {
                 // The Magic Remote pointer is the most reliable input on this TV, so the
                 // "Request access" button is clickable directly: focus it and confirm.
-                let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                 if Self::pairing_request_button_rect(card, fonts).contains_point((x, y)) {
                     self.pairing_focus = PairingFocus::RequestAccess;
                     self.handle_pairing_event(MenuEvent::Confirm);
@@ -1844,6 +2014,7 @@ impl App {
             }),
             Screen::Pairing => Some(ModalShellKey::Pairing {
                 digits: self.pin_digits,
+                shown: self.pairing_pin_shown.clone(),
                 status: self.pairing_status.clone(),
                 busy: self.pairing_busy,
                 hover_close: self.hover_close,
@@ -1884,6 +2055,7 @@ impl App {
             Screen::Experimental => Some(ModalShellKey::Experimental {
                 video_pacing: self.settings.video_pacing,
                 game_mode: self.settings.game_mode,
+                gamestream: self.settings.gamestream_enabled,
                 hover_close: self.hover_close,
             }),
             Screen::SendLogs => Some(ModalShellKey::SendLogs {
@@ -1962,6 +2134,9 @@ impl App {
                 .as_ref()
                 .filter(|w| !w.mac.is_empty())
                 .map(|w| ModalFocusKey::WakeButton(w.focused)),
+            // The display-PIN layout draws everything into the shell — nothing is focusable, so
+            // it has no focus tile at all.
+            Screen::Pairing if self.pairing_is_display_pin() => None,
             Screen::Pairing => Some(match self.pairing_focus {
                 PairingFocus::Pin => {
                     ModalFocusKey::PairingDigit(self.pin_digit_index, self.pin_digits[self.pin_digit_index])
@@ -2002,6 +2177,7 @@ impl App {
                 self.experimental_focused,
                 self.settings.video_pacing,
                 self.settings.game_mode,
+                self.settings.gamestream_enabled,
             )),
             Screen::SendLogs => Some(ModalFocusKey::SendLogsButton(self.send_logs_focused)),
             // Neither has a single focused widget: the address form is one always-active
@@ -2061,7 +2237,7 @@ impl App {
                             self.pin_digits[self.pin_digit_index],
                         )?,
                         PairingFocus::RequestAccess => {
-                            let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                            let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                             let btn = Self::pairing_request_button_rect(card, fonts);
                             ui::render_pairing_button_tile(
                                 text_cache,
@@ -2780,8 +2956,9 @@ impl App {
                             w.focused,
                         )
                     }),
+                    Screen::Pairing if self.pairing_is_display_pin() => None,
                     Screen::Pairing => {
-                        let card = Self::pairing_card_rect(screen_w, screen_h, fonts);
+                        let card = self.pairing_card_rect(screen_w, screen_h, fonts);
                         Some(match self.pairing_focus {
                             PairingFocus::Pin => {
                                 let digit_y = Self::pairing_pin_row_y(card, fonts);

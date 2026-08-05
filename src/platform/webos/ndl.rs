@@ -76,7 +76,7 @@ struct NdlDataInfo {
 
 /// `NDL_VIDEO_TYPE` values this client can request (matches the codec the host's
 /// `Welcome` resolved — see `punktfunk_core::quic::CODEC_*`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NdlCodec {
     H264,
     H265,
@@ -229,6 +229,12 @@ fn ensure_init(app_id: &str) -> Result<()> {
         bail!("NDL_DirectMediaInit failed: ret={ret} error={}", last_error());
     }
     Ok(())
+}
+
+/// The app id NDL is initialised with. Overridable for dev builds installed under another id —
+/// NDL keys its session on the caller's app id, so a mismatch fails the load.
+pub fn app_id() -> String {
+    std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into())
 }
 
 /// One loaded NDL video decode session. Dropping unloads it (not `NDL_DirectMediaQuit`).

@@ -1,4 +1,5 @@
 //! Persisted identity (PEMs), known hosts, and settings (JSON). Layout mirrors `pf-client-core::trust`.
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -7,10 +8,9 @@ use serde::{Deserialize, Serialize};
 pub use crate::core::model::{
     CodecPref, ColorRangeOverride, GamepadType, KnownHost, LogLevelOverride, Settings, DESKTOP_PIN_ID,
 };
+pub use crate::core::protocol::Protocol;
 
-pub(crate) fn app_dir() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
-}
+pub(crate) use crate::services::paths::app_dir;
 
 fn identity_paths() -> (PathBuf, PathBuf) {
     let dir = app_dir();
@@ -34,10 +34,17 @@ fn known_hosts_path() -> PathBuf {
 }
 
 pub fn load_known_hosts() -> Vec<KnownHost> {
-    std::fs::read_to_string(known_hosts_path())
+    let mut hosts: Vec<KnownHost> = std::fs::read_to_string(known_hosts_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Pre-`HostTrust` records carry a bare `fingerprint` instead. Fold it in on the way out of
+    // the file, so nothing downstream ever sees the legacy shape. Not written back here — the
+    // next ordinary save retires the old field, and until then re-loading migrates again.
+    for host in &mut hosts {
+        host.migrate_legacy_trust();
+    }
+    hosts
 }
 
 /// Write-then-rename, never truncate-in-place: `std::fs::write` truncates first,
@@ -46,9 +53,24 @@ pub fn load_known_hosts() -> Vec<KnownHost> {
 /// silently discard every paired host / all settings. A rename on the same
 /// filesystem is atomic; readers see the old file or the new one, never a torn one.
 fn write_atomic(path: std::path::PathBuf, contents: &str, what: &'static str) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents).with_context(|| format!("write {what} (tmp)"))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("rename {what} into place"))
+    write_atomic_parts(&path, &[contents.as_bytes()], what)
+}
+
+/// Same discipline for byte payloads that arrive in pieces (a header plus a pixel buffer, say):
+/// the parts are written in order, so nothing has to be concatenated into one allocation first.
+///
+/// `.tmp` is appended to the whole filename rather than replacing an extension, which would make
+/// `id.raw` and `id` — two files the art cache keeps side by side — stage to the same path.
+pub(crate) fn write_atomic_parts(path: &Path, parts: &[&[u8]], what: &str) -> Result<()> {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = std::fs::File::create(&tmp).with_context(|| format!("create {what} (tmp)"))?;
+    for part in parts {
+        file.write_all(part).with_context(|| format!("write {what} (tmp)"))?;
+    }
+    drop(file);
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {what} into place"))
 }
 
 pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
@@ -56,16 +78,16 @@ pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
     write_atomic(known_hosts_path(), &json, "known-hosts.json")
 }
 
-/// Upserts by `(host, port)`, keeping the existing fingerprint if the new record
-/// doesn't have one (a fresh mDNS discovery shouldn't clobber a paired fingerprint) —
-/// same reasoning for `mac`, learned separately (see `App::drain_discovery`) and not
-/// necessarily known again at the point something else re-upserts this host. `pinned`
-/// is *always* kept from the existing record — only `KnownHost::toggle_pin` ever
-/// changes it, so no add/edit/re-pair flow may clobber it.
+/// Upserts by `(host, port)`, keeping the existing trust if the new record is unpaired
+/// (a fresh mDNS discovery shouldn't clobber a paired host) — same reasoning for `mac`,
+/// learned separately (see `App::drain_discovery`) and not necessarily known again at the
+/// point something else re-upserts this host. `pinned` is *always* kept from the existing
+/// record — only `KnownHost::toggle_pin` ever changes it, so no add/edit/re-pair flow may
+/// clobber it.
 pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
     if let Some(existing) = hosts.iter_mut().find(|h| h.host == new.host && h.port == new.port) {
-        if new.fingerprint.is_none() {
-            new.fingerprint = existing.fingerprint;
+        if !new.is_paired() {
+            new.trust = existing.trust;
         }
         if new.mac.is_empty() {
             new.mac.clone_from(&existing.mac);

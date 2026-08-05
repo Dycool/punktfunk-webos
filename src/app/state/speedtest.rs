@@ -56,12 +56,13 @@ impl App {
         let host = entry.host().to_string();
         let port = entry.port();
         let name = entry.name().to_string();
-        // Saved host: pinned fingerprint. Unpaired: TOFU (no persistence on test).
+        // Only reachable for a paired host (see `App::host_menu_actions`), so the pin is
+        // expected to be there; `None` still just falls back to TOFU rather than failing.
         let pin = self
             .known_hosts
             .iter()
             .find(|h| h.host == host && h.port == port)
-            .and_then(|h| h.fingerprint);
+            .and_then(crate::services::store::KnownHost::pin);
 
         self.speed_test_name = name;
         self.speed_test = Some(SpeedTestState::Connecting);
@@ -79,7 +80,7 @@ impl App {
                 port,
                 identity,
                 pin,
-                std::time::Duration::from_secs(20),
+                crate::services::budget::SPEED_TEST,
                 |partial| {
                     let _ = progress_tx.send(SpeedTestMsg::Progress(partial));
                 },

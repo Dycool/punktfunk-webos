@@ -13,9 +13,23 @@ impl App {
         self.entries.len() + 2
     }
 
+    /// Position of the host's own desktop entry in `games`, if its library lists one.
+    ///
+    /// `GameStream` hosts serve the desktop as an ordinary app, with real box art and a real id.
+    /// Where one exists it *is* the desktop card — the synthetic one below would be a second card
+    /// launching the same thing.
+    fn find_desktop_game_pos(&self) -> Option<usize> {
+        self.games
+            .iter()
+            .position(|g| crate::core::model::is_desktop_title(&g.title))
+    }
+
     /// Grid shape at `columns` columns; scans for pinned pins, so build once and reuse.
     pub(crate) fn grid_layout(&self, columns: usize) -> GridLayout {
-        let desktop_pinned = self.games_loaded
+        // With a real desktop entry in the library there is no synthetic card at all: it is an
+        // ordinary game, pinned (or not) through the same machinery as any other.
+        let synthetic_desktop = self.games_loaded && self.desktop_pos.is_none();
+        let desktop_pinned = synthetic_desktop
             && self
                 .selected_known_host()
                 .is_some_and(|h| h.is_pinned(store::DESKTOP_PIN_ID));
@@ -28,7 +42,7 @@ impl App {
         GridLayout {
             pinned_count: self.pinned_count,
             desktop_pinned,
-            desktop_in_rest: self.games_loaded && !desktop_pinned,
+            desktop_in_rest: synthetic_desktop && !desktop_pinned,
             front_count,
             pinned_rows,
             unpinned_start: pinned_rows * columns.max(1),
@@ -274,6 +288,13 @@ impl App {
     /// `known_hosts`' persisted pins for games the host no longer lists — otherwise
     /// a removed game keeps counting toward `MAX_PINNED_GAMES` forever.
     pub(crate) fn reorder_games_by_pin(&mut self) {
+        self.reorder_games_by_pin_inner();
+        // Reordering moves the desktop entry, so the cache is refreshed here — the only
+        // place `games`' order changes after a fetch.
+        self.desktop_pos = self.find_desktop_game_pos();
+    }
+
+    fn reorder_games_by_pin_inner(&mut self) {
         let Some(known_idx) = self
             .selected_host
             .as_ref()
@@ -286,9 +307,18 @@ impl App {
         let mut pinned = Vec::new();
         let mut still_pinned = Vec::new();
         for id in &pinned_ids {
-            // Desktop isn't in `self.games`, so it's never "missing".
             if id == store::DESKTOP_PIN_ID {
-                still_pinned.push(id.clone());
+                // A host that lists its own desktop app: rewrite the pin to that entry's id, so
+                // the card pins and unpins like any other. Done once, here, rather than special-
+                // cased at every pin site — and the rewrite is saved below.
+                // Live scan, not `desktop_pos`: the loop above is removing entries as it goes.
+                if let Some(pos) = self.find_desktop_game_pos() {
+                    still_pinned.push(self.games[pos].id.clone());
+                    pinned.push(self.games.remove(pos));
+                } else {
+                    // The synthetic card isn't in `self.games`, so it's never "missing".
+                    still_pinned.push(id.clone());
+                }
             } else if let Some(pos) = self.games.iter().position(|g| &g.id == id) {
                 pinned.push(self.games.remove(pos));
                 still_pinned.push(id.clone());
@@ -298,7 +328,8 @@ impl App {
         pinned.append(&mut self.games);
         self.games = pinned;
 
-        if still_pinned.len() != pinned_ids.len() {
+        // Not just a length check: the desktop rewrite above substitutes an id without dropping one.
+        if still_pinned != pinned_ids {
             self.known_hosts[known_idx].pinned = still_pinned;
             let _ = store::save_known_hosts(&self.known_hosts);
         }
@@ -378,7 +409,7 @@ impl App {
     pub(crate) fn confirm_sidebar_host(&mut self, idx: usize) {
         let entry = self.entries[idx].clone();
         match entry {
-            HostEntry::Known(h) if h.fingerprint.is_some() => {
+            HostEntry::Known(h) if h.is_paired() => {
                 let (host, port, mgmt_port) = (h.host, h.port, h.mgmt_port);
                 // Re-confirming the already-active host refreshes its library too — a
                 // user clicking it is asking to see the current game list, e.g. after
@@ -387,6 +418,23 @@ impl App {
             }
             _ => self.open_pairing(idx),
         }
+    }
+
+    /// Drops the selected host and everything drawn from its library — the grid, its art and any
+    /// in-flight fetch. Whatever removed the host from the sidebar (Forget, or the `GameStream`
+    /// toggle going off) must call this, or its grid stays on screen with no row to go back to.
+    pub(crate) fn clear_selected_host(&mut self) {
+        self.selected_host = None;
+        self.games = Vec::new();
+        self.games_loaded = false;
+        self.desktop_pos = None;
+        self.pinned_count = 0;
+        self.art.clear();
+        self.art_loader = None;
+        self.games_rx = None;
+        self.home_status = None;
+        self.home_focus = HomeFocus::Sidebar(0);
+        self.grid_dirty = true;
     }
 
     /// Selects host and kicks off async library fetch; avoids blocking the UI thread (used to freeze input).
@@ -402,6 +450,7 @@ impl App {
         self.games = Vec::new();
         self.pinned_count = 0;
         self.games_loaded = false;
+        self.desktop_pos = None;
         self.art.clear();
         // Dropping the loader stops its worker (its request channel closes), so a host
         // switch abandons in-flight fetches for the previous library.
@@ -413,14 +462,13 @@ impl App {
         self.grid_scroll_target = 0;
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
-        let fingerprint = self
-            .known_hosts
-            .iter()
-            .find(|h| h.host == host && h.port == port)
-            .and_then(|h| h.fingerprint);
-        let mgmt_port = mgmt_port.unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
+        let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
+        let fingerprint = known.and_then(store::KnownHost::pin);
+        let backend = crate::backend::backend_for(known.map(|h| h.protocol).unwrap_or_default());
+        let mgmt_port = mgmt_port.unwrap_or_else(|| backend.default_query_port());
         tracing::debug!("library: fetching from {host}:{mgmt_port}…");
         self.games_rx = Some(crate::services::library::load_games_async(
+            backend,
             host,
             port,
             mgmt_port,
@@ -450,22 +498,19 @@ impl App {
                 games.sort_by_key(|g| g.title.to_lowercase());
                 tracing::info!("library: {} games from {host}:{mgmt_port}", games.len());
                 let identity = (self.identity.0.clone(), self.identity.1.clone());
-                let fingerprint = self
-                    .known_hosts
-                    .iter()
-                    .find(|h| h.host == host && h.port == port)
-                    .and_then(|h| h.fingerprint);
+                let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
+                let fingerprint = known.and_then(store::KnownHost::pin);
+                let backend = crate::backend::backend_for(known.map(|h| h.protocol).unwrap_or_default());
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
-                let (card_w, card_h) = self.card_size;
                 self.art_loader = Some(crate::services::art::ArtLoader::spawn(
+                    backend,
                     host,
                     port,
                     mgmt_port,
                     identity,
                     fingerprint,
-                    card_w,
-                    card_h,
+                    self.card_size,
                 ));
                 self.games = games;
                 self.games_loaded = true;
@@ -517,7 +562,20 @@ impl App {
         let Some(known) = self.known_hosts.iter().find(|h| h.host == host && h.port == port) else {
             return;
         };
-        let Some(fingerprint) = known.fingerprint else { return };
+        // Only punktfunk has a host key to pin, and there it is also the pair state: no pin means
+        // the host was never paired, so there is nothing to connect with. `GameStream` carries its
+        // trust as the registered client certificate instead, which `query::open` restores.
+        let protocol = known.protocol;
+        let fingerprint = known.pin();
+        if protocol == store::Protocol::Punktfunk && fingerprint.is_none() {
+            return;
+        }
+        // `GameStream` serves launches from the same port it serves queries from, which discovery
+        // stored in both fields — but a hand-added host has only `port`, so fall back to it.
+        let port = match protocol {
+            store::Protocol::GameStream => known.mgmt_port.unwrap_or(port),
+            store::Protocol::Punktfunk => port,
+        };
         let (launch, title) = match self.grid_card_at(idx, columns) {
             Some(GridCard::Desktop) => (None, "Desktop".to_string()),
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
@@ -541,6 +599,7 @@ impl App {
         self.launch_ready = Some(ConnectTarget {
             host,
             port,
+            protocol,
             fingerprint,
             launch,
         });
@@ -559,16 +618,28 @@ impl App {
             return;
         };
         let (host, port) = (h.host.clone(), h.port);
+        // Tell the host to forget us too, where the protocol has somewhere to say that
+        // (`BackendCaps::unpair`). Fire-and-forget on a worker: the record goes away either way —
+        // a host that is offline must not block Forget — and there is no UI left to report into
+        // once this modal closes. `mgmt_port` unwraps to the backend's own default.
+        let backend = crate::backend::backend_for(h.protocol);
+        if backend.caps().unpair {
+            let (addr, query_port) = (
+                host.clone(),
+                h.mgmt_port.unwrap_or_else(|| backend.default_query_port()),
+            );
+            std::thread::spawn(move || {
+                if let Err(e) = backend.unpair(&addr, query_port) {
+                    tracing::warn!("unpair {addr}:{query_port} failed: {e}");
+                }
+            });
+        }
         crate::services::art::clear_host_cache(&host, port);
         self.known_hosts.retain(|k| !(k.host == host && k.port == port));
         let _ = store::save_known_hosts(&self.known_hosts);
-        self.entries = self.known_hosts.iter().cloned().map(HostEntry::Known).collect();
+        self.rebuild_entries();
         if self.selected_host.as_ref() == Some(&(host, port)) {
-            self.selected_host = None;
-            self.games = Vec::new();
-            self.games_loaded = false;
-            self.home_status = None;
-            self.home_focus = HomeFocus::Sidebar(0);
+            self.clear_selected_host();
         }
         let sidebar_len = self.sidebar_len();
         if let HomeFocus::Sidebar(i) = &mut self.home_focus {
