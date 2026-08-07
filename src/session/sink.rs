@@ -2,12 +2,9 @@
 //!
 //! Everything between "an access unit arrived" and "NDL has been fed" lives here: host-PTS
 //! anchoring, the refresh-rate-reconciled [`PtsPacer`], backpressure metering,
-//! freeze-until-reanchor, and keyframe-request throttling. Protocol pumps keep only the
-//! parts that are protocol-shaped — pulling frames, and *how* a keyframe is asked for.
-//!
-//! The seam that serves both protocols is [`SinkResult::NeedKeyframe`]: punktfunk's pump
-//! answers it with `NativeClient::request_keyframe`, `GameStream` with
-//! `DecodeResult::NeedIdr`.
+//! freeze-until-reanchor, and keyframe-request throttling. The video pump keeps only the
+//! parts that are wire-shaped — pulling frames, and *how* a keyframe is asked for, which it
+//! answers to [`SinkResult::NeedKeyframe`] with `NativeClient::request_keyframe`.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

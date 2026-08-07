@@ -114,14 +114,6 @@ impl HostEntry {
     pub fn is_paired(&self) -> bool {
         matches!(self, Self::Known(h) if h.is_paired())
     }
-    /// Which protocol this host speaks — decided at discovery/add time, never probed. Screens use
-    /// it to look up a `backend::HostBackend` and gate affordances off its `caps()`.
-    pub fn protocol(&self) -> crate::core::protocol::Protocol {
-        match self {
-            Self::Known(h) => h.protocol,
-            Self::Discovered(h) => h.protocol,
-        }
-    }
     pub fn mgmt_port(&self) -> Option<u16> {
         match self {
             Self::Known(h) => h.mgmt_port,

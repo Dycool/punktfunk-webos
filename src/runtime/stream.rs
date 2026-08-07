@@ -627,8 +627,8 @@ pub(super) fn run_inner() -> Result<()> {
                             } else {
                                 backlog.to_string()
                             };
-                            // "n/a" rather than 0 where the protocol has no such counter — a zero
-                            // would read as "no loss", which is a different claim.
+                            // "n/a" rather than 0 where there is no such counter — a zero would
+                            // read as "no loss", which is a different claim.
                             let or_na = |v: Option<u64>| v.map_or_else(|| "n/a".to_string(), |v| v.to_string());
                             format!(
                                 "Drop {} · FEC {} · hold {} · buf {backlog}",
@@ -722,10 +722,9 @@ pub(super) fn run_inner() -> Result<()> {
                 tracing::info!("host ended the session");
                 // `is_session_ended` covers both a graceful host close and a network
                 // drop/idle-timeout (see `NativeClient::is_session_ended`'s doc) — no
-                // signal distinguishes them on punktfunk, so one message covers both;
-                // `GameStream` has the host's reason code and says more where it can (see
-                // `StreamHandle::end_message`). But this also flips true right after *our
-                // own* `disconnect_quit()` calls above (Back/dialog, SIGTERM) — skip the
+                // signal distinguishes them, so one message covers both. But this also
+                // flips true right after *our own* `disconnect_quit()` calls above
+                // (Back/dialog, SIGTERM) — skip the
                 // toast for those, it's not news to the user who just asked to disconnect.
                 if !client_initiated_disconnect {
                     menu_toast = Some(connected.end_message());

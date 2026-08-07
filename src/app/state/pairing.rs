@@ -1,7 +1,6 @@
-//! Pairing modal logic — punktfunk's PIN entry and request-access ceremonies, and
-//! `GameStream`'s inverted display-PIN one. Rendering lives in `app::view::pairing`.
+//! Pairing modal logic — the PIN entry and request-access ceremonies. Rendering lives in
+//! `app::view::pairing`.
 use crate::app::{App, PairingOutcome};
-use crate::core::protocol::{HostTrust, Protocol};
 use crate::core::screen::{PairingFocus, Screen};
 use crate::services::store::{self, KnownHost};
 use crate::ui::MenuEvent;
@@ -14,93 +13,10 @@ impl App {
         self.pin_digits = [0; 4];
         self.pin_digit_index = 0;
         self.pairing_status = None;
-        self.pairing_pin_shown = None;
         self.screen = Screen::Pairing;
-        // `GameStream` inverts the ceremony: there is nothing for the user to type here, so the
-        // modal opens straight into the wait with the PIN it must show. No focusable element and
-        // no Confirm — Back is the only input the layout accepts.
-        if self.entries.get(idx).map(crate::ui::HostEntry::protocol) == Some(Protocol::GameStream) {
-            self.pairing_focus = PairingFocus::Pin;
-            self.start_gamestream_pairing();
-            return;
-        }
-        // Request access is the default *where the protocol has it*: it is the path that always
-        // works, whereas the PIN additionally needs the host's pairing page open and armed. A
-        // protocol without it must not open focused on a button it doesn't offer — see
-        // `backend::BackendCaps::request_access`.
-        let request_access = self
-            .entries
-            .get(idx)
-            .is_some_and(|e| crate::backend::backend_for(e.protocol()).caps().request_access);
-        self.pairing_focus = if request_access {
-            PairingFocus::RequestAccess
-        } else {
-            PairingFocus::Pin
-        };
-    }
-
-    /// Whether the modal is the display-PIN layout: we generate the PIN and the user types it
-    /// into the host, rather than the reverse. Keyed off the host's protocol rather than off
-    /// `pairing_pin_shown` being `Some`, so a failed ceremony keeps its layout (and its
-    /// error line) instead of flipping to punktfunk's digit row.
-    pub(crate) fn pairing_is_display_pin(&self) -> bool {
-        self.entries.get(self.pairing_entry).map(crate::ui::HostEntry::protocol) == Some(Protocol::GameStream)
-    }
-
-    /// Generates a PIN, shows it, and runs the five-phase handshake off-thread.
-    ///
-    /// Everything about this blocks for human-scale time: `identity::load_or_create_client` does
-    /// RSA-2048 keygen on first use (seconds on this `SoC`) and the handshake then waits for
-    /// someone to walk to their PC and type four digits. Hence a worker thread and the same
-    /// `pairing_rx` channel the other two ceremonies use.
-    fn start_gamestream_pairing(&mut self) {
-        let entry = &self.entries[self.pairing_entry];
-        let host = entry.host().to_string();
-        let port = entry.port();
-        let name = entry.name().to_string();
-        let mgmt_port = entry.mgmt_port();
-        let mac = entry.mac().to_vec();
-
-        let pin = match crate::backend::gamestream::query::generate_pin() {
-            Ok(pin) => pin,
-            Err(e) => {
-                // No entropy means no ceremony; there is nothing to retry off-thread.
-                self.pairing_status = Some(crate::errors::friendly(&e));
-                return;
-            }
-        };
-        self.pairing_pin_shown = Some(pin.to_string());
-        self.pairing_busy = true;
-        self.pairing_status = Some("Waiting for the host — enter the PIN there.".into());
-        tracing::info!("GameStream pairing with {host}:{port}");
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.pairing_rx = Some(rx);
-        std::thread::spawn(move || {
-            // A `GameStream` host advertises no MAC over mDNS, so `entry.mac()` is always empty
-            // here — `/serverinfo` carries one, and pairing already holds an open host. Skipping it
-            // would work (the reachability sweep's `wake_mac` learns it eventually) but leaves the
-            // host unwakeable until then.
-            let mut mac = mac;
-            let result = crate::backend::gamestream::query::open(&host, Some(port))
-                .and_then(|h| {
-                    crate::backend::gamestream::query::pair(&h, pin)?;
-                    if mac.is_empty() {
-                        mac = crate::backend::gamestream::reported_mac(&host, &h);
-                    }
-                    Ok(HostTrust::ClientCertPaired)
-                })
-                .map_err(|e| crate::errors::friendly(&e));
-            let _ = tx.send(PairingOutcome {
-                host,
-                port,
-                name,
-                protocol: Protocol::GameStream,
-                mgmt_port,
-                mac,
-                result,
-            });
-        });
+        // Request access is the default: it is the path that always works, whereas the PIN
+        // additionally needs the host's pairing page open and armed.
+        self.pairing_focus = PairingFocus::RequestAccess;
     }
 
     /// Handle pairing events (PIN row or Request Access button).
@@ -112,7 +28,6 @@ impl App {
                 self.pairing_rx = None;
                 self.pairing_busy = false;
                 self.pairing_status = None;
-                self.pairing_pin_shown = None;
                 self.screen = Screen::Home;
             }
             return;
@@ -122,14 +37,8 @@ impl App {
         match ev {
             MenuEvent::Back => {
                 self.screen = Screen::Home;
-                self.pairing_pin_shown = None;
                 return;
             }
-            // The display-PIN layout has no focusable element and no second method to switch to,
-            // so every remaining event is a no-op. Reached only after a failed ceremony (during
-            // one, the busy guard above has already returned) — without this, Confirm would run
-            // punktfunk's PIN handshake against a `GameStream` host.
-            _ if self.pairing_is_display_pin() => return,
             MenuEvent::Secondary => {
                 self.pairing_focus = match self.pairing_focus {
                     PairingFocus::Pin => PairingFocus::RequestAccess,
@@ -205,13 +114,11 @@ impl App {
         self.pairing_rx = Some(rx);
         std::thread::spawn(move || {
             let result = crate::session::request_access(&host, port, identity, crate::services::budget::HOST_WAIT)
-                .map(HostTrust::Pinned)
                 .map_err(|e| crate::errors::friendly(&e));
             let _ = tx.send(PairingOutcome {
                 host,
                 port,
                 name,
-                protocol: Protocol::Punktfunk,
                 mgmt_port,
                 mac,
                 result,
@@ -225,18 +132,16 @@ impl App {
         let Ok(outcome) = rx.try_recv() else { return false };
         self.pairing_rx = None;
         self.pairing_busy = false;
-        self.pairing_pin_shown = None;
         match outcome.result {
-            Ok(trust) => {
-                tracing::info!("paired ok ({}:{}), trust {trust:?}", outcome.host, outcome.port);
+            Ok(fingerprint) => {
+                tracing::info!("paired ok ({}:{})", outcome.host, outcome.port);
                 store::upsert_known_host(
                     &mut self.known_hosts,
                     KnownHost {
                         name: outcome.name,
                         host: outcome.host.clone(),
                         port: outcome.port,
-                        protocol: outcome.protocol,
-                        trust,
+                        fingerprint: Some(fingerprint),
                         mgmt_port: outcome.mgmt_port,
                         mac: outcome.mac,
                         // Preserved across a re-add by `upsert_known_host`; off for a genuinely new host.
@@ -244,7 +149,6 @@ impl App {
                         // Only reaches a genuinely new host — `upsert_known_host` keeps an
                         // existing record's pins.
                         pinned: vec![store::DESKTOP_PIN_ID.to_string()],
-                        ..KnownHost::default()
                     },
                 );
                 let _ = store::save_known_hosts(&self.known_hosts);
@@ -301,12 +205,10 @@ impl App {
                 (&identity.0, &identity.1),
                 &pin,
                 "webOS TV",
-                // The same window `GameStream` PIN pairing gets: both are a handshake gated on a
-                // human, and the old 30 s here was the only reason the two protocols timed out
-                // differently on the same screen.
+                // A handshake gated on a human walking to their PC, so it gets the long
+                // host-wait budget rather than the old 30 s.
                 crate::services::budget::HOST_WAIT,
             )
-            .map(HostTrust::Pinned)
             .map_err(|e| crate::errors::pair_message(&e));
             // Send failing just means the user backed out and the receiver is
             // gone — nothing to deliver to.
@@ -314,7 +216,6 @@ impl App {
                 host,
                 port,
                 name,
-                protocol: Protocol::Punktfunk,
                 mgmt_port,
                 mac,
                 result,

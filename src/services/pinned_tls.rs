@@ -1,9 +1,9 @@
 //! `ureq` transport plumbing for TLS against a self-signed peer.
 //!
-//! Both protocols authenticate the host by its certificate rather than by a CA chain
-//! (punktfunk pins a SHA-256 fingerprint, `GameStream` pins the exact certificate handed
-//! over during pairing), and `ureq`'s own `TlsConfig` has no hook for installing a custom
-//! `rustls` verifier. So both build a `rustls::ClientConfig` themselves and hand it here.
+//! The host is authenticated by its certificate rather than by a CA chain (a SHA-256
+//! fingerprint pinned at pairing time), and `ureq`'s own `TlsConfig` has no hook for installing
+//! a custom `rustls` verifier. So the caller builds a `rustls::ClientConfig` itself and hands
+//! it here.
 //!
 //! Modeled directly on ureq 3.x's own (crate-private) `RustlsConnector`
 //! (`ureq` crate, `src/tls/rustls.rs`), minus its `TlsConfig`-driven `build_config` step.

@@ -15,9 +15,9 @@ impl App {
 
     /// Position of the host's own desktop entry in `games`, if its library lists one.
     ///
-    /// `GameStream` hosts serve the desktop as an ordinary app, with real box art and a real id.
-    /// Where one exists it *is* the desktop card — the synthetic one below would be a second card
-    /// launching the same thing.
+    /// A host that already lists its desktop as an ordinary app gives it real box art and a real
+    /// id. Where one exists it *is* the desktop card — the synthetic one below would be a second
+    /// card launching the same thing.
     fn find_desktop_game_pos(&self) -> Option<usize> {
         self.games
             .iter()
@@ -421,8 +421,8 @@ impl App {
     }
 
     /// Drops the selected host and everything drawn from its library — the grid, its art and any
-    /// in-flight fetch. Whatever removed the host from the sidebar (Forget, or the `GameStream`
-    /// toggle going off) must call this, or its grid stays on screen with no row to go back to.
+    /// in-flight fetch. Whatever removed the host from the sidebar (Forget) must call this, or
+    /// its grid stays on screen with no row to go back to.
     pub(crate) fn clear_selected_host(&mut self) {
         self.selected_host = None;
         self.games = Vec::new();
@@ -464,11 +464,9 @@ impl App {
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
         let fingerprint = known.and_then(store::KnownHost::pin);
-        let backend = crate::backend::backend_for(known.map(|h| h.protocol).unwrap_or_default());
-        let mgmt_port = mgmt_port.unwrap_or_else(|| backend.default_query_port());
+        let mgmt_port = mgmt_port.unwrap_or(crate::services::library::DEFAULT_MGMT_PORT);
         tracing::debug!("library: fetching from {host}:{mgmt_port}…");
         self.games_rx = Some(crate::services::library::load_games_async(
-            backend,
             host,
             port,
             mgmt_port,
@@ -500,11 +498,9 @@ impl App {
                 let identity = (self.identity.0.clone(), self.identity.1.clone());
                 let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
                 let fingerprint = known.and_then(store::KnownHost::pin);
-                let backend = crate::backend::backend_for(known.map(|h| h.protocol).unwrap_or_default());
                 // Covers are requested per card as the grid window reaches them (see
                 // `App::prepare_tiles`), not fetched for the whole library up front.
                 self.art_loader = Some(crate::services::art::ArtLoader::spawn(
-                    backend,
                     host,
                     port,
                     mgmt_port,
@@ -562,20 +558,12 @@ impl App {
         let Some(known) = self.known_hosts.iter().find(|h| h.host == host && h.port == port) else {
             return;
         };
-        // Only punktfunk has a host key to pin, and there it is also the pair state: no pin means
-        // the host was never paired, so there is nothing to connect with. `GameStream` carries its
-        // trust as the registered client certificate instead, which `query::open` restores.
-        let protocol = known.protocol;
+        // The pin is also the pair state: no pin means the host was never paired, so there is
+        // nothing to connect with.
         let fingerprint = known.pin();
-        if protocol == store::Protocol::Punktfunk && fingerprint.is_none() {
+        if fingerprint.is_none() {
             return;
         }
-        // `GameStream` serves launches from the same port it serves queries from, which discovery
-        // stored in both fields — but a hand-added host has only `port`, so fall back to it.
-        let port = match protocol {
-            store::Protocol::GameStream => known.mgmt_port.unwrap_or(port),
-            store::Protocol::Punktfunk => port,
-        };
         let (launch, title) = match self.grid_card_at(idx, columns) {
             Some(GridCard::Desktop) => (None, "Desktop".to_string()),
             Some(GridCard::Game(game)) => (Some(game.id.clone()), game.title.clone()),
@@ -609,7 +597,6 @@ impl App {
         self.launch_ready = Some(ConnectTarget {
             host,
             port,
-            protocol,
             fingerprint,
             launch,
         });
@@ -628,22 +615,6 @@ impl App {
             return;
         };
         let (host, port) = (h.host.clone(), h.port);
-        // Tell the host to forget us too, where the protocol has somewhere to say that
-        // (`BackendCaps::unpair`). Fire-and-forget on a worker: the record goes away either way —
-        // a host that is offline must not block Forget — and there is no UI left to report into
-        // once this modal closes. `mgmt_port` unwraps to the backend's own default.
-        let backend = crate::backend::backend_for(h.protocol);
-        if backend.caps().unpair {
-            let (addr, query_port) = (
-                host.clone(),
-                h.mgmt_port.unwrap_or_else(|| backend.default_query_port()),
-            );
-            std::thread::spawn(move || {
-                if let Err(e) = backend.unpair(&addr, query_port) {
-                    tracing::warn!("unpair {addr}:{query_port} failed: {e}");
-                }
-            });
-        }
         crate::services::art::clear_host_cache(&host, port);
         self.known_hosts.retain(|k| !(k.host == host && k.port == port));
         let _ = store::save_known_hosts(&self.known_hosts);

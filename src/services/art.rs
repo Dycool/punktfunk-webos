@@ -260,10 +260,6 @@ fn resize_pixmap(src: &Pixmap, w: u32, h: u32) -> Option<Pixmap> {
 
 /// `worker`'s fixed, per-host config — bundled to keep its arg count sane.
 struct WorkerConfig {
-    /// Which protocol's art transport to open — see `backend::ArtFetch`. This module knows
-    /// nothing about how a cover is fetched, only that `ArtRequest::paths` are handles the
-    /// backend understands.
-    backend: &'static dyn crate::backend::HostBackend,
     host: String,
     query_port: u16,
     identity: (String, String),
@@ -292,7 +288,6 @@ impl ArtLoader {
     /// Spawn loader. `query_port` is what's dialed (separate from identity `port`).
     /// Card dimensions determine cover stretch-to size.
     pub fn spawn(
-        backend: &'static dyn crate::backend::HostBackend,
         host: String,
         port: u16,
         query_port: u16,
@@ -304,7 +299,6 @@ impl ArtLoader {
         let (tx_done, rx_done) = std::sync::mpsc::channel::<ArtLoaded>();
         let dir = cache_dir(&host, port);
         let config = WorkerConfig {
-            backend,
             host,
             query_port,
             identity,
@@ -428,7 +422,6 @@ impl ArtLoader {
 
 fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoaded>) {
     let WorkerConfig {
-        backend,
         host,
         query_port,
         identity,
@@ -498,18 +491,18 @@ fn worker(config: &WorkerConfig, rx: &Receiver<ArtRequest>, tx: &Sender<ArtLoade
             Ok(b) if !b.is_empty() => b,
             _ => {
                 if fetcher.is_none() {
-                    match backend.art_fetcher(host, query_port, identity, fingerprint) {
-                        Ok(f) => fetcher = Some(f),
+                    match crate::services::library::agent(identity, fingerprint) {
+                        Ok(a) => fetcher = Some(a),
                         Err(e) => {
                             tracing::warn!("art: {} opening art transport failed: {e}", req.game_id);
                             continue;
                         }
                     }
                 }
-                let Some(f) = fetcher.as_ref() else { continue };
+                let Some(agent) = fetcher.as_ref() else { continue };
                 let mut fetched = None;
                 for path in &req.paths {
-                    match f.fetch(path) {
+                    match crate::services::library::fetch_art(agent, host, query_port, path) {
                         Ok(b) => {
                             fetched = Some(b);
                             break;

@@ -38,14 +38,10 @@ pub(super) fn run_ui_flow(
             crate::app::ConnectTarget {
                 host,
                 port,
-                // The override names a punktfunk host and port pair; a `GameStream` one would need
-                // a paired identity this file has no way to name.
-                protocol: store::Protocol::Punktfunk,
                 fingerprint: None,
                 launch: None,
             },
             settings,
-            false,
         )?;
         return Ok(Some((handle, settings)));
     }
@@ -177,8 +173,6 @@ pub(super) fn run_ui_flow(
         dirty |= app.drain_pairing();
         dirty |= app.drain_speed_test();
         dirty |= app.drain_send_logs();
-        dirty |= app.drain_quit_app();
-        dirty |= app.drain_gamestream_probe();
         app.tick_reachability();
         dirty |= app.drain_reachability();
         dirty |= app.tick_wake();
@@ -205,7 +199,7 @@ pub(super) fn run_ui_flow(
                 // `SettingsWriter`, so re-reading disk here could race the write and
                 // connect with the stale value. `app.settings` is updated synchronously.
                 let settings = resolve_gamepad_type(app.settings, game_controller);
-                let handle = spawn_connect(identity.clone(), target, settings, controller.is_some())?;
+                let handle = spawn_connect(identity.clone(), target, settings)?;
                 connect_handle = Some((handle, settings));
             }
         }
