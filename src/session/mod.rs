@@ -114,12 +114,11 @@ pub fn clock_ticks_per_sec() -> u64 {
 /// cadence, but the FFI calls they make between checks (NDL `play`/`play_audio`, and the
 /// QUIC-close worker `NativeClient::drop` joins internally) have no timeout of their own — an
 /// intermittently wedged vendor call must not freeze the whole app on the caller's thread.
-/// Also the ceiling `GsStream::shutdown` waits on (a different mechanism, same rationale).
+/// Also the ceiling the stream teardown waits on (a different mechanism, same rationale).
 pub const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// punktfunk's keyframe-request throttle: the request travels on its own QUIC control stream, so a
-/// tight interval costs nothing but the request itself. `GameStream` throttles far harder — see
-/// `backend::gamestream::stream`'s own constant.
+/// The keyframe-request throttle: the request travels on its own QUIC control stream, so a
+/// tight interval costs nothing but the request itself.
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Joins `handle` from a watcher thread so a hang inside it can't block the caller past

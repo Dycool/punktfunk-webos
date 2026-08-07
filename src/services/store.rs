@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 pub use crate::core::model::{
     CodecPref, ColorRangeOverride, GamepadType, KnownHost, LogLevelOverride, Settings, DESKTOP_PIN_ID,
 };
-pub use crate::core::protocol::Protocol;
-
 pub(crate) use crate::services::paths::app_dir;
 
 fn identity_paths() -> (PathBuf, PathBuf) {
@@ -34,17 +32,10 @@ fn known_hosts_path() -> PathBuf {
 }
 
 pub fn load_known_hosts() -> Vec<KnownHost> {
-    let mut hosts: Vec<KnownHost> = std::fs::read_to_string(known_hosts_path())
+    std::fs::read_to_string(known_hosts_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    // Pre-`HostTrust` records carry a bare `fingerprint` instead. Fold it in on the way out of
-    // the file, so nothing downstream ever sees the legacy shape. Not written back here — the
-    // next ordinary save retires the old field, and until then re-loading migrates again.
-    for host in &mut hosts {
-        host.migrate_legacy_trust();
-    }
-    hosts
+        .unwrap_or_default()
 }
 
 /// Write-then-rename, never truncate-in-place: `std::fs::write` truncates first,
@@ -78,7 +69,7 @@ pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
     write_atomic(known_hosts_path(), &json, "known-hosts.json")
 }
 
-/// Upserts by `(host, port)`, keeping the existing trust if the new record is unpaired
+/// Upserts by `(host, port)`, keeping the existing fingerprint if the new record is unpaired
 /// (a fresh mDNS discovery shouldn't clobber a paired host) — same reasoning for `mac`,
 /// learned separately (see `App::drain_discovery`) and not necessarily known again at the
 /// point something else re-upserts this host. `pinned` is *always* kept from the existing
@@ -87,7 +78,7 @@ pub fn save_known_hosts(hosts: &[KnownHost]) -> Result<()> {
 pub fn upsert_known_host(hosts: &mut Vec<KnownHost>, mut new: KnownHost) {
     if let Some(existing) = hosts.iter_mut().find(|h| h.host == new.host && h.port == new.port) {
         if !new.is_paired() {
-            new.trust = existing.trust;
+            new.fingerprint = existing.fingerprint;
         }
         if new.mac.is_empty() {
             new.mac.clone_from(&existing.mac);

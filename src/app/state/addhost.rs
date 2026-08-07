@@ -47,16 +47,12 @@ impl App {
                 wol_auto: false,
                 // upsert_known_host keeps an existing record's pins
                 pinned: vec![store::DESKTOP_PIN_ID.to_string()],
-                // Defaults: punktfunk protocol and unpaired trust. `upsert_known_host` keeps
-                // an existing record's trust, so re-adding a paired host doesn't unpair it.
+                // Defaults to unpaired. `upsert_known_host` keeps an existing record's
+                // fingerprint, so re-adding a paired host doesn't unpair it.
                 ..store::KnownHost::default()
             },
         );
         let _ = store::save_known_hosts(&self.known_hosts);
-        // The record above is punktfunk, because that is what a bare address means here. If the
-        // address turns out to be a `GameStream` host, the probe rewrites it — see
-        // `App::probe_gamestream_fallback`, which is a no-op unless the toggle is on.
-        self.probe_gamestream_fallback(host.clone(), port);
         self.rebuild_entries();
         self.home_focus = HomeFocus::Sidebar(
             self.entries

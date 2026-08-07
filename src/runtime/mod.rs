@@ -42,64 +42,8 @@ fn resolve_gamepad_type(
     settings
 }
 
-/// Start the connect on its own thread, dispatched by protocol. Caller joins after animation (or
-/// immediately).
+/// Start the connect on its own thread. Caller joins after animation (or immediately).
 fn spawn_connect(
-    identity: (String, String),
-    target: crate::app::ConnectTarget,
-    settings: store::Settings,
-    gamepad_attached: bool,
-) -> Result<std::thread::JoinHandle<Result<StreamHandle>>> {
-    match target.protocol {
-        store::Protocol::Punktfunk => spawn_connect_punktfunk(identity, target, settings),
-        store::Protocol::GameStream => spawn_connect_gamestream(target, settings, gamepad_attached),
-    }
-}
-
-/// `GameStream`: `/launch` and the stream driver both live behind
-/// `backend::gamestream::stream::connect`, so the hero-handover timing in `run_ui_flow` sees the
-/// same "one blocking connect on one thread" shape it always did.
-fn spawn_connect_gamestream(
-    target: crate::app::ConnectTarget,
-    settings: store::Settings,
-    gamepad_attached: bool,
-) -> Result<std::thread::JoinHandle<Result<StreamHandle>>> {
-    use crate::backend::gamestream::stream::{connect, GsConnectSpec};
-    std::thread::Builder::new()
-        .name("punktfunk-webos-connect".into())
-        .spawn(move || {
-            tracing::info!(
-                "GameStream: requesting {}x{}@{} from {}:{}",
-                settings.width,
-                settings.height,
-                settings.refresh_hz,
-                target.host,
-                target.port,
-            );
-            connect(GsConnectSpec {
-                addr: target.host,
-                query_port: target.port,
-                app_id: target.launch,
-                width: settings.width,
-                height: settings.height,
-                refresh_hz: settings.refresh_hz,
-                bitrate_kbps: settings.bitrate_kbps,
-                hdr_enabled: settings.hdr_enabled,
-                codec: settings.codec,
-                color_range_override: settings.color_range_override,
-                video_pacing: settings.video_pacing,
-                gamepad_type: settings.gamepad_type,
-                gamepad_attached,
-                // A `GameStream` host is always paired, so there is no approval to park on: this is
-                // the "answered but still starting" budget, spent only once it has answered.
-                host_wait: crate::services::budget::HOST_WAIT,
-            })
-            .map(StreamHandle::GameStream)
-        })
-        .context("spawn connect thread")
-}
-
-fn spawn_connect_punktfunk(
     identity: (String, String),
     target: crate::app::ConnectTarget,
     settings: store::Settings,
@@ -143,7 +87,7 @@ fn spawn_connect_punktfunk(
                 settings.gamepad_type,
                 settings.cursor_capture,
             )
-            .map(StreamHandle::Punktfunk)
+            .map(StreamHandle)
         })
         .context("spawn connect thread")
 }
