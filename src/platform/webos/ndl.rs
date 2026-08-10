@@ -1,7 +1,7 @@
 //! Safe wrapper over webOS's NDL `DirectMedia` v2 API (`NDL_Direct*`, webOS 5+).
 //! Video only; audio via SDL2. Never calls `NDL_DirectVideoSetArea` (causes stutter above 1080p).
 use std::ffi::{c_char, c_int, c_longlong, c_uint, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{bail, Result};
@@ -216,6 +216,59 @@ fn last_error() -> String {
 
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Count of video/audio pump threads leaked past `SHUTDOWN_JOIN_TIMEOUT` (see
+/// `session::join_with_timeout`), not yet confirmed exited. A leaked thread may still be
+/// inside an `NDL_Direct*` call and still holds a live `NdlVideo` with its own unsynchronized
+/// `ffi` mutex — a second `NDL_DirectMediaLoad` on top of that races it instead of starting
+/// clean, reproducing as an undecodable stream rather than a clean failure.
+///
+/// No way to force this: an OS thread can't be safely cancelled mid-FFI-call, and racing
+/// `NDL_DirectMediaUnload` against it is the exact hazard this guards against. So `load()`
+/// refuses while nonzero, and dropping the [`LeakGuard`] clears it in-process (no restart) once the
+/// leaked thread actually returns — its `NdlVideo::drop` has run the real unload by then.
+static LEAKED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// One leaked NDL-touching thread, for as long as this value lives (see [`LEAKED_THREADS`]).
+///
+/// A guard rather than a `poison`/`recovered` pair of calls: both ways of mispairing them are
+/// silent — a missed decrement refuses streaming until restart, an extra one re-permits it while a
+/// thread is still inside NDL. Ownership makes the pairing structural.
+pub struct LeakGuard(());
+
+impl Drop for LeakGuard {
+    fn drop(&mut self) {
+        if LEAKED_THREADS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            tracing::info!(
+                "NDL recovered: the wedged decode thread finished and unloaded cleanly — streaming re-enabled"
+            );
+        }
+    }
+}
+
+/// Marks one NDL-touching thread as leaked until the returned guard drops — which the caller must
+/// arrange to happen when that same thread actually finishes, however late. Leaking the guard
+/// (`mem::forget`) is the deliberate "nothing will ever tell us it recovered" case.
+#[must_use = "NDL stays poisoned until this guard drops — hold it until the wedged thread returns"]
+pub fn poison() -> LeakGuard {
+    if LEAKED_THREADS.fetch_add(1, Ordering::SeqCst) == 0 {
+        tracing::error!(
+            "NDL poisoned: a decode thread is wedged past its join deadline — streaming \
+             refused until it actually finishes (no safe way to force it sooner)"
+        );
+    }
+    LeakGuard(())
+}
+
+/// `Err` while any leaked thread might still be live (see [`LEAKED_THREADS`]). One gate, one
+/// wording: `load()` enforces it and `session::connect` checks it early to avoid holding a host
+/// session slot for a connect that can only end here.
+pub fn ensure_not_poisoned() -> Result<()> {
+    if LEAKED_THREADS.load(Ordering::SeqCst) > 0 {
+        bail!("NDL is still tearing down a wedged decode thread from the previous session — try reconnecting shortly");
+    }
+    Ok(())
+}
+
 /// Calls `NDL_DirectMediaInit` once (process-global, idempotent-guarded).
 fn ensure_init(app_id: &str) -> Result<()> {
     if INIT_DONE.swap(true, Ordering::SeqCst) {
@@ -250,6 +303,7 @@ impl NdlVideo {
     /// Load NDL video stream. Calls `NDL_DirectMediaInit` on first use.
     /// Audio request is a probe: fails silently on unsupported models, retries video-only.
     pub fn load(app_id: &str, width: i32, height: i32, codec: NdlCodec, audio: Option<NdlAudioConfig>) -> Result<Self> {
+        ensure_not_poisoned()?;
         ensure_init(app_id)?;
         let video = NdlVideoInfo {
             width,
