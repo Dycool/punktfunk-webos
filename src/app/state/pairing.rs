@@ -144,14 +144,13 @@ impl App {
                         fingerprint: Some(fingerprint),
                         mgmt_port: outcome.mgmt_port,
                         mac: outcome.mac,
-                        // Preserved across a re-add by `upsert_known_host`; off for a genuinely new host.
-                        wol_auto: false,
                         // Only reaches a genuinely new host — `upsert_known_host` keeps an
-                        // existing record's pins.
+                        // existing record's pins and wol_auto.
                         pinned: vec![store::DESKTOP_PIN_ID.to_string()],
+                        ..KnownHost::default()
                     },
                 );
-                let _ = store::save_known_hosts(&self.known_hosts);
+                self.persist();
                 self.rebuild_entries();
                 self.sidebar_dirty = true;
                 self.screen = Screen::Home;
