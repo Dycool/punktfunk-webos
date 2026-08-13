@@ -1,5 +1,6 @@
 use super::*;
-use crate::services::store::{CodecPref, GamepadType, LogLevelOverride, Settings};
+use crate::core::caps::video_caps;
+use crate::services::store::{CodecPref, GamepadType, LogLevelOverride, Settings, VideoBackend};
 
 /// User-requested presets: 1080p, 1440p, 4K.
 pub const RESOLUTIONS: [(u32, u32, &str); 3] = [
@@ -66,31 +67,37 @@ pub const fn settings_row_stride() -> u32 {
 pub const ROW_RESOLUTION: usize = 0;
 pub const ROW_FRAMERATE: usize = 1;
 pub const ROW_BITRATE: usize = 2;
-pub const ROW_CODEC: usize = 3;
+/// Which decode pipeline to load — see `store::VideoBackend`. Only offered where there is a
+/// choice (webOS 3.5-4.x, see `caps::smp_selectable`), and above Codec deliberately: the
+/// pick is what decides whether HEVC and HDR exist as options at all.
+pub const ROW_VIDEO_BACKEND: usize = 3;
+/// Hidden where the backend has no HEVC — there is only one decodable codec then (see `row_shown`).
+pub const ROW_CODEC: usize = 4;
 /// Directly below Codec: HDR applies only to HEVC, so the row is hidden on an explicit
-/// H.264 pick (see `hdr_row_shown`) — adjacency keeps that dependency discoverable.
-pub const ROW_HDR: usize = 4;
-pub const ROW_AUDIO: usize = 5;
+/// H.264 pick (see `row_shown`) — adjacency keeps that dependency discoverable.
+pub const ROW_HDR: usize = 5;
+/// Hidden where the backend is capped at stereo — the only channel count then (see `row_shown`).
+pub const ROW_AUDIO: usize = 6;
 /// Which controller the host presents to the game — see `store::GamepadType`. Last of the
 /// real settings: it's the only input-side one, and picking `DualSense` is what turns on
 /// adaptive triggers (`crate::platform::webos::dualsense`).
-pub const ROW_GAMEPAD: usize = 6;
+pub const ROW_GAMEPAD: usize = 7;
 /// Not a setting — a link to `Screen::CursorSettings`, directly below Controller since it's
 /// the other input-side entry. Both pointer toggles live behind it (see `cursor_rows`) rather
 /// than on this list: neither is something a user sets more than once, and pairing them makes
 /// the gesture toggle discoverable next to the capture mode it interacts with.
-pub const ROW_CURSOR: usize = 7;
+pub const ROW_CURSOR: usize = 8;
 /// Not a setting — a link to `Screen::Experimental` (unstable toggles, currently the
 /// frame pacer). Grouped off the main list so an untested option isn't one keystroke away.
-pub const ROW_EXPERIMENTAL: usize = 8;
+pub const ROW_EXPERIMENTAL: usize = 9;
 /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay).
 /// A debug aid, not something a normal user needs to find quickly.
-pub const ROW_DIAGNOSTICS: usize = 9;
+pub const ROW_DIAGNOSTICS: usize = 10;
 /// Not a setting — a link to `Screen::About`. Sits last: every other punktfunk
 /// client puts the version + licences at the very bottom of Settings, and a
 /// `RowKind::Action` row costs nothing extra to render.
-pub const ROW_ABOUT: usize = 10;
-pub const SETTINGS_ROW_COUNT: usize = 11;
+pub const ROW_ABOUT: usize = 11;
+pub const SETTINGS_ROW_COUNT: usize = 12;
 
 /// Experimental modal row indices (see `experimental_rows`).
 pub const EXP_ROW_FRAME_PACER: usize = 0;
@@ -120,37 +127,47 @@ pub const DIAG_ROW_SHOW_LOGS: usize = 2;
 pub const DIAG_ROW_SEND_LOGS: usize = 3;
 pub const DIAGNOSTICS_ROW_COUNT: usize = 4;
 
-/// HDR only applies to HEVC — the host never resolves HDR for an explicit H.264
-/// session, and the toggle would be a no-op. On Automatic the row stays (the host may
-/// still resolve HEVC); it's hidden only when H.264 is picked explicitly. Application
-/// is gated on the *negotiated* codec too — see `session::connect`.
-pub fn hdr_row_shown(settings: &Settings) -> bool {
-    settings.codec != CodecPref::H264
+/// Whether one focusable row is offered, given the settings and what this TV's video backend can
+/// do.
+///
+/// **The sole visibility predicate — one arm per row, every condition for that row inside it.**
+/// Everything else (row list, count, display↔logical mapping, focus clamping) derives from
+/// [`settings_visible_logical_rows`]; a second opinion anywhere is a row you can focus but not see.
+fn row_shown(row: usize, settings: &Settings) -> bool {
+    let caps = video_caps();
+    match row {
+        // HDR only applies to HEVC: the host never resolves it for an explicit H.264 session, so
+        // the toggle would be a no-op (Automatic keeps the row — HEVC may still be resolved). A
+        // backend without HDR has nothing to toggle either way. Application is gated on the
+        // *negotiated* codec too — see `session::connect`.
+        ROW_HDR => settings.codec != CodecPref::H264 && caps.hdr,
+        // A dropdown with one entry is noise — without HEVC there is a single decodable codec
+        // (see `VideoCaps::codec_prefs`), so there is nothing to pick.
+        ROW_CODEC => caps.codec_prefs().len() > 1,
+        // Same rule: a backend capped at stereo leaves Stereo as the only entry.
+        ROW_AUDIO => audio_channel_options().len() > 1,
+        // Only a choice where NDL is the narrow v1 generation — everywhere else NDL v2 is
+        // strictly better and the row would be a trap.
+        ROW_VIDEO_BACKEND => crate::core::caps::smp_selectable(),
+        _ => true,
+    }
 }
 
-/// Logical `ROW_*` indices currently visible, in display order. The HDR row is dropped
-/// (rather than shown disabled) on an explicit H.264 pick. Every visibility-aware helper
-/// derives from this one list.
-pub fn settings_visible_logical_rows(settings: &Settings) -> Vec<usize> {
-    (0..SETTINGS_ROW_COUNT)
-        .filter(|&row| match row {
-            ROW_HDR => hdr_row_shown(settings),
-            _ => true,
-        })
-        .collect()
+/// Logical `ROW_*` indices currently visible, in display order — the single source of truth
+/// every visibility-aware helper derives from. Hidden rows are dropped rather than shown
+/// disabled, so the list renumbers itself and no caller carries a fixed index.
+pub fn settings_visible_logical_rows(settings: &Settings) -> impl Iterator<Item = usize> + '_ {
+    (0..SETTINGS_ROW_COUNT).filter(|&row| row_shown(row, settings))
 }
 
 /// Live row count (vs. `SETTINGS_ROW_COUNT`, the maximum).
 pub fn settings_row_count(settings: &Settings) -> usize {
-    settings_visible_logical_rows(settings).len()
+    settings_visible_logical_rows(settings).count()
 }
 
 /// On-screen row position -> logical `ROW_*` index, skipping past any hidden rows.
 pub fn settings_logical_row(settings: &Settings, display: usize) -> usize {
-    settings_visible_logical_rows(settings)
-        .get(display)
-        .copied()
-        .unwrap_or(display)
+    settings_visible_logical_rows(settings).nth(display).unwrap_or(display)
 }
 
 /// Cycle through options, wrapping.
@@ -190,13 +207,22 @@ pub fn resolution_label(width: u32, height: u32) -> String {
 /// attached or an unrecognized pad. Only changes what "Automatic" reads as (see
 /// `gamepad_auto_label`) — it doesn't affect `dualsense_limited`, which the caller already
 /// folded this into.
-pub fn settings_rows(settings: &Settings, dualsense_limited: bool, detected: Option<GamepadType>) -> Vec<FocusRow> {
+///
+/// `webos_major`: this TV's OS major, named in the Video backend row's caption. `None` where the
+/// version couldn't be read, which falls back to "on this TV". Passed in for the same reason as
+/// `dualsense_limited` — `device::sdk_version` is platform.
+pub fn settings_rows(
+    settings: &Settings,
+    dualsense_limited: bool,
+    detected: Option<GamepadType>,
+    webos_major: Option<u32>,
+) -> Vec<FocusRow> {
     let bitrate_frac = if settings.bitrate_kbps == BITRATE_AUTOMATIC {
         0.0
     } else {
         (settings.bitrate_kbps.saturating_sub(BITRATE_MIN_KBPS)) as f32 / (BITRATE_MAX_KBPS - BITRATE_MIN_KBPS) as f32
     };
-    let mut rows = vec![
+    let rows = vec![
         FocusRow {
             icon: ICON_MONITOR,
             label: "Resolution".into(),
@@ -231,6 +257,25 @@ pub fn settings_rows(settings: &Settings, dualsense_limited: bool, detected: Opt
             menu: None,
             subtext: (settings.bitrate_kbps > BITRATE_WARN_KBPS)
                 .then(|| RowSubtext::caution("May be unstable on Wi-Fi — try Ethernet")),
+        },
+        FocusRow {
+            icon: ICON_MEMORY,
+            label: "Video backend".into(),
+            value: match settings.video_backend {
+                VideoBackend::Ndl => "NDL".into(),
+                VideoBackend::Smp => "SMP".into(),
+            },
+            kind: RowKind::Dropdown,
+            fraction: 0.0,
+            danger: false,
+            menu: None,
+            // Show the warning with webOS version.
+            subtext: (settings.video_backend == VideoBackend::Ndl).then(|| {
+                RowSubtext::caution(match webos_major {
+                    Some(major) => format!("Limitted HDR support on webOS {major}"),
+                    None => "".into(),
+                })
+            }),
         },
         FocusRow {
             icon: ICON_MOVIE,
@@ -289,11 +334,14 @@ pub fn settings_rows(settings: &Settings, dualsense_limited: bool, detected: Opt
         // every other punktfunk client puts version + licences at the very bottom.
         FocusRow::action_with_value(ICON_INFO, "About & licenses", format!("v{VERSION}")),
     ];
-    // Mirrors `settings_visible_logical_rows`: drop rather than disable when hidden.
-    if !hdr_row_shown(settings) {
-        rows.remove(ROW_HDR);
-    }
-    rows
+    debug_assert_eq!(rows.len(), SETTINGS_ROW_COUNT, "one row per logical index, in order");
+    // Driven by the one visibility predicate rather than repeating its conditions, so a row hidden
+    // there can never linger here. Index == logical row, guaranteed by the assert above.
+    rows.into_iter()
+        .enumerate()
+        .filter(|(row, _)| row_shown(*row, settings))
+        .map(|(_, row)| row)
+        .collect()
 }
 
 pub const LOG_LEVEL_OPTIONS: [LogLevelOverride; 4] = [
@@ -463,11 +511,6 @@ pub fn wake_settings_rows(auto_send: bool) -> Vec<FocusRow> {
     }]
 }
 
-/// The codec choices offered. NDL decodes H.264/HEVC only, so the list is fixed.
-pub fn codec_options() -> Vec<CodecPref> {
-    vec![CodecPref::Auto, CodecPref::H264, CodecPref::Hevc]
-}
-
 pub fn codec_label(pref: CodecPref) -> &'static str {
     match pref {
         CodecPref::Auto => "Automatic",
@@ -502,11 +545,20 @@ pub fn gamepad_label(t: GamepadType) -> &'static str {
 /// will actually resolve to for this session (see `gamepad::detect_type`), rather than leaving
 /// the user to guess.
 pub fn gamepad_auto_label(detected: Option<GamepadType>) -> String {
-    detected.map_or_else(|| "Automatic".to_string(), |t| format!("Automatic ({})", gamepad_label(t)))
+    detected.map_or_else(
+        || "Automatic".to_string(),
+        |t| format!("Automatic ({})", gamepad_label(t)),
+    )
 }
 
-/// Supported channel counts.
-pub const AUDIO_CHANNELS: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1 surround"), (8, "7.1 surround")];
+/// Every channel count this client can label; what is *offered* is [`audio_channel_options`].
+const AUDIO_CHANNELS: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1 surround"), (8, "7.1 surround")];
+
+/// The channel counts offered, filtered to what the active backend can present.
+pub fn audio_channel_options() -> Vec<(u8, &'static str)> {
+    let max = video_caps().max_channels;
+    AUDIO_CHANNELS.iter().copied().filter(|(c, _)| *c <= max).collect()
+}
 
 fn audio_label(channels: u8) -> String {
     AUDIO_CHANNELS
@@ -515,14 +567,33 @@ fn audio_label(channels: u8) -> String {
         .map_or_else(|| format!("{channels} channels"), |(_, s)| (*s).to_string())
 }
 
+/// The backend choices offered, in display order (NDL first — it's the default and needs no
+/// wrapper `.so`). Only reachable while the row is shown (see `row_shown`).
+pub const VIDEO_BACKENDS: [VideoBackend; 2] = [VideoBackend::Ndl, VideoBackend::Smp];
+
+/// Dropdown label for a backend. Derived from the value, not a parallel list: the dropdown is
+/// indexed into [`VIDEO_BACKENDS`], so two lists that drift apply the option above or below the
+/// one the user picked. The row's own value column uses the short name instead.
+fn video_backend_label(backend: VideoBackend) -> &'static str {
+    match backend {
+        VideoBackend::Ndl => "NDL (DirectMedia)",
+        VideoBackend::Smp => "SMP (Media Pipeline)",
+    }
+}
+
 /// Dropdown labels for a row.
 pub fn dropdown_options(settings: &Settings, row_index: usize, detected: Option<GamepadType>) -> Vec<String> {
     let _ = settings;
     match row_index {
+        ROW_VIDEO_BACKEND => VIDEO_BACKENDS.iter().map(|&b| video_backend_label(b).into()).collect(),
         ROW_RESOLUTION => RESOLUTIONS.iter().map(|(w, h, _)| resolution_label(*w, *h)).collect(),
         ROW_FRAMERATE => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
-        ROW_CODEC => codec_options().iter().map(|&p| codec_label(p).to_string()).collect(),
-        ROW_AUDIO => AUDIO_CHANNELS.iter().map(|(_, s)| (*s).to_string()).collect(),
+        ROW_CODEC => video_caps()
+            .codec_prefs()
+            .iter()
+            .map(|&p| codec_label(p).to_string())
+            .collect(),
+        ROW_AUDIO => audio_channel_options().iter().map(|(_, s)| (*s).to_string()).collect(),
         ROW_GAMEPAD => GAMEPAD_TYPES
             .iter()
             .map(|&t| {
@@ -548,8 +619,16 @@ pub fn dropdown_current_index(settings: &Settings, row_index: usize) -> usize {
             .iter()
             .position(|hz| *hz == settings.refresh_hz)
             .unwrap_or(0),
-        ROW_CODEC => codec_options().iter().position(|&p| p == settings.codec).unwrap_or(0),
-        ROW_AUDIO => AUDIO_CHANNELS
+        ROW_VIDEO_BACKEND => VIDEO_BACKENDS
+            .iter()
+            .position(|&b| b == settings.video_backend)
+            .unwrap_or(0),
+        ROW_CODEC => video_caps()
+            .codec_prefs()
+            .iter()
+            .position(|&p| p == settings.codec)
+            .unwrap_or(0),
+        ROW_AUDIO => audio_channel_options()
             .iter()
             .position(|(c, _)| *c == settings.audio_channels)
             .unwrap_or(0),
@@ -574,13 +653,23 @@ pub fn apply_dropdown_choice(settings: &mut Settings, row_index: usize, choice_i
                 settings.refresh_hz = *hz;
             }
         }
+        ROW_VIDEO_BACKEND => {
+            if let Some(&backend) = VIDEO_BACKENDS.get(choice_index) {
+                settings.video_backend = backend;
+                // The pick IS the capability set (see `core::caps::set_backend`), so publish it
+                // before clamping — switching back to NDL has to take a now-unpresentable HEVC
+                // or HDR value with it rather than leaving it set behind a hidden row.
+                crate::core::caps::set_backend(backend);
+                settings.clamp_to_caps();
+            }
+        }
         ROW_CODEC => {
-            if let Some(&pref) = codec_options().get(choice_index) {
+            if let Some(&pref) = video_caps().codec_prefs().get(choice_index) {
                 settings.codec = pref;
             }
         }
         ROW_AUDIO => {
-            if let Some((channels, _)) = AUDIO_CHANNELS.get(choice_index) {
+            if let Some((channels, _)) = audio_channel_options().get(choice_index) {
                 settings.audio_channels = *channels;
             }
         }
@@ -626,15 +715,21 @@ pub fn adjust_setting(settings: &mut Settings, row_index: usize, forward: bool) 
             settings.hdr_enabled = !settings.hdr_enabled;
             true
         }
+        ROW_VIDEO_BACKEND => {
+            let idx = dropdown_current_index(settings, ROW_VIDEO_BACKEND);
+            let next = cycle_index(idx, VIDEO_BACKENDS.len(), forward);
+            apply_dropdown_choice(settings, ROW_VIDEO_BACKEND, next);
+            true
+        }
         ROW_CODEC => {
             let idx = dropdown_current_index(settings, ROW_CODEC);
-            let next = cycle_index(idx, codec_options().len(), forward);
+            let next = cycle_index(idx, video_caps().codec_prefs().len(), forward);
             apply_dropdown_choice(settings, ROW_CODEC, next);
             true
         }
         ROW_AUDIO => {
             let idx = dropdown_current_index(settings, ROW_AUDIO);
-            let next = cycle_index(idx, AUDIO_CHANNELS.len(), forward);
+            let next = cycle_index(idx, audio_channel_options().len(), forward);
             apply_dropdown_choice(settings, ROW_AUDIO, next);
             true
         }

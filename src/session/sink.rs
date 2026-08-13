@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use punktfunk_core::quic;
 
+use crate::platform::webos::ndl::v1::NdlV1Video;
 use crate::platform::webos::ndl::NdlVideo;
+use crate::platform::webos::smp::SmpVideo;
 use crate::session::pacing::{reconciled_pace_interval_ns, HostPtsAnchor, PtsPacer};
 use crate::session::StreamStats;
 
@@ -133,21 +135,35 @@ pub enum SinkResult {
     NeedKeyframe,
 }
 
-/// Video-decode backend (NDL `DirectMedia` — the only one). Arc'd because the audio-offload
-/// path shares the handle with `ndl_audio_pump`; NDL unloads process-globally, so unload
-/// waits for both threads (`Arc::drop`).
-pub struct VideoPlayer(Arc<NdlVideo>);
+/// The video-decode backend this session runs on: one of the two NDL `DirectMedia` generations
+/// (`device::ndl_generation` picks), or SMP where the user selected it
+/// (`Settings::video_backend`, offered on webOS 3.5-4.x only). Everything above this type is
+/// backend-blind.
+///
+/// V2 is Arc'd because the audio-offload path shares the handle with `ndl_audio_pump`; NDL
+/// unloads process-globally, so unload waits for both threads (`Arc::drop`).
+pub enum VideoPlayer {
+    /// webOS 5+: PTS-driven feed, render-buffer query, flush, HDR metadata.
+    V2(Arc<NdlVideo>),
+    /// webOS 3.5-4.x: H.264 SDR, feed-order presentation, none of the above (see
+    /// `platform::webos::ndl::v1`).
+    V1(NdlV1Video),
+    /// SMP: HEVC + HDR + `pauseAtDecodeTime` on a legacy TV (see
+    /// `platform::webos::smp`).
+    Smp(SmpVideo),
+}
 
 impl VideoPlayer {
-    pub fn new(ndl: Arc<NdlVideo>) -> Self {
-        Self(ndl)
-    }
-
     /// Feed access unit; return (result, `feed_duration`) for ABR latency reporting.
     /// `pts_ns` must already be in NDL's PTS clock domain (see [`Self::pace_base_ns`]).
     fn play(&self, au: &[u8], pts_ns: u64) -> (anyhow::Result<()>, Duration) {
         let t = Instant::now();
-        let result = self.0.play(au, pts_ns);
+        let result = match self {
+            Self::V2(ndl) => ndl.play(au, pts_ns),
+            // v1's feed takes no timestamp at all — frames present as fed.
+            Self::V1(ndl) => ndl.play(au),
+            Self::Smp(sf) => sf.play(au, pts_ns),
+        };
         (result, t.elapsed())
     }
 
@@ -157,35 +173,67 @@ impl VideoPlayer {
     /// player clock ([`HostPtsAnchor`]) so the reference tracks host frame cadence instead
     /// of feed-time wall-clock, keeping delivery jitter out of the pacer's drift-clamp
     /// anchor. Without `anchor` (pacing off) NDL falls back to raw player time.
+    ///
+    /// SMP is mapped the same way as V2 — its PTS domain is nanoseconds since *its own* load
+    /// (`now - openTime`), not the host's clock, so an unmapped host PTS would sit an
+    /// arbitrary epoch away and `pauseAtDecodeTime` would hold every frame. V1 has nothing to pace
+    /// against at all (no PTS input, no player clock), so the host PTS returns untouched there and
+    /// the pacer's output is discarded at the feed.
     fn pace_base_ns(&self, frame_pts_ns: u64, anchor: Option<&mut HostPtsAnchor>) -> u64 {
-        let player_clock_ns = self.0.elapsed_ns();
+        let player_clock_ns = match self {
+            Self::V2(ndl) => ndl.elapsed_ns(),
+            Self::Smp(sf) => sf.elapsed_ns(),
+            Self::V1(_) => return frame_pts_ns,
+        };
         match anchor {
             Some(a) => a.map(frame_pts_ns, player_clock_ns),
             None => player_clock_ns,
         }
     }
 
+    /// Neither V1 nor SMP has a render-buffer to flush (SMP drains its own buffer and
+    /// resets on an IDR) — the sink's freeze still holds frames.
     fn flush(&self) -> anyhow::Result<()> {
-        self.0.flush()
+        match self {
+            Self::V2(ndl) => ndl.flush(),
+            Self::V1(_) | Self::Smp(_) => Ok(()),
+        }
     }
 
+    /// No-op on V1: SDR/BT.709 only, and no `SetHDRInfo` to call.
     pub fn set_color_info(&self, meta: Option<&quic::HdrMeta>, color: quic::ColorInfo) -> anyhow::Result<()> {
-        self.0.set_color_info(meta, color)
+        match self {
+            Self::V2(ndl) => ndl.set_color_info(meta, color),
+            Self::Smp(sf) => sf.set_color_info(meta, color),
+            Self::V1(_) => Ok(()),
+        }
     }
 
-    /// Whether the backend decodes audio itself.
-    pub fn audio_offloaded(&self) -> bool {
-        self.0.audio_offloaded()
-    }
-
-    /// Shared NDL handle when audio-offloaded; None on a video-only load.
+    /// Shared NDL handle when audio-offloaded; None on a video-only load or any other backend.
+    /// V2 only: V1's `NDL_DirectAudio*` has no Opus source type, and SMP loads `needAudio: false`.
     pub fn ndl_audio_handle(&self) -> Option<Arc<NdlVideo>> {
-        self.0.audio_offloaded().then(|| self.0.clone())
+        match self {
+            Self::V2(ndl) => ndl.audio_offloaded().then(|| ndl.clone()),
+            Self::V1(_) | Self::Smp(_) => None,
+        }
     }
 
-    /// NDL render-buffer backlog (None if the query fails).
+    /// NDL render-buffer backlog. `None` if the query fails, or on a backend with no such query —
+    /// the sink treats both as "no queue to add".
     fn render_buffer_length(&self) -> Option<i32> {
-        self.0.render_buffer_length()
+        match self {
+            Self::V2(ndl) => ndl.render_buffer_length(),
+            Self::V1(_) | Self::Smp(_) => None,
+        }
+    }
+
+    /// For the stats overlay and the session log line.
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::V2(_) => "NDL v2",
+            Self::V1(_) => "NDL v1",
+            Self::Smp(_) => "SMP",
+        }
     }
 }
 
@@ -490,10 +538,7 @@ mod tests {
     /// collapses this onto the base case.
     #[test]
     fn the_render_queue_adds_its_own_drain_time() {
-        assert_eq!(
-            video_e2e_ns(SUBMIT, 0, PTS, 3, HZ60_NS),
-            Some(30_000_000 + 3 * HZ60_NS)
-        );
+        assert_eq!(video_e2e_ns(SUBMIT, 0, PTS, 3, HZ60_NS), Some(30_000_000 + 3 * HZ60_NS));
         // And a deeper queue is strictly later — the ratchet the sync loop exists to cancel.
         let shallow = video_e2e_ns(SUBMIT, 0, PTS, 1, HZ60_NS).unwrap();
         let deep = video_e2e_ns(SUBMIT, 0, PTS, 6, HZ60_NS).unwrap();

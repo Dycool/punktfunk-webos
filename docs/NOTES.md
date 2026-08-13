@@ -11,6 +11,24 @@ Verified against LG CX (webOS 5.6) and G5 (webOS 10.3). Load-bearing decisions o
 - **SDL2 must be webosbrew fork** (release-2.30.12-webos.5, not generic SDL2). Only fork has Wayland shell-integration (`QT_WAYLAND_SHELL_INTEGRATION=webos`). On-device system copy is 2.0.10 (too old). Bundle own libSDL2 with `$ORIGIN/../lib` RPATH (set in `build.rs`).
 - **cmake/opus**: `punktfunk-core`'s `quic` feature needs CMAKE_POLICY_VERSION_MINIMUM=3.5 (modern CMake refuses vendored libopus's old minimum).
 
+## UI preview (container)
+
+`task docker:deploy` runs the app in a container on a virtual 1080p display and serves it over
+VNC (`http://localhost:6080/vnc.html`), so UI work needs no TV and no
+host tools beyond Docker. Same image, mounts and cache volumes as the cross-build tasks (it goes
+through `toolchain:docker-run` like they do); SDL2, Xvfb, x11vnc and noVNC are apt-installed per
+run.
+
+- **Build with the `preview` profile** (release codegen, no LTO). `tiny_skia` rasterizes in
+  software; a `dev` build spends tens of ms a frame there and reads as input lag, on top of
+  llvmpipe and the VNC round trip. `PROFILE=dev` if the rebuild time matters more.
+- **No GPU and no mDNS.** llvmpipe means animation timing here is not the TV's, and Docker's
+  "host" is the Linux VM, so `services::discovery` sees no LAN multicast — add hosts by hand.
+  Unicast is unaffected, so a hand-entered host pairs and speed-tests for real.
+- **Launch params reach the app as the argv[1] JSON SAM sends on a TV**, so `WEBOS_SDK=4.0.0`
+  exercises the NDL v1 path here too. Telemetry is wired to a listener inside the container, so
+  logs land in the terminal at `TELEMETRY_LEVEL` with nothing to configure.
+
 ## UI rendering
 
 Hybrid software/GPU: `tiny_skia` rasterizes tiles, SDL2 composites. Redraw-on-change (no every-tick render). Key facts:
@@ -138,6 +156,29 @@ Blind alleys, so they aren't re-tried:
 
 Burst is 320 Mbps / 3s (not 3 Gbps / 5s) — 3-core Cortex-A9 runs UI thread; unbounded firehose starves app. 320 detects any ceiling that changes clamped recommendation (>~285 Mbps). Probe must advertise `VIDEO_CAP_CHACHA20` like real session (core's `bytes_received` counter increments *after* AEAD decrypt). Measured on G5 Wi-Fi: ~245 Mbps airlink ceiling (MediaTek USB 2.0 Hi-Speed bus), nothing client code can raise. New flows sometimes black-hole ~10-29s (AP/driver setup); `run_speed_probe` waits for first completed video frame (cap 35s) before burst — plane is live and path is warm.
 
-## Video backend: NDL DirectMedia only
+## Video backends: NDL (default) + SMP on webOS <5
 
-NDL DirectMedia is the **sole** video backend (Starfish/SMP and its `libplayerAPIs_C.so` wrapper were removed, along with AV1 — only ever decodable through Starfish). Header signatures from `mariotaku/ss4s`. No decode context handle; all NDL calls are serialized behind `NdlVideo::ffi` mutex (not thread-safe per header).
+NDL DirectMedia is the only backend on webOS 5+. NDL has no decode context; calls go through `NdlVideo::ffi` mutex (header says not thread-safe). AV1 remains disabled (never produced picture).
+
+SMP (`libplayerAPIs_C.so`, loaded via `dlopen`) is only for webOS 3.5-4.x, where it is the only HEVC/HDR path. Choosing SMP widens `core::caps`; SMP load failure falls back to NDL v1.
+
+Critical SMP constraints:
+
+- **Sink wiring is version-specific** (`smp/sink.rs`):
+  - webOS 5+: SDL exported window id in load payload.
+  - webOS 3.5-4.x: ACB (`libAcbAPI.so`) path, no window. Required sequence: `initialize(PLAYER_TYPE_MSE=10)`, `setMediaId(getMediaID())` pre-load, `setSinkType(MAIN)` + `setState(LOADED)` on LOADCOMPLETED, `setDisplayWindow`, then `setState(PLAYING)` on first accepted frame, and `setMediaVideoData` with `STR_VIDEO_INFO` (+`hdrType` for HDR).
+  - Wrong shape: load succeeds, frames accepted, nothing composited.
+- **Feed PTS must be SMP-relative** (`now - openTime` ns), not host clock. `session::sink` maps host PTS through `HostPtsAnchor` (same model as NDL v2).
+- **Load payload is fragile:** only one known shape works; trimmed variants never completed load.
+
+Still unverified on real 3.5-4.x hardware. webOS 3.5 may require `playerAPIs_C_Legacy`; `c_shim.cpp` currently targets the current SDK header.
+
+## NDL generations: v2 (webOS 5+) and v1 (3.5-4.x)
+
+- Same library, two ABIs: v2 (`DirectMediaLoad`, `DirectVideoPlay`, `FlushRenderBuffer`, `GetRenderBufferLength`, `SetHDRInfo`) vs v1 (`DirectVideoOpen/SetCallback/SetArea/PlayWithCallback/Close`). webOS 4 has no v2 symbols.
+- **Must `dlopen`, never link** `libNDL_directmedia.so.1`: a `DT_NEEDED` breaks webOS 4 startup under BIND_NOW (fails before `main`). Do not re-add `#[link(name = "NDL_directmedia")]`; `-Wl,-z,lazy` is not an acceptable workaround.
+- Backend generation comes from `device::ndl_generation()` (`sdkVersion`): v1 for `<5`, v2 for `>=5` and unknown. Version selects what to try; `dlsym` is final authority (no silent fallback).
+- v1 limits: H.264 + SDR/BT.709 only; no input PTS, render-buffer query, flush, or HDR API. **Resolution is not capped here**: decode dimensions are passed through; `1920x1080` in `ndl/v1.rs` is only the display rect from `SetArea`.
+- `NDL_DIRECTVIDEO_DATA_INFO_T` must include `source` (`width,height,source`). Omitting it fed stack garbage into `NDL_DirectVideoOpen`; now explicitly `NONE` (0) (fixed 2026-08-12).
+- `core::caps` must stay consistent across `session::connect` (source of truth), `ui::settings`, and `Settings::clamp_to_caps`.
+- M3/KADP runtime codec patch remains intentionally unused.

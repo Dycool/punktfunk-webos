@@ -13,7 +13,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 pub use crate::core::model::{
-    upsert_known_host, CodecPref, GamepadType, KnownHost, LogLevelOverride, Persisted, Settings, DESKTOP_PIN_ID,
+    upsert_known_host, CodecPref, GamepadType, KnownHost, LogLevelOverride, Persisted, Settings, VideoBackend,
+    DESKTOP_PIN_ID,
 };
 pub use crate::services::paths::app_dir;
 pub use identity::load_or_create_identity;
@@ -42,7 +43,24 @@ pub fn load() -> Persisted {
         None => legacy::migrate(Settings::default()),
     };
     apply_launch_overrides(&mut state);
+    // A document written on a more capable TV can hold HEVC, HDR and 7.1 on a device with none
+    // of them — leaving a *set* value whose row the UI hides.
+    state.settings.clamp_to_caps();
     state
+}
+
+/// Just the persisted backend pick, for `core::caps` at startup. Not [`load`]: that clamps
+/// against the caps this very value decides, so it has to be read first. Reads either
+/// document shape (same reasoning as [`persisted_log_level`]).
+pub fn persisted_video_backend() -> VideoBackend {
+    let Some(doc) = read_document() else {
+        return VideoBackend::default();
+    };
+    let settings = doc.get("settings").unwrap_or(&doc);
+    settings
+        .get("video_backend")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 pub fn save(state: &Persisted) -> Result<()> {

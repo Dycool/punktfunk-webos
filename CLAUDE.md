@@ -35,8 +35,8 @@ Layered by module, deps point inward (acyclic). Leaves first:
 - **`platform/webos/`** — SDL2/hardware boundary (all `#[cfg(target_os = "linux")]`):
   `compositor` (translates `ui::DrawList` → SDL textures, owns the texture cache),
   `input` (SDL events → `InputEvent`), `text_sdl` (SDL2_ttf impl of `TextRaster`),
-  video (`ndl`/`luna`), `audio`, `device`, `gamepad`/`keyboard`/`mouse`/
-  `dualsense`, C build shims.
+  video (`ndl/` — `ffi` dlopen tables, `v2`, `v1`; `smp/`; plus `luna`), `audio`, `device`, `gamepad`/`keyboard`/`mouse`/
+  `dualsense`, `sdl_webos` (the SDL fork's own entry points, `dlopen`'d), C build shims.
 - **`app/`** — the `App` state machine. Per-screen `impl App` blocks split by concern:
   `app::state::<screen>` (event handling/transitions) and `app::view::<screen>` (geometry +
   draw-list building).
@@ -49,16 +49,18 @@ the `Screen` enum has eight dispatch sites across `app/mod.rs` and `runtime/` (c
 all at once, mechanical but safe). Rendering: `tiny_skia` software framebuffer,
 redraw-on-change (`dirty` flag, no time-based animation).
 
-**Platform gating**: only SDL2/webOS-linked layers are `#[cfg(target_os = "linux")]` in
-`main.rs` — `app`, `platform`, `session`, `runtime`. Platform-independent layers (`core`,
-`ui`, `services`, `errors`, `logger`) ungated, build on any host (their deps —
-`tiny-skia`, `image`, `ureq`, `rustls` — are base; only `sdl2`/`opus`/`libc` stay Linux-gated
-in `Cargo.toml`). webOS target reports Linux same as dev box; macOS/Windows get a stub
-`anyhow::bail!` in `main()` — builds stay green without SDL2, and now typecheck `ui`/`core`/
-`services` too. Keep new modules ungated unless they link SDL2/webOS libs.
+**Platform gating**: one target — Linux (webOS armv7 cross target, or a plain Linux box).
+`platform/webos/sdl_webos.rs` resolves the `webosbrew/SDL-webOS` fork's own entry points the
+same way (a stock SDL2 exports none of them).
 
-**Two decode paths**: video via NDL DirectMedia (`platform/webos/ndl.rs`, opaque
-decode+present), audio client-side Opus (`platform/webos/audio.rs`). Loss recovery:
+**Two decode paths**: video via NDL DirectMedia (`platform/webos/ndl/`, opaque
+decode+present), audio client-side Opus (`platform/webos/audio.rs`). NDL is `dlopen`'d (never
+linked — see `docs/NOTES.md`) and comes in two generations: v2 on webOS 5+, v1 on 3.5-4.x
+(H.264/SDR, no PTS), picked by `device::ndl_generation()` from the detected `sdkVersion`;
+`core::caps` publishes the resulting limits to the wire, the UI and settings load. On webOS <5 only,
+SMP (`platform/webos/smp/` — `ffi` dlopen table, `sink` ACB/exported-window split, `c_shim.cpp`
+wrapper) is selectable instead — HEVC/HDR where NDL v1 has neither, falling back to NDL v1 if its
+load fails. Loss recovery:
 `session`'s `video_pump` reimplements freeze-until-reanchor directly — upstream `ReanchorGate`
 assumes decode/present split NDL lacks.
 
