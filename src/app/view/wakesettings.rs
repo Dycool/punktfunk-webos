@@ -1,49 +1,44 @@
-//! Per-host Wake-on-LAN settings — rendering. Logic lives in `app::state::wakesettings`.
-use crate::app::App;
+//! Per-host Wake-on-LAN settings. Logic lives in `app::state::wakesettings`.
 use crate::ui::render::Rect;
-use crate::ui::{self, FocusRow, Painter};
+use crate::ui::{self, Canvas, FocusRow, Fonts, ModalScreen};
 use anyhow::Result;
 
-impl App {
-    pub(crate) fn wake_settings_rows(&self) -> Vec<FocusRow> {
-        ui::wake_settings_rows(self.wake_settings_host().is_some_and(|h| h.wol_auto))
+/// Spells out both halves of the behaviour, because the alternative to "On" is not
+/// "never wake" — it's "ask first", which the switch alone can't say.
+pub const SUBTITLE: &str = "On: an unreachable host is sent a wake signal straight away, retried every \
+     minute until it answers. Off: it asks first.";
+pub const ROW_COUNT: usize = 1;
+
+pub fn title(host_name: &str) -> String {
+    format!("Wake · {host_name}")
+}
+
+pub fn rows(auto_send: bool) -> Vec<FocusRow> {
+    vec![FocusRow::toggle(ui::ICON_POWER, "Wake automatically", auto_send)]
+}
+
+pub fn card_rect(screen_w: u32, screen_h: u32, fonts: &Fonts) -> Rect {
+    ui::list_modal_card_rect(screen_w, screen_h, fonts, SUBTITLE, ROW_COUNT)
+}
+
+/// The per-host wake settings as a [`ModalScreen`].
+pub(crate) struct Modal<'a> {
+    pub host_name: &'a str,
+    pub auto_send: bool,
+}
+
+impl ModalScreen for Modal<'_> {
+    fn card_rect(&self, screen_w: u32, screen_h: u32, fonts: &Fonts) -> Rect {
+        card_rect(screen_w, screen_h, fonts)
     }
 
-    pub(crate) fn wake_settings_title(&self) -> String {
-        format!("Wake · {}", self.host_menu_title())
+    fn content_rect(&self, card: Rect, fonts: &Fonts) -> Option<Rect> {
+        Some(ui::list_modal_content_rect(card, fonts, SUBTITLE, ROW_COUNT))
     }
 
-    pub(crate) fn wake_settings_subtitle(&self) -> String {
-        // Spells out both halves of the behaviour, because the alternative to "On" is
-        // not "never wake" — it's "ask first", which the switch alone can't say.
-        "On: an unreachable host is sent a wake signal straight away, retried every \
-         minute until it answers. Off: it asks first."
-            .to_string()
-    }
-
-    pub(crate) fn wake_settings_card_rect(screen_w: u32, screen_h: u32, fonts: &ui::Fonts, subtitle: &str) -> Rect {
-        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, 1)
-    }
-
-    pub(crate) fn render_wake_settings(
-        &self,
-        painter: &mut Painter,
-        text_cache: &mut crate::ui::TextCache,
-        fonts: &ui::Fonts,
-        screen_w: u32,
-        screen_h: u32,
-    ) -> Result<()> {
-        let subtitle = self.wake_settings_subtitle();
-        let card = Self::wake_settings_card_rect(screen_w, screen_h, fonts, &subtitle);
-        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
-        ui::render_list_modal(
-            painter,
-            text_cache,
-            fonts,
-            card,
-            &self.wake_settings_title(),
-            &subtitle,
-            &self.wake_settings_rows(),
-        )
+    fn render(&self, c: &mut Canvas, hover_close: bool) -> Result<()> {
+        let card = self.card_rect(c.screen_w, c.screen_h, c.fonts);
+        let title = title(self.host_name);
+        c.list_modal_screen(card, &title, SUBTITLE, &rows(self.auto_send), hover_close)
     }
 }

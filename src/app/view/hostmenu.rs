@@ -1,44 +1,36 @@
-//! The per-host actions menu — rendering. Logic lives in `app::state::hostmenu`.
-use crate::app::App;
+//! The per-host actions menu — presentation. Which actions exist, and their labels, is
+//! logic and lives in `app::state::hostmenu`; this only lays them out and paints them.
 use crate::ui::render::Rect;
-use crate::ui::{self, Painter};
+use crate::ui::{self, Canvas, FocusRow, Fonts, ModalScreen};
 use anyhow::Result;
 
-impl App {
-    pub(crate) fn host_menu_rows(&self) -> Vec<ui::FocusRow> {
-        self.host_menu_actions().into_iter().map(|(_, r)| r).collect()
+pub(crate) fn card_rect(screen_w: u32, screen_h: u32, fonts: &Fonts, subtitle: &str, rows: usize) -> Rect {
+    ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, rows)
+}
+
+/// The per-host actions menu as a [`ModalScreen`].
+pub(crate) struct Modal<'a> {
+    pub title: &'a str,
+    pub subtitle: String,
+    pub rows: Vec<FocusRow>,
+}
+
+impl ModalScreen for Modal<'_> {
+    fn card_rect(&self, screen_w: u32, screen_h: u32, fonts: &Fonts) -> Rect {
+        card_rect(screen_w, screen_h, fonts, &self.subtitle, self.rows.len())
     }
 
-    pub(crate) fn host_menu_card_rect(
-        screen_w: u32,
-        screen_h: u32,
-        fonts: &ui::Fonts,
-        subtitle: &str,
-        rows: usize,
-    ) -> Rect {
-        ui::list_modal_card_rect(screen_w, screen_h, fonts, subtitle, rows)
-    }
-
-    pub(crate) fn render_host_menu(
-        &self,
-        painter: &mut Painter,
-        text_cache: &mut crate::ui::TextCache,
-        fonts: &ui::Fonts,
-        screen_w: u32,
-        screen_h: u32,
-    ) -> Result<()> {
-        let rows = self.host_menu_rows();
-        let subtitle = self.host_menu_subtitle();
-        let card = Self::host_menu_card_rect(screen_w, screen_h, fonts, &subtitle, rows.len());
-        self.draw_modal_shell(painter, text_cache, fonts.raster, fonts.icon, card)?;
-        ui::render_list_modal(
-            painter,
-            text_cache,
-            fonts,
+    fn content_rect(&self, card: Rect, fonts: &Fonts) -> Option<Rect> {
+        Some(ui::list_modal_content_rect(
             card,
-            &self.host_menu_title(),
-            &subtitle,
-            &rows,
-        )
+            fonts,
+            &self.subtitle,
+            self.rows.len(),
+        ))
+    }
+
+    fn render(&self, c: &mut Canvas, hover_close: bool) -> Result<()> {
+        let card = self.card_rect(c.screen_w, c.screen_h, c.fonts);
+        c.list_modal_screen(card, self.title, &self.subtitle, &self.rows, hover_close)
     }
 }
