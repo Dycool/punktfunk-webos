@@ -44,6 +44,27 @@ impl Rect {
         Self::new(self.x + dx, self.y + dy, self.w, self.h)
     }
 
+    /// Grown by `pad` on every side. The padded region a tile is rasterized into (its
+    /// shadow and focus ring live in that margin), and the same rect the compositor has to
+    /// draw it back to.
+    pub fn inflate(self, pad: i32) -> Self {
+        Self::new(
+            self.x - pad,
+            self.y - pad,
+            (self.w as i32 + 2 * pad).max(0) as u32,
+            (self.h as i32 + 2 * pad).max(0) as u32,
+        )
+    }
+
+    /// Inset by `pad` on the left and right, full height. The content column inside a
+    /// card: one pad governs both edges, so there is nothing here for a [`Layout`] split
+    /// to keep in agreement.
+    ///
+    /// [`Layout`]: crate::ui::layout::Layout
+    pub fn inset_x(self, pad: u32) -> Self {
+        Self::new(self.x + pad as i32, self.y, self.w.saturating_sub(2 * pad), self.h)
+    }
+
     pub fn contains_point(&self, p: (i32, i32)) -> bool {
         let (px, py) = p;
         px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
@@ -94,35 +115,15 @@ impl Color {
     }
 }
 
-/// Texture cache key. Same variants as the former `compositor::Tile`, now living in
-/// `ui` and keyed by the plain `core::screen::Screen` enum rather than a platform type.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum TileId {
-    Sidebar,
-    FocusRow,
-    Card(String),
-    Ring,
-    CardOutline,
-    PinBadge,
-    Modal,
-    ModalFocusElement,
-    DropdownOverlay,
-    DropdownFocusOption,
-    Status,
-    NoHost,
-    ScrollIndicator(crate::core::screen::Screen),
-    ScrollContent(crate::core::screen::Screen),
-    ScrollFade,
-    ScrollFadeTop,
-    SpinnerFrame(usize),
-    /// Wide hero art for the connecting screen, keyed by game id.
-    Hero(String),
-    StatsOverlay,
-    Notification,
-    LogOverlay,
-    DisconnectDialog,
-    DisconnectFocusButton,
-}
+/// One cached tile's identity: an opaque number the *app* assigns.
+///
+/// It used to be an enum naming this app's screens (`NoHost`, `PinBadge`, `Hero(String)`),
+/// which made `ui` unusable by anything else and put a `String` clone plus a hash of that
+/// string on every draw command of every frame. The library only ever needs to tell two
+/// tiles apart, so a `Copy` integer is the whole requirement; which number means what is
+/// `app::render::tile`'s business.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct TileId(pub u32);
 
 /// One step of a frame's composition, in paint order.
 pub enum DrawCmd {

@@ -2,9 +2,10 @@
 use crate::app::menu;
 use crate::app::App;
 use crate::app::DropdownState;
+use crate::core::event::MenuEvent;
 use crate::core::screen::Screen;
 use crate::services::store;
-use crate::ui::{self, MenuEvent};
+use crate::ui;
 use std::time::Instant;
 
 impl App {
@@ -25,8 +26,9 @@ impl App {
         if let Some(dd) = self.dropdown.as_mut() {
             let len = menu::LOG_LEVEL_OPTIONS.len();
             match ev {
-                MenuEvent::Up => dd.focused = if dd.focused == 0 { len - 1 } else { dd.focused - 1 },
-                MenuEvent::Down => dd.focused = (dd.focused + 1) % len,
+                MenuEvent::Up | MenuEvent::Down => {
+                    crate::ui::widgets::list_nav(&mut dd.focused, len, menu::nav_dir(ev));
+                }
                 MenuEvent::Confirm => {
                     let choice = dd.focused;
                     self.dropdown_fade.close((menu::DIAG_ROW_LOG_LEVEL, choice));
@@ -42,7 +44,7 @@ impl App {
             return;
         }
         let len = crate::app::view::diagnostics::rows(&self.settings).len();
-        if ui::list_nav(&mut self.diagnostics_focused, len, ev) {
+        if ui::widgets::list_nav(&mut self.diagnostics_focused, len, menu::nav_dir(ev)) {
             self.modal_focus_anim = Some(Instant::now());
             return;
         }
