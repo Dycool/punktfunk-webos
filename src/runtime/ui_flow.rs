@@ -1,5 +1,25 @@
 use super::*;
 
+/// Uploads one decoded GIF frame as `tile::spinner(idx)`'s texture. Both the pre-upload
+/// below and the per-tick `updated` pass go through here, so they can't drift on format.
+fn upload_spinner(
+    compositor: &mut Compositor,
+    texture_creator: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    idx: usize,
+) -> Result<()> {
+    if let Some(frame) = crate::assets::spinner_frame(idx) {
+        compositor.upload_raw(
+            texture_creator,
+            tile::spinner(idx),
+            frame.width,
+            frame.height,
+            sdl2::pixels::PixelFormatEnum::RGBA32,
+            &frame.pixels,
+        )?;
+    }
+    Ok(())
+}
+
 /// Runs the UI (host list -> pairing -> settings) until the user confirms a
 /// connect target or the system asks the app to close (`None`). A plain
 /// function, not a closure — a closure capturing `canvas`/`events` by
@@ -39,20 +59,17 @@ pub(super) fn run_ui_flow(
     // that meant the first spin cycle stalled once per unique frame, right when the
     // spinner is supposed to look smooth. `clear_all` (stream handoff) drops these
     // along with everything else, so this needs redoing on every re-entry here.
-    for (idx, frame) in crate::assets::spinner_frames().iter().enumerate() {
-        compositor.upload_raw(
-            texture_creator,
-            tile::spinner(idx),
-            frame.width,
-            frame.height,
-            &frame.pixels,
-        )?;
+    for idx in 0..crate::assets::spinner_frames().len() {
+        upload_spinner(compositor, texture_creator, idx)?;
     }
     // E.g. "the last connect attempt failed, and here's why" — shown on the
     // Home screen the user just got dropped back onto (see `run_inner`'s
     // connect-error path).
     if initial_status.is_some() {
+        // Set after `App::new`, which has already kicked off the library reload for the
+        // restored host — sticky so that reload's own progress line doesn't erase it.
         app.home_status = initial_status;
+        app.home_status_sticky = true;
     }
     // Same toast widget as the streaming loop's frame-pacer toggle (`ui::widgets::Notification`);
     // shown once, right as the Home screen re-appears.
@@ -87,10 +104,7 @@ pub(super) fn run_ui_flow(
     // Set once the reachability check passes — `spawn_connect` is already
     // running by then, so this just carries its handle out of the loop for
     // `run_inner` to join once the launch animation finishes.
-    let mut connect_handle: Option<ConnectOutcome> = None;
-    // Whether the connect thread has been seen finished. Latched, since `is_finished` is only
-    // polled while the loading screen is up.
-    let mut connect_done = false;
+    let mut connect_handle: Option<(std::thread::JoinHandle<Result<session::Connected>>, store::Settings)> = None;
     // Yellow button log overlay works here too (see streaming loop).
     let mut yellow_held = false;
     let mut home_held = false;
@@ -194,9 +208,14 @@ pub(super) fn run_ui_flow(
         // landed (`run_inner`'s join then returns immediately), the decoder presenting (so
         // its reveal wait is satisfied too), and the hold and fade-out done.
         if let Some(t) = app.launch_anim {
-            connect_done |= connect_handle.as_ref().is_none_or(|(h, _)| h.is_finished());
+            // `is_finished` is monotonic, so this needs no latch of its own.
+            let connect = match connect_handle.as_ref() {
+                _ if CONNECT_FAILED.load(Ordering::Relaxed) => Connect::Failed,
+                Some((h, _)) if !h.is_finished() => Connect::Pending,
+                _ => Connect::Done,
+            };
             let presenting = crate::platform::webos::ndl::presenting();
-            if app.hero.handover_ready(t.elapsed(), connect_done, presenting) {
+            if app.hero.handover_ready(t.elapsed(), connect, presenting) {
                 break 'ui;
             }
         }
@@ -360,12 +379,18 @@ pub(super) fn run_ui_flow(
         // tile the store just built.
         for id in updated {
             if let Some(idx) = tile::spinner_index(id) {
-                if let Some(frame) = crate::assets::spinner_frame(idx) {
-                    compositor.upload_raw(texture_creator, id, frame.width, frame.height, &frame.pixels)?;
-                }
+                upload_spinner(compositor, texture_creator, idx)?;
             } else if id == tile::HERO {
                 if let Some(hero) = app.hero.uploaded_image() {
-                    compositor.upload_raw(texture_creator, id, hero.width, hero.height, &hero.pixels)?;
+                    compositor.drop_tile(id);
+                    compositor.upload_raw(
+                        texture_creator,
+                        id,
+                        hero.width,
+                        hero.height,
+                        sdl2::pixels::PixelFormatEnum::RGB565,
+                        &hero.pixels,
+                    )?;
                 }
             } else if let Some(pm) = tiles.get(id) {
                 compositor.upload(texture_creator, id, pm, id == tile::SIDEBAR)?;
@@ -434,5 +459,9 @@ pub(super) fn run_ui_flow(
     if text_input_active {
         text_input.stop();
     }
-    Ok(connect_handle)
+    Ok(connect_handle.map(|(handle, settings)| ConnectOutcome {
+        handle,
+        settings,
+        first_frame_deadline: app.hero.first_frame_deadline(),
+    }))
 }

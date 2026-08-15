@@ -43,7 +43,10 @@ const CARD_BUILD_BUDGET: usize = 1;
 /// Loading spinner timeout: failed fetches never become ready, so cap the wait.
 const SPINNER_MAX_WAIT: Duration = Duration::from_millis(900);
 
-pub(crate) const CARD_GROWTH: f32 = 0.028;
+/// How much a focused grid card grows. Bigger than the modal widgets' pop (they sit
+/// in a fixed column where any spill reads as a layout shift); a card has the grid gap
+/// around it to grow into.
+pub(crate) const CARD_GROWTH: f32 = 0.045;
 pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
 const PIN_BADGE_MARGIN: i32 = 10;
 pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
@@ -200,6 +203,11 @@ pub struct App {
     pub(crate) games_loaded: bool,
     pub(crate) games_rx: Option<std::sync::mpsc::Receiver<crate::services::library::GamesLoaded>>,
     pub home_status: Option<String>,
+    /// Whether `home_status` is the reason the last launch bounced back to the menu, and so must
+    /// survive the library reload a fresh menu entry starts — that reload clears the status on
+    /// success, which wiped the error a second after the user landed back on the grid. Anything
+    /// the user's own actions produce replaces it as usual.
+    pub(crate) home_status_sticky: bool,
     /// Cover art pixmaps by game id.
     pub art: std::collections::HashMap<String, Pixmap>,
     pub(crate) art_loader: Option<crate::services::art::ArtLoader>,
@@ -455,6 +463,10 @@ impl App {
             selected_host,
         } = loaded;
         let entries = known_entries(&known_hosts);
+
+        // Catches hosts that left the list while the app was closed (migration, torn document);
+        // in-session removals reconcile at their own sites.
+        crate::services::art::reconcile_host_caches(&known_hosts);
         let (discovered, discovery_daemon) = match crate::services::discovery::browse() {
             Some((rx, daemon)) => (rx, Some(daemon)),
             None => (std::sync::mpsc::channel().1, None),
@@ -473,6 +485,7 @@ impl App {
             games_loaded: false,
             games_rx: None,
             home_status: None,
+            home_status_sticky: false,
             art: std::collections::HashMap::new(),
             art_loader: None,
             hero: hero::Hero::default(),
@@ -927,7 +940,7 @@ impl App {
             animating = true;
         }
         if let Some(t) = self.focus_anim {
-            if t.elapsed() >= ui::animation::FOCUS_POP {
+            if t.elapsed() >= ui::animation::CARD_FOCUS_POP {
                 self.focus_anim = None;
             }
             animating = true;
