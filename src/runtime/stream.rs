@@ -14,18 +14,16 @@ fn reveal_deadline(started: Option<Instant>) -> Instant {
 }
 
 pub(super) fn run_inner() -> Result<()> {
-    // Stops webOS's launcher intercepting Back/Windows-Meta/Guide as its own Home shortcut
-    // (see `keyboard.rs`'s LGui/RGui and `gamepad.rs`'s BTN_GUIDE mapping). Must be set before
-    // window creation — these hints only latch at creation time.
+    // Stops webOS's launcher intercepting Back/Guide as its own shortcut (see `gamepad.rs`'s
+    // BTN_GUIDE mapping). Must be set before window creation — these hints only latch there.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
     // Without this webOS SIGTERMs the app on a held/root-level Back before it can react.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_EXIT", "true");
-    // Shares the Home-class policy with the remote's Home button (no separate policy exists);
-    // capturing is the only way a keyboard's Super key reaches the app to forward as
-    // VK_LWIN/VK_RWIN. Cost: remote Home no longer opens the launcher natively, so the input
-    // loop detects it (bare keycode, no scancode) and relaunches via `luna::launch_home`.
+    // Same for the remote's Home button, which otherwise backgrounds and kills the app; the
+    // input loop re-opens the launcher itself via `luna::launch_home` instead. No `KEYS_META`
+    // alongside it: a keyboard's Super key is Home-class, so that hint never suppressed it, and
+    // in-stream it now reaches the host over evdev anyway (`platform::webos::evdev`).
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_HOME", "true");
-    sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_META", "true");
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_KEYS_GUIDE", "true");
     // Suppress webOS's launcher ribbon popping over the foregrounded app.
     sdl2::hint::set("SDL_WEBOS_ACCESS_POLICY_RIBBON", "false");
@@ -235,18 +233,14 @@ pub(super) fn run_inner() -> Result<()> {
         // its Red key — see `RemoteButtons`. Fed only the remote's own input; a real HID mouse's
         // clicks never reach it.
         let mut buttons = mouse::RemoteButtons::default();
-        // Raw evdev mouse, only under cursor capture (uncaptured, raw deltas can't express the
-        // remote's absolute pointing). Sends happen on the reader thread, not queued for the
-        // ~2ms main loop, to avoid re-resampling a 1000 Hz mouse. Active from the start so the
-        // compositor never draws its own arrow over what we're forwarding — see `evmouse`'s
-        // module docs; deactivated below whenever the disconnect dialog needs the pointer back.
-        let hid_mouse = if settings.cursor_capture {
-            let input = connected.input();
-            crate::platform::webos::evmouse::HidMouse::start(true, move |ev| input.send(ev))
-        } else {
-            None
-        };
-        // Flips once a HID mouse is found — `HidMouse::start` no longer scans before returning
+        // Raw evdev HID, sending on the reader thread rather than queued for the ~2ms main loop
+        // so a 1000 Hz mouse isn't re-resampled. Keyboards are grabbed whatever Capture says, or
+        // the compositor sees Ctrl/Alt/Shift and warps its pointer mid-click; mouse nodes follow
+        // Capture: on = exclusive relative grab, off = compositor keeps the pointer to aim with.
+        let input = connected.input();
+        let hid =
+            crate::platform::webos::evdev::HidInput::start(true, settings.cursor_capture, move |ev| input.send(ev));
+        // Flips once a HID mouse is found — `HidInput::start` no longer scans before returning
         // (that blocked every stream connect on the node-open cost), so presence is only known
         // once the reader thread's own scan catches up; checked each tick below.
         let mut hid_device_seen = false;
@@ -316,10 +310,11 @@ pub(super) fn run_inner() -> Result<()> {
                 connected.disconnect_quit();
                 break 'running StreamOutcome::Quit;
             }
-            if !hid_device_seen
-                && hid_mouse
+            if settings.cursor_capture
+                && !hid_device_seen
+                && hid
                     .as_ref()
-                    .is_some_and(crate::platform::webos::evmouse::HidMouse::has_device)
+                    .is_some_and(crate::platform::webos::evdev::HidInput::has_mouse)
             {
                 hid_device_seen = true;
                 cursor.disable_sdl_relative();
@@ -330,13 +325,22 @@ pub(super) fn run_inner() -> Result<()> {
             }
             for event in events.poll_iter() {
                 use sdl2::event::Event;
-                // While the HID reader is seeing mouse reports, SDL's pointer events are that
-                // same input echoed by the compositor and must be dropped; once it idles, what
-                // arrives is the remote. Read once per event, not per guard — the window is
-                // 250ms, so per-arm freshness buys nothing.
-                let (hid_motion, hid_clicks) = match hid_mouse.as_ref() {
-                    Some(hid) => (hid.owns_sdl_motion(), hid.owns_sdl_clicks()),
-                    None => (false, false),
+                // Which SDL events are the compositor's echo of input this app already read off
+                // evdev. Owning the pointer node is the whole answer for buttons — it's decided
+                // in `evdev` (Capture, and whether the keyboard shares the node), so it isn't
+                // re-derived from the setting here. Keys go by recency instead, so the Magic
+                // Remote's keys — which never appear on a node we hold — still pass. Read once
+                // per event, not per guard: the window is 250ms, so per-arm freshness buys
+                // nothing.
+                let (hid_motion, hid_clicks, hid_keys) = match hid.as_ref() {
+                    Some(hid) => {
+                        let pointer = hid.has_mouse();
+                        // A keypress with the pointer left to the compositor still moves it:
+                        // webOS warps to screen centre, which would drag the host cursor along.
+                        let keys = hid.keyboard_busy();
+                        (pointer || keys, pointer, keys)
+                    }
+                    None => (false, false, false),
                 };
                 match event {
                     Event::Quit { .. } => {
@@ -372,7 +376,7 @@ pub(super) fn run_inner() -> Result<()> {
                         }
                     }
                     // Scancode keys are real game input — forward only, never open the dialog.
-                    Event::KeyDown { scancode: Some(sc), .. } => {
+                    Event::KeyDown { scancode: Some(sc), .. } if !hid_keys => {
                         if let Some(ev) = keyboard::key_event(sc, true) {
                             connected.send_input(&ev);
                         }
@@ -413,7 +417,7 @@ pub(super) fn run_inner() -> Result<()> {
                             connected.send_input(&ev);
                         }
                     }
-                    Event::KeyUp { scancode: Some(sc), .. } => {
+                    Event::KeyUp { scancode: Some(sc), .. } if !hid_keys => {
                         if let Some(ev) = keyboard::key_event(sc, false) {
                             connected.send_input(&ev);
                         }
@@ -592,16 +596,15 @@ pub(super) fn run_inner() -> Result<()> {
             was_holding = holding_now;
             // The dialog is navigated with the Magic Remote's pointer, so a captured stream
             // must hand the pointer back while it's up — hidden/relative there'd be nothing
-            // to aim with. Recaptured on dismiss.
+            // to aim with. Recaptured on dismiss. The evdev reader releases its grabs for the
+            // same window in either Capture mode — the dialog needs the remote's keys as much
+            // as its pointer, and holding a grab would only leave a HID device dead meanwhile.
             let want_captured = settings.cursor_capture && !disconnect.is_open();
             if want_captured != cursor.is_captured() {
                 cursor.set_captured(want_captured);
-                // Deactivate with the dialog open — the remote needs the OS pointer back to
-                // navigate it, and holding the grab would just leave a HID mouse dead for that
-                // duration; deactivating also stops forwarding in the same store, see `evmouse`.
-                if let Some(hid) = &hid_mouse {
-                    hid.set_active(want_captured);
-                }
+            }
+            if let Some(hid) = &hid {
+                hid.set_active(!disconnect.is_open());
             }
             // Wider than `is_open()`: a dismissed dialog still draws (fading out) a few more
             // ticks, used below to skip the stats overlay for exactly those ticks.

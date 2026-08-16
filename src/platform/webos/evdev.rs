@@ -1,25 +1,33 @@
-//! Raw HID mouse input straight from `/dev/input/event*`, bypassing SDL.
+//! Raw HID mouse **and keyboard** input straight from `/dev/input/event*`, bypassing SDL.
 //!
 //! **Why.** SDL mouse events on webOS come from the compositor's pointer, smoothed/resampled
 //! for a wrist-waved remote rather than a 125–1000 Hz mouse — jittery deltas no matter what the
 //! client does with them. evdev is the same bypass aurora-tv ships as "Use Hardware Mouse".
+//! Keyboards need the same exclusive grab, and in **both** cursor modes: an ungrabbed USB
+//! keyboard still reaches surface-manager, which reads modifier+click as a system gesture and
+//! warps its pointer to screen centre — the TV cursor and the host's then fight each other, which
+//! is what made Ctrl/Alt/Shift unusable in a CAD app.
+//!
+//! **Two cursor modes.** Capture on (games): mouse nodes are grabbed too, SDL relative is off,
+//! the compositor pointer is hidden. Capture off (desktop/absolute): a pointer-only node is left
+//! with the compositor so the TV cursor stays the one you aim — only keyboards are taken.
 //!
 //! **Access.** Unlike `/dev/hidraw*` (jail-blocked, see `dualsense.rs`), evdev nodes are
 //! reachable: `root:compositor 0660`, and the app's uid carries gid 505 in its supplementary
 //! groups — verified on-device, non-rooted, webOS 10.3.
 //!
-//! **Grabbed while active.** `EVIOCGRAB` is scoped to [`HidMouse::set_active`], not held for the
+//! **Grabbed while active.** `EVIOCGRAB` is scoped to [`HidInput::set_active`], not held for the
 //! reader's whole life: `cursor::COMPOSITOR_CURSOR_CONTROL` is verified off on webOS 26 (see
 //! `cursor.rs`), so an ungrabbed node leaves the compositor drawing its own pointer from the same
 //! evdev reports we forward. Scoping it to "caller wants it" rather than the reader's whole life
 //! bounds a wedged thread's blast radius to "no HID input" instead of "no mouse input at all,
 //! TV-wide" — the kernel releases the grab the moment our fd closes (including on panic), and the
 //! surface-manager's own fd stays open throughout, just starved of events while ours holds it.
-//! The Magic Remote never touches an evdev node, so it's unaffected and stays usable via SDL —
-//! which is what [`HidMouse::owns_sdl_motion`] is for.
+//! The Magic Remote never matches the mouse/keyboard filter, so it stays usable via SDL —
+//! which is what [`HidInput::keyboard_busy`] is for (drop HID keyboard echoes, keep remote keys).
 //!
 //! **One flag, two effects.** "Grabbed" and "forwarded to the host" are the same condition by
-//! construction, not two atomics a caller has to keep in sync: [`HidMouse::set_active`]`(false)`
+//! construction, not two atomics a caller has to keep in sync: [`HidInput::set_active`]`(false)`
 //! both releases the node and stops calling `sink`, in one store — needed for the disconnect
 //! dialog, which hands the pointer back to the Magic Remote and needs a HID mouse to go quiet for
 //! the same window.
@@ -32,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use punktfunk_core::input::InputEvent;
 
+use super::keyboard;
 use super::mouse;
 
 const EV_KEY: u16 = 0x01;
@@ -50,6 +59,9 @@ const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
+
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_A: u16 = 30;
 
 /// `poll` revents bits that mean the node is gone, not readable.
 const DEAD: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
@@ -94,13 +106,13 @@ const fn eviocgrab() -> libc::c_ulong {
     eioc(IOC_WRITE, 0x90, 4)
 }
 
-/// How long after a report this device still owns SDL's pointer events — bridges pauses within
-/// one drag, short enough that switching to the remote still feels immediate.
+/// How long after a keypress a HID keyboard still owns SDL's key events — bridges the gaps
+/// within a burst of typing, short enough that reaching for the remote still feels immediate.
 const IN_USE_WINDOW: Duration = Duration::from_millis(250);
 
-/// A HID mouse reader: one thread polling every mouse-shaped evdev node, handing each wire
-/// event straight to `sink`. Dropping it stops and joins the thread.
-pub struct HidMouse {
+/// A HID reader: one thread polling every mouse- or keyboard-shaped evdev node, handing each
+/// wire event straight to `sink`. Dropping it stops and joins the thread.
+pub struct HidInput {
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -109,45 +121,47 @@ pub struct HidMouse {
 /// the lot instead of a clone-and-thread-per-field.
 struct Shared {
     stop: AtomicBool,
-    has_device: AtomicBool,
-    /// Desired grab/forward state — see [`HidMouse::set_active`]. Read by [`reader_loop`] (to
+    has_mouse: AtomicBool,
+    /// Desired grab/forward state — see [`HidInput::set_active`]. Read by [`reader_loop`] (to
     /// drive `EVIOCGRAB`) and by the reader thread's gated `sink` wrapper; the per-device
     /// *applied* grab state lives on [`Device`], not here.
     grab: AtomicBool,
-    activity: Activity,
+    /// Cursor capture, fixed for this reader's life (the setting only takes effect next stream):
+    /// off leaves a pointer-only node with the compositor, so the TV cursor still aims.
+    grab_mouse: bool,
+    keys: KeyActivity,
 }
 
-/// Last-report timestamp, shared with the main thread to tell the mouse and remote apart — SDL
-/// gives no device identity here, so recency is the only discriminator. Millis since `base`,
-/// not `Instant`, since `Instant` isn't atomic.
-struct Activity {
+/// Last keyboard report, shared with the main thread to tell a HID keyboard from the remote —
+/// SDL gives no device identity, so recency is the only discriminator. The pointer needs no
+/// equivalent: whether this reader owns the mouse is a fixed fact for a stream, not a recency
+/// question ([`HidInput::has_mouse`]). Millis since `base`, since `Instant` isn't atomic.
+struct KeyActivity {
     base: Instant,
-    motion_ms: std::sync::atomic::AtomicU64,
-    /// Separate from motion: a click moves nothing, so a still mouse would look idle otherwise.
-    discrete_ms: std::sync::atomic::AtomicU64,
+    last_ms: std::sync::atomic::AtomicU64,
 }
 
-impl Activity {
+impl KeyActivity {
     fn new() -> Self {
         Self {
             base: Instant::now(),
-            motion_ms: std::sync::atomic::AtomicU64::new(0),
-            discrete_ms: std::sync::atomic::AtomicU64::new(0),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    fn touch(&self, slot: &std::sync::atomic::AtomicU64) {
-        slot.store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+    fn touch(&self) {
+        self.last_ms
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
-    fn recent(&self, slot: &std::sync::atomic::AtomicU64) -> bool {
-        let last = slot.load(Ordering::Relaxed);
+    fn recent(&self) -> bool {
+        let last = self.last_ms.load(Ordering::Relaxed);
         // 0 = nothing seen yet.
         last != 0 && self.base.elapsed().as_millis() as u64 - last < IN_USE_WINDOW.as_millis() as u64
     }
 }
 
-impl HidMouse {
+impl HidInput {
     /// `None` only if the reader thread itself fails to spawn — a Magic-Remote-only TV (or
     /// jail group mismatch) still gets a thread, so a mouse plugged in mid-session is picked up
     /// by [`reader_loop`]'s own rescan; scanning here on the caller's thread would instead block
@@ -159,16 +173,19 @@ impl HidMouse {
     ///
     /// `active` is the initial [`set_active`](Self::set_active) state — passed here instead of
     /// left to a follow-up call so a caller that always wants "started active" can't forget it.
-    pub fn start(active: bool, sink: impl Fn(&InputEvent) + Send + 'static) -> Option<Self> {
+    /// `grab_mouse` is cursor capture: false leaves pointer-only nodes with the compositor
+    /// (desktop/absolute), keyboards are taken either way.
+    pub fn start(active: bool, grab_mouse: bool, sink: impl Fn(&InputEvent) + Send + 'static) -> Option<Self> {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
-            has_device: AtomicBool::new(false),
+            has_mouse: AtomicBool::new(false),
             grab: AtomicBool::new(active),
-            activity: Activity::new(),
+            grab_mouse,
+            keys: KeyActivity::new(),
         });
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
-            .name("pf-evmouse".into())
+            .name("pf-evdev".into())
             .spawn(move || {
                 let gate = Arc::clone(&thread_shared);
                 let gated_sink = move |ev: &InputEvent| {
@@ -185,7 +202,7 @@ impl HidMouse {
         })
     }
 
-    /// Grab (or release) every open mouse node exclusively, and — same flag — start or stop
+    /// Grab (or release) every open node exclusively, and — same flag — start or stop
     /// calling `sink` with what they report (see the module docs). Applied on the reader thread's
     /// own cadence (bounded by [`POLL_TIMEOUT_MS`]), including to any node that shows up after
     /// this call, so callers don't need to re-invoke it on hot-plug.
@@ -193,27 +210,22 @@ impl HidMouse {
         self.shared.grab.store(active, Ordering::Relaxed);
     }
 
-    /// Whether the reader currently owns at least one open mouse node — `false` right after
+    /// Whether the reader currently owns at least one pointing node — `false` right after
     /// [`start`] until its background scan completes, or permanently on a Magic-Remote-only TV.
     /// Callers use this instead of `is_some()`/`is_none()` to tell "no HID mouse yet" apart from
     /// "not asked for one", since the reader thread always exists once `start` returns `Some`.
-    pub fn has_device(&self) -> bool {
-        self.shared.has_device.load(Ordering::Relaxed)
+    pub fn has_mouse(&self) -> bool {
+        self.shared.has_mouse.load(Ordering::Relaxed)
     }
 
-    /// True while the mouse moved within [`IN_USE_WINDOW`] — caller should drop SDL's echo of it.
-    pub fn owns_sdl_motion(&self) -> bool {
-        self.shared.activity.recent(&self.shared.activity.motion_ms)
-    }
-
-    /// Same question for SDL's buttons/wheel; also true during motion, so a click mid-drag is
-    /// covered even if its echo arrives before this reader's own read of it.
-    pub fn owns_sdl_clicks(&self) -> bool {
-        self.shared.activity.recent(&self.shared.activity.discrete_ms) || self.owns_sdl_motion()
+    /// True while a HID keyboard key was seen within [`IN_USE_WINDOW`] — caller should drop
+    /// SDL's echo of that keyboard without dropping the Magic Remote.
+    pub fn keyboard_busy(&self) -> bool {
+        self.shared.keys.recent()
     }
 }
 
-impl Drop for HidMouse {
+impl Drop for HidInput {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
@@ -225,7 +237,7 @@ impl Drop for HidMouse {
     }
 }
 
-/// An open mouse node, plus motion accumulated from it (`REL_X`/`REL_Y` only mean anything
+/// An open evdev node, plus motion accumulated from it (`REL_X`/`REL_Y` only mean anything
 /// together, at the next `SYN_REPORT`).
 struct Device {
     fd: RawFd,
@@ -241,6 +253,11 @@ struct Device {
     /// Which `want` value the last failed ioctl was for, so a device stuck failing every retry
     /// (device gone, held elsewhere) warns once per state change instead of once per poll cycle.
     grab_warned_for: Option<bool>,
+    /// Relative pointer (`REL_X`/`REL_Y`) whose motion this reader owns. Independent of
+    /// [`Self::keyboard`]: combo receivers usually expose the two on separate nodes.
+    mouse: bool,
+    /// Alphanumeric/modifier keys. Magic Remote nodes are excluded by [`open_hid`].
+    keyboard: bool,
 }
 
 impl Drop for Device {
@@ -252,15 +269,15 @@ impl Drop for Device {
 
 /// What probing a node found — matters for whether a later rescan retries it, see [`scan`].
 enum Probe {
-    Mouse(Device),
-    NotAMouse,
+    Hid(Device),
+    Skip,
     Unopenable,
 }
 
-/// Opens every mouse-shaped node not already in `seen`, appending the paths it takes.
-fn scan(seen: &mut Vec<PathBuf>) -> Vec<Device> {
+/// Opens every node this reader wants that isn't already in `seen`, appending the paths it takes.
+fn scan(seen: &mut Vec<PathBuf>, grab_mouse: bool) -> Vec<Device> {
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
-        tracing::warn!("/dev/input unreadable — no HID mouse support");
+        tracing::warn!("/dev/input unreadable — no HID input support");
         return Vec::new();
     };
     let mut paths: Vec<PathBuf> = entries
@@ -277,13 +294,13 @@ fn scan(seen: &mut Vec<PathBuf>) -> Vec<Device> {
     paths.sort();
     let mut devices = Vec::new();
     for path in paths {
-        match open_mouse(&path) {
-            Probe::Mouse(dev) => {
+        match open_hid(&path, grab_mouse) {
+            Probe::Hid(dev) => {
                 seen.push(path);
                 devices.push(dev);
             }
-            // Opened and isn't a mouse — settled, no rescan will change that.
-            Probe::NotAMouse => seen.push(path),
+            // Opened and isn't ours — settled, no rescan will change that.
+            Probe::Skip => seen.push(path),
             // Not marked seen: an unopenable node (`ENXIO`) looks like a not-yet-plugged
             // dongle, so the next rescan retries it.
             Probe::Unopenable => {}
@@ -293,10 +310,12 @@ fn scan(seen: &mut Vec<PathBuf>) -> Vec<Device> {
 }
 
 /// A mouse is a relative-pointing device (`EV_REL` on both axes) that isn't also an absolute
-/// pointer, which is what separates a desk mouse from the Magic Remote.
-fn open_mouse(path: &Path) -> Probe {
+/// pointer, which is what separates a desk mouse from the Magic Remote. A keyboard is a node
+/// carrying `KEY_A`/`KEY_LEFTCTRL` that isn't a TV builtin — those advertise a full QWERTY
+/// keymap, so [`is_tv_builtin`]'s name denylist is load-bearing.
+fn open_hid(path: &Path, grab_mouse: bool) -> Probe {
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-        return Probe::NotAMouse;
+        return Probe::Skip;
     };
     // SAFETY: NUL-terminated path, standard flags; failure is reported as -1, not UB.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
@@ -305,8 +324,14 @@ fn open_mouse(path: &Path) -> Probe {
     if fd < 0 {
         return Probe::Unopenable;
     }
+    let name = device_name(fd).unwrap_or_default();
+    if is_tv_builtin(&name) {
+        // SAFETY: `fd` came from `open` above; closing before the Device wrapper exists.
+        unsafe { libc::close(fd) };
+        return Probe::Skip;
+    }
     // Built before the checks below so `Drop` closes `fd` on every reject path.
-    let dev = Device {
+    let mut dev = Device {
         fd,
         path: path.to_path_buf(),
         dx: 0,
@@ -314,22 +339,49 @@ fn open_mouse(path: &Path) -> Probe {
         scroll: mouse::ScrollAccumulator::default(),
         grabbed: false,
         grab_warned_for: None,
+        mouse: false,
+        keyboard: false,
     };
     let rel = event_bits(fd, EV_REL);
     let abs = event_bits(fd, EV_ABS);
+    let key = event_bits(fd, EV_KEY);
     let has_axes = bit(&rel, REL_X) && bit(&rel, REL_Y);
     // Only absolute *pointer* axes disqualify — "any EV_ABS bit" would reject the Logitech
     // receiver here, which advertises `ABS_VOLUME` for media keys while pointing relatively.
     let absolute_pointer = bit(&abs, ABS_X) && bit(&abs, ABS_Y);
-    if !has_axes || absolute_pointer {
-        return Probe::NotAMouse;
+    let pointer = has_axes && !absolute_pointer;
+    // KEY_A / KEY_LEFTCTRL rather than "any EV_KEY": mouse nodes advertise BTN_LEFT in EV_KEY
+    // without being a keyboard. Absolute-pointer remotes are already excluded above.
+    dev.keyboard = !absolute_pointer && (bit(&key, KEY_A) || bit(&key, KEY_LEFTCTRL));
+    // A grab is per node, never per event type: taking a combo node's keys takes its pointer
+    // too, so forward that pointer as well or the mouse would go dead. Desktop mode pays for
+    // that — a combo receiver loses the TV cursor and aims relatively like a captured mouse,
+    // where a separate mouse node keeps aiming absolutely. Better than the alternatives: not
+    // grabbing means the modifier bug this exists to fix comes back on exactly that hardware.
+    dev.mouse = pointer && (grab_mouse || dev.keyboard);
+    if !dev.mouse && !dev.keyboard {
+        // Not ours, or a pointer-only node in desktop mode — left with the compositor so the
+        // TV cursor is still the one you aim.
+        return Probe::Skip;
     }
     tracing::info!(
-        "HID mouse: {} ({})",
-        device_name(fd).unwrap_or_default(),
+        "HID {}: {} ({})",
+        match (dev.mouse, dev.keyboard) {
+            (true, true) => "mouse+keyboard",
+            (true, false) => "mouse",
+            _ => "keyboard",
+        },
+        name,
         path.display()
     );
-    Probe::Mouse(dev)
+    Probe::Hid(dev)
+}
+
+/// LG's virtual remotes advertise a full QWERTY keymap, so a "has `KEY_A`" filter would steal
+/// the Magic Remote / RCU from the compositor and leave the TV unnavigable. Names as they read
+/// in `/proc/bus/input/devices` on-device.
+fn is_tv_builtin(name: &str) -> bool {
+    name.starts_with("LGE") || name.starts_with("Bluetooth-audio") || matches!(name, "CHECK INPUT" | "IoT keypad")
 }
 
 /// The `EVIOCGBIT` bitmap of supported codes for event type `kind`, or all-zero when the
@@ -391,12 +443,11 @@ fn reader_loop(sink: &impl Fn(&InputEvent), shared: &Shared) {
     // delay, so boosting priority wouldn't speed it up — it would just pull CPU from the video
     // pump during exactly the busiest window (stream connect) for no benefit.
     let mut seen: Vec<PathBuf> = Vec::new();
-    let mut devices = scan(&mut seen);
+    let mut devices = scan(&mut seen, shared.grab_mouse);
     if devices.is_empty() {
-        tracing::info!("no HID mouse on /dev/input yet — using SDL pointer until one appears");
-    } else {
-        shared.has_device.store(true, Ordering::Relaxed);
+        tracing::info!("no HID mouse/keyboard on /dev/input yet — using SDL input until one appears");
     }
+    store_presence(&devices, shared);
     // Nice -10, like the video pump, from here on: at nice 0 this thread lost the CPU to
     // boosted decode threads for up to 28ms at a stretch while a 1kHz mouse kept reporting —
     // exactly the jitter this module exists to remove.
@@ -417,7 +468,7 @@ fn reader_loop(sink: &impl Fn(&InputEvent), shared: &Shared) {
         if rc > 0 {
             for (i, pfd) in fds.iter().enumerate() {
                 if pfd.revents & libc::POLLIN != 0 {
-                    read_device(&mut devices[i], sink, &shared.activity);
+                    read_device(&mut devices[i], sink, &shared.keys);
                 }
             }
             // An unplugged node polls ready forever with POLLERR/HUP; checked cheaply since
@@ -428,11 +479,11 @@ fn reader_loop(sink: &impl Fn(&InputEvent), shared: &Shared) {
                         continue;
                     }
                     let gone = devices.remove(i);
-                    tracing::info!("HID mouse gone: {}", gone.path.display());
+                    tracing::info!("HID device gone: {}", gone.path.display());
                     seen.retain(|p| *p != gone.path);
                 }
                 fds = pollfds(&devices);
-                shared.has_device.store(!devices.is_empty(), Ordering::Relaxed);
+                store_presence(&devices, shared);
             }
             // Each pass above already drained and flushed everything pending, so a mouse
             // reporting faster than `MOTION_INTERVAL` just means going straight back into
@@ -449,15 +500,23 @@ fn reader_loop(sink: &impl Fn(&InputEvent), shared: &Shared) {
             let mtime = std::fs::metadata("/dev/input").and_then(|m| m.modified()).ok();
             if mtime != dir_mtime {
                 dir_mtime = mtime;
-                let found = scan(&mut seen);
+                let found = scan(&mut seen, shared.grab_mouse);
                 if !found.is_empty() {
                     devices.extend(found);
                     fds = pollfds(&devices);
-                    shared.has_device.store(true, Ordering::Relaxed);
+                    store_presence(&devices, shared);
                 }
             }
         }
     }
+}
+
+/// Only pointing nodes count: the caller uses this to decide whether SDL's pointer is ours,
+/// which a keyboard-only reader says nothing about.
+fn store_presence(devices: &[Device], shared: &Shared) {
+    shared
+        .has_mouse
+        .store(devices.iter().any(|d| d.mouse), Ordering::Relaxed);
 }
 
 fn pollfds(devices: &[Device]) -> Vec<libc::pollfd> {
@@ -474,7 +533,7 @@ fn pollfds(devices: &[Device]) -> Vec<libc::pollfd> {
 /// Drains one device's pending events, emitting the summed motion once at the end — a burst is
 /// reports the kernel already queued, so summing costs no latency and beats a datagram per event
 /// at 1kHz (the host's own injector coalesces the same way).
-fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), activity: &Activity) {
+fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), keys: &KeyActivity) {
     let size = std::mem::size_of::<InputEventRaw>();
     let mut buf = [0u8; 1024];
     loop {
@@ -490,9 +549,8 @@ fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), activity: &Activit
             // buffer offset carries no alignment guarantee.
             let ev = unsafe { chunk.as_ptr().cast::<InputEventRaw>().read_unaligned() };
             match ev.kind {
-                EV_REL => match ev.code {
+                EV_REL if dev.mouse => match ev.code {
                     REL_X | REL_Y => {
-                        activity.touch(&activity.motion_ms);
                         if ev.code == REL_X {
                             dev.dx += ev.value;
                         } else {
@@ -502,7 +560,6 @@ fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), activity: &Activit
                     // evdev's wheel is one unit per notch, same as SDL's, so the ×120 wire
                     // scaling accumulator applies unchanged.
                     REL_WHEEL | REL_HWHEEL => {
-                        activity.touch(&activity.discrete_ms);
                         flush_motion(dev, sink);
                         if let Some(e) = dev.scroll.scroll_event(ev.value, ev.code == REL_HWHEEL) {
                             sink(&e);
@@ -512,11 +569,15 @@ fn read_device(dev: &mut Device, sink: &impl Fn(&InputEvent), activity: &Activit
                 },
                 // `value == 2` is autorepeat, keyboard-only; matching 0/1 explicitly to be safe.
                 EV_KEY if ev.value == 0 || ev.value == 1 => {
-                    if let Some(button) = button_code(ev.code) {
-                        activity.touch(&activity.discrete_ms);
+                    // Buttons and keys share `EV_KEY`, and a combo node reports both — the code
+                    // ranges are what tells them apart, not the device.
+                    if let Some(button) = dev.mouse.then(|| button_code(ev.code)).flatten() {
                         // Motion first: the click must land where the pointer already is.
                         flush_motion(dev, sink);
                         sink(&mouse::raw_button_event(button, ev.value == 1));
+                    } else if let Some(vk) = dev.keyboard.then(|| keyboard::vk_from_evdev(ev.code)).flatten() {
+                        keys.touch();
+                        sink(&keyboard::raw_key_event(vk, ev.value == 1));
                     }
                 }
                 _ => {}
@@ -550,5 +611,19 @@ fn button_code(code: u16) -> Option<u32> {
         BTN_SIDE => Some(4),
         BTN_EXTRA => Some(5),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_tv_builtin;
+
+    #[test]
+    fn tv_builtins_are_skipped_by_name() {
+        assert!(is_tv_builtin("LGE M-RCU - Builtin [0]"));
+        assert!(is_tv_builtin("LGE RCU"));
+        assert!(is_tv_builtin("CHECK INPUT"));
+        assert!(!is_tv_builtin("M720 Triathlon Mouse"));
+        assert!(!is_tv_builtin("MX MCHNCL M Keyboard"));
     }
 }
