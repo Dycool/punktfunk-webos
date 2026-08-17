@@ -546,17 +546,24 @@ impl NdlSink {
                 paced_ns as f64 / 1_000_000.0,
             );
             // A frame refused because the pipeline hasn't finished loading is NOT a decode
-            // error, and must not be answered with a flush: `NDL_DirectVideoFlushRenderBuffer`
-            // against a not-yet-loaded pipeline silently kills the audio plane for the rest of
-            // the session (video recovers, audio never does — observed on CX). Holding and asking
-            // for a keyframe is the whole of the correct response here; the frames are being
-            // dropped on our side, so there is nothing queued in NDL to discard anyway.
+            // error, and gets neither loss response.
+            //
+            // No flush: against a not-yet-loaded pipeline it silently kills the audio plane for
+            // the session (video recovers, audio never does — observed on CX), and nothing is
+            // queued in NDL to discard anyway.
+            //
+            // No hold: freeze-until-reanchor is mid-stream recovery, and at frame 0 there is no
+            // last-good picture to freeze on. Worse, holding short-circuits `submit` before
+            // `play`, the only caller of the feed-anyway escape, so the hold outlives its own
+            // cause — release then needs the host's reanchor or `HOLD_GIVE_UP`, both evaluated
+            // only when a frame arrives, and a static desktop sends none. Request a keyframe and
+            // let the next frame retry.
             let not_loaded = e.downcast_ref::<NotLoadedYet>().is_some();
             if self.take_keyframe_slot() {
                 if !not_loaded {
                     let _ = self.player.flush();
+                    self.begin_hold();
                 }
-                self.begin_hold();
                 need_keyframe = true;
             }
         }
