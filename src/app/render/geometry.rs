@@ -4,12 +4,10 @@
 //! Shared on purpose — `prepare`'s staleness checks and `compose`'s GPU-crop math have to
 //! agree about a scrollable modal's extent, and deriving it twice is how they stop
 //! agreeing.
+use crate::app::{menu, view, App, PairingFocus, Screen, MODAL_TILE_PAD};
 use crate::ui;
 use crate::ui::render::Rect;
-
-// A glob, deliberately: these are `impl App` blocks lifted out of `app/mod.rs`, and
-// they read the same private tuning constants the rest of that module does.
-use crate::app::*;
+use crate::ui::Painter;
 
 impl App {
     /// `(total units, visible units, card rect, content/viewport rect)` for whichever
@@ -38,8 +36,10 @@ impl App {
         fonts: &ui::text::Fonts,
     ) -> Option<(usize, usize, Rect, Rect)> {
         match screen {
-            Screen::Settings(_) => {
-                let set = self.settings_scope();
+            // The scope comes off the passed screen, not `self.screen`: a closing Settings(Game)
+            // is asked about after `self.screen` has moved on, and reading the live scope there
+            // measures the global list instead of the one being faded out.
+            Screen::Settings(set) => {
                 let (card, content) = view::settings::layout(set, screen_w, screen_h);
                 let visible = view::settings::visible_rows(set, screen_h);
                 Some((menu::settings_row_count(set), visible, card, content))
@@ -89,6 +89,16 @@ impl App {
         (total as i32 * stride - viewport_h as i32).max(0)
     }
 
+    /// The animated scroll offset, held inside the range this list can actually travel.
+    ///
+    /// `modal.scroll_px` is the raw target the ease writes; every reader wants it clamped, and
+    /// the clamp used to be spelled out at each of them.
+    pub(crate) fn clamped_scroll_px(&self, total: usize, stride: i32, viewport_h: u32) -> i32 {
+        self.modal
+            .scroll_px
+            .clamp(0, Self::max_scroll_px(total, stride, viewport_h))
+    }
+
     /// Which slice of `screen`'s baked `tile::SCROLL_CONTENT` is showing, as `(src crop,
     /// dst rect)` — `None` for a screen whose body lives in its shell tile.
     ///
@@ -110,9 +120,7 @@ impl App {
         let stride = self.scroll_stride_for(screen, fonts);
         // The animated offset (see `sync_modal_scroll`), in absolute content pixels,
         // rebased onto whatever slice is currently baked into the tile.
-        let scroll_px = self
-            .modal_scroll_px
-            .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+        let scroll_px = self.clamped_scroll_px(total, stride, content.height());
         let src = Rect::new(
             0,
             scroll_px - window_start as i32 * stride,
@@ -150,10 +158,10 @@ impl App {
         let target = (offset as i32 * stride - bias)
             .min(Self::max_scroll_px(total, stride, viewport_h))
             .max(0);
-        self.modal_scroll_target_px = target;
-        if self.modal_scroll_screen != Some(screen) {
-            self.modal_scroll_screen = Some(screen);
-            self.modal_scroll_px = target;
+        self.modal.scroll_target_px = target;
+        if self.modal.scroll_screen != Some(screen) {
+            self.modal.scroll_screen = Some(screen);
+            self.modal.scroll_px = target;
         }
     }
 
@@ -284,9 +292,7 @@ impl App {
                 // re-rendered — so anchoring it to the quantized row would show that row's
                 // content twice, in two places, for the length of every scroll.
                 let stride = ui::widgets::focus_row_stride() as i32;
-                let px = self
-                    .modal_scroll_px
-                    .clamp(0, Self::max_scroll_px(total, stride, content.height()));
+                let px = self.clamped_scroll_px(total, stride, content.height());
                 Some(ui::widgets::focus_row_rect_at_px(content, self.settings_focused, px))
             }
             // Every two-button confirm dialog: one subtitle drives the card, so one
@@ -436,7 +442,7 @@ impl App {
         let card = self.modal_card_rect(screen_w, screen_h, fonts);
         let pad = MODAL_TILE_PAD;
         let region = card.map_or_else(|| Rect::new(0, 0, screen_w, screen_h), |c| c.inflate(pad));
-        self.modal_tile_region = region;
+        self.modal.tile_region = region;
         let mut p = Painter::new(region.width(), region.height());
         p.set_origin(region.x(), region.y());
         p

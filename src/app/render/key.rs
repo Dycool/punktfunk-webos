@@ -6,12 +6,16 @@
 //!
 //! App-side on purpose: they name this app's screens and its `Settings`, which is exactly
 //! what a widget library must not know.
+//!
+//! Every key here is hashed the moment it is built and then dropped — nothing stores one (see
+//! `App::modal_shell_version`). The borrowed `&str` fields say so in the type: a key that could
+//! outlive the state it describes would have to own a copy of every label, once per frame.
 use crate::core::model::{GamepadType, LogLevelOverride, Settings, SettingsOverride};
 
 /// Focused widget in the open modal. Each variant carries its content,
 /// so value changes (not just focus moves) invalidate the tile.
 #[derive(PartialEq, Eq, Hash)]
-pub enum ModalFocusKey {
+pub enum ModalFocusKey<'a> {
     /// The detected pad type rides along because the Controller row's "Automatic (...)" value
     /// depends on it, not just on `Settings` — a hotplug alone doesn't touch `Settings` at all.
     /// The override rides along because it decides which rows wear a "use global" button —
@@ -23,9 +27,9 @@ pub enum ModalFocusKey {
     PairingButton,
     ForgetButton(usize),
     /// Carries label to prevent stale tiles across screen changes.
-    SpeedTestButton(usize, String),
+    SpeedTestButton(usize, &'a str),
     /// Carries label+menu flag for row list shape changes and ⋯ state.
-    MenuRow(usize, String, bool),
+    MenuRow(usize, &'a str, bool),
     /// (focused row, log level, stats-overlay on, show-logs on) — any change invalidates the tile.
     DiagnosticsRow(usize, LogLevelOverride, bool, bool),
     ExperimentalRow(usize, bool, bool, Option<bool>),
@@ -37,84 +41,76 @@ pub enum ModalFocusKey {
 }
 
 /// Scrollable modal content keys. Paired with Screen for staleness checks.
+///
+/// Settings has no variant here: its rows are baked one tile each, keyed by
+/// [`ui::widgets::FocusRow::key`] — see [`tile::settings_row`]. A single strip keyed on the
+/// whole `Settings` struct meant one changed value re-rasterized every row.
 #[derive(PartialEq, Eq, Hash)]
 pub enum ScrollContentKey {
-    /// Settings row list + open dropdown row + detected pad type (see `ModalFocusKey::SettingsRow`).
-    Settings(Settings, SettingsOverride, Option<usize>, Option<GamepadType>),
     /// About window's start line.
     About(usize),
 }
 
 /// Each modal's shell content keys. Value changes invalidate the shell;
 /// pure focus moves don't (that's `ModalFocusKey`'s job).
+///
+/// The close-button hover is not in here. It changes every shell alike and belongs to none of
+/// them, so `modal_shell_version` hashes it alongside whichever key it got — one place instead
+/// of a `hover_close` field repeated down every variant and every arm that builds one.
 #[derive(PartialEq, Eq, Hash)]
-pub enum ModalShellKey {
+pub enum ModalShellKey<'a> {
     // Only what `render_settings` reads — the whole `Settings` struct (or the
     // dropdown row) would invalidate this key, forcing a full-screen re-raster,
     // on every keystroke or dropdown open/close. The shell draws chrome only (no
     // row content, not even the Bitrate caution — that's the focus tile's job),
-    // so the only thing that can actually change it is the close-button hover.
+    // so nothing but the title suffix can actually change it.
     Settings {
         /// The per-game screen's dim title suffix — `None` on the global one. The only thing
         /// separating the two shells.
-        game: Option<String>,
-        hover_close: bool,
+        game: Option<&'a str>,
     },
     Wake {
-        name: String,
+        name: &'a str,
         mac_empty: bool,
         sent: bool,
-        hover_close: bool,
     },
     Pairing {
         digits: [u8; 4],
-        status: Option<String>,
+        status: Option<&'a str>,
         busy: bool,
-        hover_close: bool,
     },
     ForgetHost {
-        name: Option<String>,
-        hover_close: bool,
+        name: Option<&'a str>,
     },
     HostMenu {
-        name: String,
-        subtitle: String,
+        name: &'a str,
+        subtitle: &'a str,
         rows: usize,
-        hover_close: bool,
     },
     WakeSettings {
-        title: String,
+        title: &'a str,
         auto: bool,
-        hover_close: bool,
     },
-    About {
-        hover_close: bool,
-    },
+    About,
     SpeedTest {
-        status: String,
-        hover_close: bool,
+        status: &'a str,
     },
     Diagnostics {
         log_level: LogLevelOverride,
         stats_overlay: bool,
         show_logs: bool,
-        hover_close: bool,
     },
     Experimental {
         ndl_audio_offload: bool,
         game_mode: bool,
         /// The root-probe verdict — it locks the Game mode row and rewrites its caption.
         rooted: Option<bool>,
-        hover_close: bool,
     },
     CursorSettings {
         cursor_capture: bool,
         cursor_gestures: bool,
         over: SettingsOverride,
-        hover_close: bool,
     },
-    /// Fixed warning copy + two buttons; only the close (X) hover varies.
-    SendLogs {
-        hover_close: bool,
-    },
+    /// Fixed warning copy + two buttons — nothing screen-specific left to key on.
+    SendLogs,
 }
