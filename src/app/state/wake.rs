@@ -10,7 +10,7 @@ impl App {
     /// Enters the WOL flow. With `wol_auto` off, shows prompt immediately.
     /// With it on, fires packet silently, shows prompt only after `WAKE_RETRY_INTERVAL`.
     pub(crate) fn start_wake(&mut self, host: String, port: u16, mac: Vec<String>, reason: String) {
-        let known = self.known_hosts.iter().find(|h| h.host == host && h.port == port);
+        let known = self.hosts.known.iter().find(|h| h.host == host && h.port == port);
         let name = known.map_or_else(|| host.clone(), |h| h.name.clone());
         // WHY: without a MAC, don't auto-send — show interactive explanation instead.
         let auto = known.is_some_and(|h| h.wol_auto) && !mac.is_empty();
@@ -39,9 +39,9 @@ impl App {
             // stale "Loading library…" until the host came back (or didn't).
             self.home_status = Some(Self::wake_home_status(&wake));
         } else {
-            self.screen = Screen::Wake;
+            self.nav.screen = Screen::Wake;
         }
-        self.wake = Some(wake);
+        self.screens.wake = Some(wake);
     }
 
     /// Sends (or resends) the WOL magic packet, bumping the resend timer.
@@ -64,7 +64,9 @@ impl App {
     /// silent auto-send after that, and probes reachability every `WAKE_PROBE_INTERVAL`.
     /// Runs whether modal is showing or not; `drain_discovery` can also end wake.
     pub fn tick_wake(&mut self) -> bool {
-        let Some(wake) = &mut self.wake else { return false };
+        let Some(wake) = &mut self.screens.wake else {
+            return false;
+        };
         let now = Instant::now();
         let mut changed = false;
         let mut new_status = None;
@@ -76,7 +78,8 @@ impl App {
                 if loaded.result.is_ok() {
                     let (host, port) = (wake.host.clone(), wake.port);
                     let mgmt_port = self
-                        .known_hosts
+                        .hosts
+                        .known
                         .iter()
                         .find(|h| h.host == host && h.port == port)
                         .and_then(|h| h.mgmt_port);
@@ -86,7 +89,9 @@ impl App {
                 wake.last_probe = Some(now);
             }
         }
-        let Some(wake) = &mut self.wake else { return changed };
+        let Some(wake) = &mut self.screens.wake else {
+            return changed;
+        };
 
         // WHY: resend only if wake.sent=true; else retry would fire on first tick
         // before user confirms. First send is start_wake's call (auto) or user's confirm.
@@ -111,11 +116,11 @@ impl App {
                 .is_some_and(|t| now.duration_since(t) >= crate::app::WAKE_PROBE_INTERVAL)
         {
             let (host, port) = (wake.host.clone(), wake.port);
-            wake.probe_rx = Some(Self::wake_probe(&self.known_hosts, &self.identity, &host, port));
+            wake.probe_rx = Some(Self::wake_probe(&self.hosts.known, &self.identity, &host, port));
             wake.last_probe = Some(now);
         }
         if reveal {
-            self.screen = Screen::Wake;
+            self.nav.screen = Screen::Wake;
         }
         if let Some(status) = new_status {
             self.home_status = Some(status);
@@ -124,7 +129,7 @@ impl App {
     }
 
     /// Spawns a reachability probe for (host, port). Associated function (not &self)
-    /// so it can run while `tick_wake` holds &mut self.wake.
+    /// so it can run while `tick_wake` holds &mut self.screens.wake.
     pub(crate) fn wake_probe(
         known_hosts: &[KnownHost],
         identity: &(String, String),
@@ -142,7 +147,7 @@ impl App {
     /// Handles Wake modal events: direction moves between "Wake"/"Cancel" buttons.
     /// Confirm sends or cancels. Back dismisses the modal (keeps wake running in bg).
     pub fn handle_wake_event(&mut self, ev: MenuEvent) {
-        let Some(wake) = self.wake.as_mut() else { return };
+        let Some(wake) = self.screens.wake.as_mut() else { return };
         // WHY: no MAC = no send/automate possible. Every event but Back is no-op.
         if wake.mac.is_empty() && ev != MenuEvent::Back {
             return;
@@ -154,7 +159,7 @@ impl App {
         match ev {
             MenuEvent::Up | MenuEvent::Down | MenuEvent::Left | MenuEvent::Right => {
                 wake.focused = usize::from(wake.focused == 0);
-                self.modal.focus_anim = Some(Instant::now());
+                self.render.modal.focus_anim = Some(Instant::now());
             }
             MenuEvent::Confirm if wake.focused == 0 => Self::send_wake(wake),
             MenuEvent::Confirm => {
@@ -167,14 +172,14 @@ impl App {
     /// Closes Wake modal. Sent wakes keep running in background (timers bring host back).
     /// Unsent wakes drop entirely, leaving error text behind.
     fn dismiss_wake(&mut self) {
-        self.screen = Screen::Home;
-        match self.wake.as_mut() {
+        self.nav.screen = Screen::Home;
+        match self.screens.wake.as_mut() {
             Some(wake) if wake.sent => {
                 // WHY: set silent=false so tick_wake won't re-pop the prompt after user dismisses.
                 wake.silent = false;
                 self.home_status = Some(Self::wake_home_status(wake));
             }
-            _ => self.home_status = self.wake.take().map(|w| w.reason),
+            _ => self.home_status = self.screens.wake.take().map(|w| w.reason),
         }
     }
 

@@ -18,19 +18,24 @@ pub(crate) struct Reachability {
 impl App {
     /// Kick off reachability sweep if one is due and none is in flight.
     pub(crate) fn tick_reachability(&mut self) {
-        if self.reach_rx.is_some() {
+        if self.jobs.reach.is_some() {
             return; // a sweep is still running
         }
-        if self.reach_last.is_some_and(|t| t.elapsed() < REACH_INTERVAL) {
+        if self.hosts.reach_last.is_some_and(|t| t.elapsed() < REACH_INTERVAL) {
             return;
         }
-        self.reach_last = Some(Instant::now());
-        let targets: Vec<(String, u16)> = self.entries.iter().map(|e| (e.host().to_string(), e.port())).collect();
+        self.hosts.reach_last = Some(Instant::now());
+        let targets: Vec<(String, u16)> = self
+            .hosts
+            .entries
+            .iter()
+            .map(|e| (e.host().to_string(), e.port()))
+            .collect();
         if targets.is_empty() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        self.reach_rx = Some(rx);
+        self.jobs.reach = Some(rx);
         // One thread for the whole sweep, probing sequentially: the host count here is a
         // handful, and a thread per host would spike this SoC's 3 cores for a cosmetic
         // indicator. Each send failing (the receiver replaced by a newer sweep, or the app
@@ -47,15 +52,15 @@ impl App {
 
     /// Drain finished probes. Returns true if sidebar changed.
     pub(crate) fn drain_reachability(&mut self) -> bool {
-        let Some(rx) = &self.reach_rx else { return false };
+        let Some(rx) = &self.jobs.reach else { return false };
         let mut changed = false;
         let mut finished = false;
         loop {
             match rx.try_recv() {
                 Ok(r) => {
                     let key = (r.host, r.port);
-                    if self.reachable.get(&key) != Some(&r.online) {
-                        self.reachable.insert(key, r.online);
+                    if self.hosts.reachable.get(&key) != Some(&r.online) {
+                        self.hosts.reachable.insert(key, r.online);
                         changed = true;
                     }
                 }
@@ -67,22 +72,25 @@ impl App {
             }
         }
         if finished {
-            self.reach_rx = None;
+            self.jobs.reach = None;
         }
         if changed {
-            self.sidebar_dirty = true;
+            self.render.sidebar_dirty = true;
         }
         changed
     }
 
     /// Last known reachability (None until first probe).
     pub(crate) fn entry_online(&self, entry: &crate::app::hosts::HostEntry) -> Option<bool> {
-        self.reachable.get(&(entry.host().to_string(), entry.port())).copied()
+        self.hosts
+            .reachable
+            .get(&(entry.host().to_string(), entry.port()))
+            .copied()
     }
 
     /// All reachability states, index-aligned with entries.
     pub(crate) fn reachability_list(&self) -> Vec<Option<bool>> {
-        self.entries.iter().map(|e| self.entry_online(e)).collect()
+        self.hosts.entries.iter().map(|e| self.entry_online(e)).collect()
     }
 
     /// Initialize empty reachability map.

@@ -15,6 +15,7 @@ use crate::core::model;
 use crate::core::screen::Screen;
 use std::time::Instant;
 
+use crate::app::nav::ScreenKey;
 use punktfunk_core::client::ProbeOutcome;
 
 /// Fraction of the measured goodput to recommend as a bitrate, leaving headroom for
@@ -53,27 +54,29 @@ pub(crate) enum SpeedTestMsg {
 impl App {
     /// Opens `Screen::SpeedTest` for sidebar entry `idx` and starts the probe.
     pub(crate) fn open_speed_test(&mut self, idx: usize) {
-        let Some(entry) = self.entries.get(idx) else { return };
+        let Some(entry) = self.hosts.entries.get(idx) else {
+            return;
+        };
         let host = entry.host().to_string();
         let port = entry.port();
         let name = entry.name().to_string();
         // Only reachable for a paired host (see `App::host_menu_actions`), so the pin is
         // expected to be there; `None` still just falls back to TOFU rather than failing.
         let pin = self
-            .known_hosts
+            .hosts
+            .known
             .iter()
             .find(|h| h.host == host && h.port == port)
             .and_then(|k| k.fingerprint);
 
-        self.speed_test_name = name;
-        self.speed_test = Some(SpeedTestState::Connecting);
-        self.speed_test_focused = 0;
-        self.screen = Screen::SpeedTest;
+        self.screens.speed_test_name = name;
+        self.screens.speed_test = Some(SpeedTestState::Connecting);
+        self.nav.enter(Screen::SpeedTest, 0);
         tracing::info!("speed test: connecting to {host}:{port}");
 
         let identity = (self.identity.0.clone(), self.identity.1.clone());
         let (tx, rx) = std::sync::mpsc::channel();
-        self.speed_test_rx = Some(rx);
+        self.jobs.speed_test = Some(rx);
         std::thread::spawn(move || {
             let progress_tx = tx.clone();
             let result = crate::session::probe::run_speed_probe(
@@ -99,14 +102,14 @@ impl App {
     /// Drains the worker's updates, if any — called each tick alongside the other
     /// `drain_*`s. Returns whether anything changed.
     pub(crate) fn drain_speed_test(&mut self) -> bool {
-        let Some(rx) = &self.speed_test_rx else { return false };
+        let Some(rx) = &self.jobs.speed_test else { return false };
         let mut changed = false;
         // WHY: keep only latest; burst between ticks costs one redraw, not per-message.
         while let Ok(msg) = rx.try_recv() {
             changed = true;
             match msg {
                 SpeedTestMsg::Progress(p) => {
-                    self.speed_test = Some(SpeedTestState::Measuring { partial: Some(p) });
+                    self.screens.speed_test = Some(SpeedTestState::Measuring { partial: Some(p) });
                 }
                 SpeedTestMsg::Done { outcome, confirmed } => {
                     tracing::info!(
@@ -116,18 +119,18 @@ impl App {
                         outcome.recv_bytes,
                         outcome.elapsed_ms
                     );
-                    self.speed_test = Some(SpeedTestState::Done {
+                    self.screens.speed_test = Some(SpeedTestState::Done {
                         outcome: *outcome,
                         confirmed,
                     });
-                    self.speed_test_focused = 0;
-                    self.speed_test_rx = None;
+                    self.nav.set_cursor(ScreenKey::SpeedTest, 0);
+                    self.jobs.speed_test = None;
                     break;
                 }
                 SpeedTestMsg::Failed(e) => {
                     tracing::warn!("speed test failed: {e}");
-                    self.speed_test = Some(SpeedTestState::Failed(e));
-                    self.speed_test_rx = None;
+                    self.screens.speed_test = Some(SpeedTestState::Failed(e));
+                    self.jobs.speed_test = None;
                     break;
                 }
             }
@@ -137,7 +140,7 @@ impl App {
 
     pub(crate) fn handle_speed_test_event(&mut self, ev: MenuEvent) {
         let done = matches!(
-            self.speed_test,
+            self.screens.speed_test,
             Some(SpeedTestState::Done { .. }) | Some(SpeedTestState::Failed(_))
         );
         match ev {
@@ -145,21 +148,22 @@ impl App {
             MenuEvent::Back => self.close_speed_test(),
             _ if !done => {}
             MenuEvent::Left | MenuEvent::Right => {
-                self.speed_test_focused = 1 - self.speed_test_focused;
-                self.modal.focus_anim = Some(Instant::now());
+                self.nav
+                    .set_cursor(ScreenKey::SpeedTest, 1 - self.nav.cursor(ScreenKey::SpeedTest));
+                self.render.modal.focus_anim = Some(Instant::now());
             }
             MenuEvent::Confirm => {
-                if self.speed_test_focused != 0 {
+                if self.nav.cursor(ScreenKey::SpeedTest) != 0 {
                     self.close_speed_test();
                     return;
                 }
-                let applied = match &self.speed_test {
+                let applied = match &self.screens.speed_test {
                     Some(SpeedTestState::Done { outcome, .. }) => recommended_kbps(outcome),
                     _ => None,
                 };
                 match applied {
                     Some(kbps) => {
-                        self.settings.bitrate_kbps = kbps;
+                        self.settings_ui.settings.bitrate_kbps = kbps;
                         self.persist();
                         self.close_speed_test();
                     }
@@ -174,7 +178,7 @@ impl App {
     /// index is still set (this screen is only ever reached from there), so nothing has
     /// to be stashed separately.
     pub(crate) fn retry_speed_test(&mut self) {
-        let Some(idx) = self.host_menu_index else {
+        let Some(idx) = self.screens.host_menu_index else {
             self.close_speed_test();
             return;
         };
@@ -183,8 +187,8 @@ impl App {
 
     /// Leaves the screen, abandoning any in-flight probe.
     pub(crate) fn close_speed_test(&mut self) {
-        self.speed_test = None;
-        self.speed_test_rx = None;
+        self.screens.speed_test = None;
+        self.jobs.cancel_speed_test();
         self.back_to_host_menu();
     }
 }

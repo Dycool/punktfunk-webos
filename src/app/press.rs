@@ -24,9 +24,9 @@ impl App {
         // Anything but a confirm moves focus or closes the screen, so a dip still running
         // from an earlier press belongs to a widget that is no longer under the cursor.
         if ev != MenuEvent::Confirm {
-            self.press.take();
+            self.render.press.take();
         }
-        match self.screen {
+        match self.nav.screen {
             Screen::Home => return self.handle_home_event(ev, screen_w, screen_h),
             Screen::Pairing => self.handle_pairing_event(ev),
             Screen::Settings(_) => self.handle_settings_event(ev, screen_h),
@@ -53,13 +53,13 @@ impl App {
     /// beforehand, because whether a button opens anything is the screen handler's
     /// business and a list of which ones do would be one more thing to keep in step.
     pub(crate) fn press(&mut self, screen_w: u32, screen_h: u32, fonts: &ui::text::Fonts) -> Option<ConnectTarget> {
-        let before = self.screen;
+        let before = self.nav.screen;
         if self.pressable() {
-            self.press.arm();
+            self.render.press.arm();
         }
         let launched = self.handle_menu_event(MenuEvent::Confirm, screen_w, screen_h, fonts);
-        if self.screen != before || launched.is_some() {
-            self.press.take();
+        if self.nav.screen != before || launched.is_some() {
+            self.render.press.take();
         }
         launched
     }
@@ -69,8 +69,8 @@ impl App {
     /// composites through `App::press`, so without this an open modal's confirm would push
     /// the sidebar row behind its card in alongside the button actually pressed.
     pub(crate) fn press_dip(&self, owner: Screen) -> ui::animation::Press {
-        if self.screen == owner {
-            self.press
+        if self.nav.screen == owner {
+            self.render.press
         } else {
             ui::animation::Press::default()
         }
@@ -82,15 +82,15 @@ impl App {
     fn pressable(&self) -> bool {
         // Focus is on a dropdown option, which has its own tile — the row behind the
         // overlay is not what was pressed.
-        if self.dropdown.is_some() {
+        if self.settings_ui.dropdown.is_some() {
             return false;
         }
-        match self.screen {
+        match self.nav.screen {
             // Sidebar rows are buttons: pick a host, add one, open Settings. A grid card
             // isn't — launching one is already an animation of its own.
             Screen::Home => matches!(self.home_focus, HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_)),
             // The button only; the PIN digits above it are a field.
-            Screen::Pairing => matches!(self.pairing_focus, PairingFocus::RequestAccess),
+            Screen::Pairing => matches!(self.screens.pairing_focus, PairingFocus::RequestAccess),
             Screen::Wake | Screen::ForgetHost | Screen::SpeedTest | Screen::SendLogs => true,
             // Rows, not buttons.
             Screen::Settings(_)
@@ -109,6 +109,6 @@ impl App {
     /// Retires a dip that has played out; called every frame. `true` means the tile moved
     /// back, so the frame is dirty.
     pub(crate) fn poll_press(&mut self) -> bool {
-        self.press.landed() && self.press.take()
+        self.render.press.landed() && self.render.press.take()
     }
 }

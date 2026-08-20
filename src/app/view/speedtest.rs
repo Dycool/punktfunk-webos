@@ -3,8 +3,8 @@ use crate::app::state::speedtest::{recommended_kbps, SpeedTestState};
 use crate::ui;
 use crate::ui::render::Rect;
 use crate::ui::text::Fonts;
-use crate::ui::widgets::ConfirmButton;
 use crate::ui::Canvas;
+use crate::ui::ModalMetrics;
 use crate::ui::ModalScreen;
 use anyhow::Result;
 
@@ -14,22 +14,6 @@ pub(crate) const TITLE: &str = "Network speed test";
 /// "Retry" rather than "Close", to leave the user an action on a low-throughput result.
 pub(crate) fn apply_label(recommended: Option<u32>) -> String {
     recommended.map_or_else(|| "Retry".to_string(), |kbps| format!("Use {} Mbps", kbps / 1000))
-}
-
-/// Finished-test buttons (apply the recommendation, or close). Built per render.
-pub(crate) fn buttons(apply_label: &str) -> [ConfirmButton<'_>; 2] {
-    [
-        ConfirmButton {
-            icon: Some(crate::app::view::icons::ICON_SIGNAL),
-            label: apply_label,
-            color: ui::style::theme().accent_bright,
-        },
-        ConfirmButton {
-            icon: None,
-            label: "Close",
-            color: ui::style::theme().text,
-        },
-    ]
 }
 
 /// Whether the test has stopped — the state in which the card grows a button row.
@@ -140,13 +124,17 @@ pub(crate) fn recommendation(state: Option<&SpeedTestState>) -> Option<u32> {
 pub(crate) struct Modal<'a> {
     pub state: Option<&'a SpeedTestState>,
     pub host_name: &'a str,
+    /// `None` while the test is still running — there is nothing to apply yet.
+    pub confirm: Option<&'a crate::app::screens::confirm::Confirm>,
 }
 
-impl ModalScreen for Modal<'_> {
+impl ModalMetrics for Modal<'_> {
     fn card_rect(&self, screen_w: u32, screen_h: u32, fonts: &Fonts) -> Rect {
         card_rect(screen_w, screen_h, fonts, self.state, self.host_name)
     }
+}
 
+impl ModalScreen for Modal<'_> {
     fn render(&self, c: &mut Canvas, hover_close: bool) -> Result<()> {
         let (state, host_name) = (self.state, self.host_name);
         let card = self.card_rect(c.screen_w, c.screen_h, c.fonts);
@@ -163,11 +151,10 @@ impl ModalScreen for Modal<'_> {
                 ui::style::theme().muted
             },
         )?;
-        if finished(state) {
-            let apply_label = apply_label(recommendation(state));
-            // `usize::MAX` = nothing focused; the focused button is its own tile.
+        if let Some(confirm) = self.confirm {
+            // Every button drawn unfocused; the focused one is its own tile.
             c.render(
-                ui::widgets::ConfirmButtons::new(&buttons(&apply_label)),
+                ui::widgets::ConfirmButtons::new(&confirm.widgets()),
                 buttons_rect(c.screen_w, c.screen_h, c.fonts, state, host_name),
             )?;
         }

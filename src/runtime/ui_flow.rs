@@ -31,7 +31,7 @@ fn launch_settings(app: &App, target: &crate::core::model::ConnectTarget) -> cra
     let over = app
         .known_host(&target.host, target.port)
         .map_or_else(SettingsOverride::default, |h| h.overrides(id));
-    let mut settings = over.merge_into(app.settings);
+    let mut settings = over.merge_into(app.settings_ui.settings);
     settings.clamp_to_caps();
     settings
 }
@@ -67,7 +67,7 @@ pub(super) fn run_ui_flow(
     let mut app = App::new(identity.clone());
     // `ControllerDeviceAdded` fires once per connect, not per menu entry, so re-poll here
     // or the Controller row stays stale after the first menu.
-    app.detected_gamepad_type = gamepad::detect_type(game_controller);
+    app.set_gamepad_type(gamepad::detect_type(game_controller));
     // The GPU tile cache is the render loop's, not App's — App holds only screen state
     // Recreated per menu entry, same as `app`.
     let mut tiles = crate::ui::cache::TileStore::new();
@@ -87,8 +87,7 @@ pub(super) fn run_ui_flow(
     if initial_status.is_some() {
         // Set after `App::new`, which has already kicked off the library reload for the
         // restored host — sticky so that reload's own progress line doesn't erase it.
-        app.home_status = initial_status;
-        app.home_status_sticky = true;
+        app.set_home_status(initial_status, true);
     }
     // Same toast widget as the streaming loop's (`ui::widgets::Notification`);
     // shown once, right as the Home screen re-appears.
@@ -183,21 +182,13 @@ pub(super) fn run_ui_flow(
         }
         // Controller quit shortcut: held long enough on Home,
         // then forgotten so it fires once per hold rather than repeatedly while held.
-        if !quit_dialog.is_open() && matches!(app.screen, Screen::Home) && chord.held_for(EXIT_HOLD) {
+        if !quit_dialog.is_open() && matches!(app.nav.screen, Screen::Home) && chord.held_for(EXIT_HOLD) {
             tracing::info!("quit shortcut held — opening quit dialog");
             chord.clear();
             quit_dialog.open(1);
             dirty = true;
         }
-        dirty |= app.drain_discovery();
-        dirty |= app.drain_art();
-        dirty |= app.drain_games();
-        dirty |= app.drain_pairing();
-        dirty |= app.drain_rooted();
-        dirty |= app.drain_speed_test();
-        dirty |= app.drain_send_logs();
-        app.tick_reachability();
-        dirty |= app.drain_reachability();
+        dirty |= app.drain_jobs();
         dirty |= app.tick_wake();
         // Fire on hold elapsed, not release, so user sees it before letting go.
         if let Some(hold) = input
@@ -206,7 +197,7 @@ pub(super) fn run_ui_flow(
             .filter(|h| !h.fired && h.since.elapsed() >= CARD_HOLD)
         {
             hold.fired = true;
-            let still_there = matches!(app.screen, Screen::Home) && hold.focus == app.home_focus;
+            let still_there = matches!(app.nav.screen, Screen::Home) && hold.focus == app.home_focus;
             if still_there {
                 // The hold's whole effect. It no longer pins — pinning is one of the two
                 // rows the menu it raises offers, and the only way to reach it.
@@ -222,7 +213,7 @@ pub(super) fn run_ui_flow(
                 // In-memory settings, not `store::load_settings()`: a just-flipped
                 // toggle (e.g. audio offload) is persisted asynchronously by
                 // `StateWriter`, so re-reading disk here could race the write and
-                // connect with the stale value. `app.settings` is updated synchronously.
+                // connect with the stale value. `app.settings_ui.settings` is updated synchronously.
                 // Per-game overrides merge over the global document here — the single
                 // point where the game being launched is known and the settings copy that
                 // rides the whole session is made. Clamped to caps like any global value.
@@ -245,7 +236,7 @@ pub(super) fn run_ui_flow(
                 _ => Connect::Done,
             };
             let presenting = crate::platform::webos::ndl::presenting();
-            if app.hero.handover_ready(t.elapsed(), connect, presenting) {
+            if app.render.hero.handover_ready(t.elapsed(), connect, presenting) {
                 break 'ui;
             }
         }
@@ -284,13 +275,13 @@ pub(super) fn run_ui_flow(
                     }
                     // Outside the open: only the first pad becomes `controller`, but a second one
                     // plugged in after it can still be the pad `detect_type` names.
-                    app.detected_gamepad_type = gamepad::detect_type(game_controller);
+                    app.set_gamepad_type(gamepad::detect_type(game_controller));
                     continue;
                 }
                 Event::ControllerDeviceRemoved { .. } => {
                     *controller = None;
                     // Re-poll rather than clearing: another pad may still be attached.
-                    app.detected_gamepad_type = gamepad::detect_type(game_controller);
+                    app.set_gamepad_type(gamepad::detect_type(game_controller));
                     // An unplugged pad sends no releases — drop any armed chord.
                     chord.clear();
                     continue;
@@ -320,7 +311,7 @@ pub(super) fn run_ui_flow(
             // Short Back tap on Home with sidebar focus opens the quit dialog. From a
             // game card / the ⋯ column, Back first steps focus back to the sidebar
             // (see `App::back`), so it falls through to normal dispatch instead.
-            if matches!(app.screen, Screen::Home)
+            if matches!(app.nav.screen, Screen::Home)
                 && matches!(app.home_focus, HomeFocus::Sidebar(_))
                 && matches!(&event, Event::KeyDown { keycode: Some(k), repeat: false, .. }
                     if crate::platform::webos::input::menu_event_for_key(*k) == Some(MenuEvent::Back))
@@ -338,17 +329,18 @@ pub(super) fn run_ui_flow(
         // Track actual keyboard state (user can dismiss while field focused; moves card).
         let keyboard_shown = text_input.is_screen_keyboard_shown(canvas.window());
         if keyboard_shown != app.keyboard_shown {
-            app.keyboard_shown = keyboard_shown;
+            app.set_keyboard_shown(keyboard_shown);
             dirty = true;
             tracing::debug!("on-screen keyboard shown: {keyboard_shown}");
         }
         // Toggle text input (edge-triggered; SDL doesn't tolerate repeated calls).
-        let wants_text = text_input_screen(app.screen);
+        let wants_text = text_input_screen(app.nav.screen);
         if wants_text != text_input_active {
             text_input_active = wants_text;
             if wants_text {
-                let r = app.address_field_rect(display_mode.w as u32, display_mode.h as u32, fonts);
-                text_input.set_rect(sdl2::rect::Rect::new(r.x(), r.y(), r.width(), r.height()));
+                if let Some(r) = app.address_field_rect(display_mode.w as u32, display_mode.h as u32, fonts) {
+                    text_input.set_rect(sdl2::rect::Rect::new(r.x(), r.y(), r.width(), r.height()));
+                }
                 text_input.start();
             } else {
                 text_input.stop();
@@ -378,8 +370,8 @@ pub(super) fn run_ui_flow(
             dirty = true;
         }
         let animating = app.tick_animations()
-            || app.grid.tiles_pending
-            || !app.grid.reveal.is_revealed()
+            || app.render.grid.tiles_pending
+            || !app.render.grid.reveal.is_revealed()
             || quit_dialog_active
             || notif_frame.is_some();
         let log_overlay_due = log_overlay_state() != LogOverlayState::Off
@@ -419,7 +411,7 @@ pub(super) fn run_ui_flow(
         let rebuilt = updated.len();
         frame.stage(Stage::Upload, || -> Result<()> {
             // Free old textures before uploading new (reduce peak memory during scroll).
-            for tile in std::mem::take(&mut app.evicted_tiles) {
+            for tile in std::mem::take(&mut app.render.evicted_tiles) {
                 compositor.drop_tile(tile);
             }
             // Two families upload from outside the tile store (the spinner's pre-rasterized
@@ -429,7 +421,7 @@ pub(super) fn run_ui_flow(
                 if let Some(idx) = tile::spinner_index(id) {
                     upload_spinner(compositor, texture_creator, idx)?;
                 } else if id == tile::HERO {
-                    if let Some(hero) = app.hero.uploaded_image() {
+                    if let Some(hero) = app.render.hero.uploaded_image() {
                         compositor.upload_raw(
                             texture_creator,
                             id,
@@ -515,7 +507,7 @@ pub(super) fn run_ui_flow(
         frame.report(
             TICK_BUDGET,
             &FrameStats {
-                screen: app.screen,
+                screen: app.nav.screen,
                 rebuilt,
                 tiles: &tiles,
                 text: text_cache.len(),
@@ -532,6 +524,6 @@ pub(super) fn run_ui_flow(
     Ok(connect_handle.map(|(handle, settings)| ConnectOutcome {
         handle,
         settings,
-        first_frame_deadline: app.hero.first_frame_deadline(),
+        first_frame_deadline: app.render.hero.first_frame_deadline(),
     }))
 }

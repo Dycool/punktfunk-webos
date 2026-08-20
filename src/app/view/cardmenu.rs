@@ -34,8 +34,13 @@ impl App {
         let menu = self.card_menu.as_ref()?;
         let available_w = screen_w.saturating_sub(ui::widgets::SIDEBAR_W);
         let columns = view::home::grid_columns(available_w);
-        let idx = self.grid_idx_for_pin_id(&menu.pin_id, columns)?;
-        let card = self.scrolled_card_rect(idx, columns, ui::widgets::SIDEBAR_W as i32, available_w);
+        // The latch is only good while the grid still holds that card at that index — a
+        // library reload landing under an open menu (`drain_games`) reorders it, and measuring
+        // the wrong card's rect would put the rows somewhere the user never sees them.
+        if self.pin_id_at_grid_idx(menu.idx, columns) != Some(menu.pin_id.as_str()) {
+            return None;
+        }
+        let card = self.scrolled_card_rect(menu.idx, columns, ui::widgets::SIDEBAR_W as i32, available_w);
         let panel_h = ui::widgets::card_menu_strip_h(fonts.raster, fonts.value, card.height(), ROW_COUNT);
         let title_h = ui::widgets::title_strip_h(fonts.raster, fonts.value, card.height());
         let top = card.bottom() - panel_h as i32 + title_h as i32;
@@ -50,7 +55,7 @@ impl App {
     /// The transform `compose_grid` composites the focused card and everything on it with:
     /// the focus zoom and the appear pop, both about the card's own centre.
     pub(crate) fn focused_card_scale(&self, pin_id: &str) -> f32 {
-        let f = ui::animation::anim_frac_smooth(self.focus_anim, ui::animation::CARD_FOCUS_POP);
+        let f = ui::animation::anim_frac_smooth(self.render.focus_anim, ui::animation::CARD_FOCUS_POP);
         ui::animation::zoom_scale(f, crate::app::CARD_GROWTH)
             * ui::animation::pop_in_scale(self.card_pop_frac(pin_id), crate::app::CARD_POP_SHRINK)
     }

@@ -11,24 +11,24 @@ use crate::services::store;
 impl App {
     /// Open `EditHost` for sidebar row; pre-filled with current address. No-op for unsaved entries.
     pub(crate) fn open_edit_host(&mut self, idx: usize) {
-        let Some(HostEntry::Known(h)) = self.entries.get(idx) else {
+        let Some(HostEntry::Known(h)) = self.hosts.entries.get(idx) else {
             return;
         };
-        self.add_host = AddHostState::from_host_port(&h.host, h.port);
-        self.edit_host_index = Some(idx);
-        self.host_menu_index = None;
-        self.screen = Screen::EditHost;
+        self.screens.add_host = AddHostState::from_host_port(&h.host, h.port);
+        self.screens.edit_host_index = Some(idx);
+        self.screens.host_menu_index = None;
+        self.nav.screen = Screen::EditHost;
     }
 
     /// Handle menu event. Left/Right stand in for backspace; Confirm commits with 4 octets.
     pub(crate) fn handle_edit_host_event(&mut self, ev: MenuEvent) {
         match ev {
-            MenuEvent::Left => self.add_host.backspace(),
-            MenuEvent::Right => self.add_host.advance_field(),
+            MenuEvent::Left => self.screens.add_host.backspace(),
+            MenuEvent::Right => self.screens.add_host.advance_field(),
             MenuEvent::Confirm => self.confirm_edit_host(),
             MenuEvent::Back => {
-                self.edit_host_index = None;
-                self.screen = Screen::Home;
+                self.screens.edit_host_index = None;
+                self.nav.screen = Screen::Home;
             }
             MenuEvent::Up | MenuEvent::Down | MenuEvent::Secondary => {}
         }
@@ -36,24 +36,26 @@ impl App {
 
     /// Rewrite address in-place, keeping identity (fingerprint, `mgmt_port`, MAC). No-op if partial.
     pub(crate) fn confirm_edit_host(&mut self) {
-        if !self.add_host.is_complete() {
+        if !self.screens.add_host.is_complete() {
             return;
         }
-        let Some(idx) = self.edit_host_index else { return };
-        let Some(HostEntry::Known(old)) = self.entries.get(idx).cloned() else {
+        let Some(idx) = self.screens.edit_host_index else {
             return;
         };
-        let (host, port) = self.add_host.host_and_port();
+        let Some(HostEntry::Known(old)) = self.hosts.entries.get(idx).cloned() else {
+            return;
+        };
+        let (host, port) = self.screens.add_host.host_and_port();
         if host == old.host && port == old.port {
-            self.edit_host_index = None;
-            self.screen = Screen::Home;
+            self.screens.edit_host_index = None;
+            self.nav.screen = Screen::Home;
             return;
         }
 
         // Drop old record before upsert to avoid stale entry (upsert_known_host keys on (host, port))
-        self.known_hosts.retain(|k| !(k.host == old.host && k.port == old.port));
+        self.hosts.known.retain(|k| !(k.host == old.host && k.port == old.port));
         store::upsert_known_host(
-            &mut self.known_hosts,
+            &mut self.hosts.known,
             store::KnownHost {
                 name: old.name.clone(),
                 host: host.clone(),
@@ -66,23 +68,24 @@ impl App {
             },
         );
         // The address is the cache key, so the old one's art is now orphaned.
-        crate::services::art::reconcile_host_caches(&self.known_hosts);
+        crate::services::art::reconcile_host_caches(&self.hosts.known);
         self.persist();
         self.rebuild_entries();
 
         // Keep selection updated to new address
-        if self.selected_host.as_ref() == Some(&(old.host.clone(), old.port)) {
-            self.selected_host = Some((host.clone(), port));
+        if self.library.selected_host.as_ref() == Some(&(old.host.clone(), old.port)) {
+            self.library.selected_host = Some((host.clone(), port));
         }
         self.home_focus = HomeFocus::Sidebar(
-            self.entries
+            self.hosts
+                .entries
                 .iter()
                 .position(|e| e.host() == host && e.port() == port)
                 .unwrap_or(0),
         );
-        self.edit_host_index = None;
-        self.sidebar_dirty = true;
-        self.grid.dirty = true;
-        self.screen = Screen::Home;
+        self.screens.edit_host_index = None;
+        self.render.sidebar_dirty = true;
+        self.render.grid.dirty = true;
+        self.nav.screen = Screen::Home;
     }
 }

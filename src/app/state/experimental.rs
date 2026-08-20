@@ -1,24 +1,27 @@
 //! Experimental screen logic. Rendering lives in `app::view::experimental`.
 use crate::app::menu;
+use crate::app::nav::ScreenKey;
 use crate::app::App;
 use crate::core::event::MenuEvent;
 use crate::core::screen::{Screen, SettingsScope};
-use crate::ui;
-use std::time::Instant;
 
 impl App {
     /// Probes root access for the Game mode row, once per launch — rooting can come and go
     /// between boots, so it is never persisted, and no screen but this one needs the answer.
-    /// Off-thread: a luna round-trip has no business blocking the modal's open frame.
+    ///
+    /// Off-thread, and deliberately not on the frame the modal opens: the probe forks
+    /// `luna-send-pub`, which in turn launches the Homebrew Channel's service on demand, and
+    /// that costs enough CPU on this hardware to show as a stutter in the open animation
+    /// running beside it. [`App::tick_root_probe`] starts it once that animation is over.
     fn start_root_probe(&mut self) {
-        if self.rooted.is_some() || self.rooted_rx.is_some() {
+        if self.hosts.rooted.is_some() || self.jobs.rooted.is_some() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new().name("root-probe".into()).spawn(move || {
             let _ = tx.send(crate::platform::webos::game_mode::probe_rooted());
         }) {
-            Ok(_) => self.rooted_rx = Some(rx),
+            Ok(_) => self.jobs.rooted = Some(rx),
             // Nothing will ever answer, so settle on "not rooted" rather than leaving the row
             // stuck on its checking caption.
             Err(e) => {
@@ -32,17 +35,32 @@ impl App {
     /// go with it: the row is locked once the verdict is in, so nothing could switch it off
     /// again, and every stream start would keep paying for luna calls that can only fail.
     fn settle_rooted(&mut self, rooted: bool) {
-        self.rooted = Some(rooted);
-        if !rooted && self.settings.game_mode {
-            self.settings.game_mode = false;
+        self.hosts.rooted = Some(rooted);
+        if !rooted && self.settings_ui.settings.game_mode {
+            self.settings_ui.settings.game_mode = false;
             self.persist();
         }
+    }
+
+    /// Starts an owed root probe once the modal that wants it has finished opening. Called
+    /// each tick alongside the `drain_*`s.
+    pub(crate) fn tick_root_probe(&mut self) {
+        // Still on Experimental: leaving before the animation settles defers the probe to the
+        // next visit rather than paying for it behind a screen that no longer asks.
+        if !self.jobs.root_probe_owed
+            || !matches!(self.nav.screen, Screen::Experimental)
+            || self.render.modal.fade.is_animating(crate::app::MODAL_FADE)
+        {
+            return;
+        }
+        self.jobs.root_probe_owed = false;
+        self.start_root_probe();
     }
 
     /// Picks up the probe's verdict, unlocking the Game mode row (or explaining why not).
     /// Reports whether anything changed, so the open screen redraws.
     pub(crate) fn drain_rooted(&mut self) -> bool {
-        let Some(rx) = &self.rooted_rx else { return false };
+        let Some(rx) = &self.jobs.rooted else { return false };
         let rooted = match rx.try_recv() {
             Ok(rooted) => rooted,
             // A probe thread that died without sending would otherwise leave the row on its
@@ -50,44 +68,45 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
         };
-        self.rooted_rx = None;
+        self.jobs.rooted = None;
         self.settle_rooted(rooted);
         true
     }
 
-    /// Opens the Experimental screen (Settings → `menu::ROW_EXPERIMENTAL`). Holds unstable,
+    /// Opens the Experimental screen (Settings → `menu::SettingsRow::Experimental`). Holds unstable,
     /// off-by-default toggles (the software-audio override, Game mode on rooted sets).
     pub(crate) fn open_experimental(&mut self) {
-        self.start_root_probe();
-        self.experimental_focused = 0;
-        self.screen = Screen::Experimental;
+        // Owed, not started — see `start_root_probe`.
+        self.jobs.root_probe_owed = self.hosts.rooted.is_none() && self.jobs.rooted.is_none();
+        self.nav.enter(Screen::Experimental, 0);
     }
 
     /// All rows are plain Left/Right/Confirm toggles. Back saves and returns to Settings.
     pub(crate) fn handle_experimental_event(&mut self, ev: MenuEvent) {
-        let len = menu::EXP_ROW_COUNT;
-        if ui::widgets::list_nav(&mut self.experimental_focused, len, menu::nav_dir(ev)) {
-            self.modal.focus_anim = Some(Instant::now());
+        if self.list_nav_event(ev) {
             return;
         }
-        match (self.experimental_focused, ev) {
-            (menu::EXP_ROW_HW_AUDIO, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
-                let from = self.settings.ndl_audio_offload;
-                self.settings.ndl_audio_offload = !from;
-                self.modal.switch_anim = Some((Instant::now(), from, self.experimental_focused));
+        match (
+            menu::EXP_ROWS.get(self.nav.cursor(ScreenKey::Experimental)).copied(),
+            ev,
+        ) {
+            (Some(menu::ExpRow::HwAudio), MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
+                let from = self.settings_ui.settings.ndl_audio_offload;
+                self.settings_ui.settings.ndl_audio_offload = !from;
+                self.arm_switch_anim(from);
             }
             // A locked row (see `menu::exp_row_lock`) rejects the press — the greyed control
             // already says the value is fixed.
-            (menu::EXP_ROW_GAME_MODE, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm)
-                if menu::exp_row_lock(menu::EXP_ROW_GAME_MODE, self.rooted).is_none() =>
+            (Some(menu::ExpRow::GameMode), MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm)
+                if menu::exp_row_lock(menu::ExpRow::GameMode, self.hosts.rooted).is_none() =>
             {
-                let from = self.settings.game_mode;
-                self.settings.game_mode = !from;
-                self.modal.switch_anim = Some((Instant::now(), from, self.experimental_focused));
+                let from = self.settings_ui.settings.game_mode;
+                self.settings_ui.settings.game_mode = !from;
+                self.arm_switch_anim(from);
             }
             (_, MenuEvent::Back) => {
                 self.persist();
-                self.screen = Screen::Settings(SettingsScope::Global);
+                self.nav.resume(Screen::Settings(SettingsScope::Global));
             }
             _ => {}
         }

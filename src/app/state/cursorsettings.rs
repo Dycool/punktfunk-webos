@@ -1,45 +1,36 @@
 //! Cursor screen logic. Rendering lives in `app::view::cursorsettings`.
 use crate::app::menu;
+use crate::app::nav::ScreenKey;
 use crate::app::App;
 use crate::core::event::MenuEvent;
 use crate::core::screen::Screen;
-use crate::ui;
-use std::time::Instant;
 
 impl App {
-    /// Opens the Cursor screen (Settings → `menu::ROW_CURSOR`). Holds the two pointer
+    /// Opens the Cursor screen (Settings → `menu::SettingsRow::Cursor`). Holds the two pointer
     /// toggles: capture mode and the OK-button gestures. `scope` is the caller's, carried on
     /// the screen so the sub-screen keeps editing the same document.
     pub(crate) fn open_cursor_settings(&mut self, scope: menu::SettingsScope) {
-        self.cursor_settings_focused = 0;
-        self.screen = Screen::CursorSettings(scope);
+        self.nav.enter(Screen::CursorSettings(scope), 0);
     }
 
     /// All rows are plain Left/Right/Confirm toggles. Back saves and returns to whichever
     /// settings screen opened it — the per-game one keeps editing its own copy while here
     /// (see `App::settings_target`), so only where the save lands differs.
     pub(crate) fn handle_cursor_settings_event(&mut self, ev: MenuEvent) {
-        if ui::widgets::list_nav(
-            &mut self.cursor_settings_focused,
-            menu::CURSOR_ROW_COUNT,
-            menu::nav_dir(ev),
-        ) {
-            self.modal.focus_anim = Some(Instant::now());
+        if self.list_nav_event(ev) {
             return;
         }
-        let row = self.cursor_settings_focused;
-        match (row, ev) {
-            // Both rows are plain toggles, so they go through the same mutator every
-            // settings row uses — `cursor_logical_row` is where the dense `CURSOR_ROW_*`
-            // indices meet the logical `ROW_*` ids the override table is keyed by.
-            (_, MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
-                let logical = menu::cursor_logical_row(row);
+        let row = self.nav.cursor(ScreenKey::CursorSettings);
+        match (menu::CURSOR_ROWS.get(row).copied(), ev) {
+            // Both rows are plain toggles, so they go through the same mutator every other
+            // settings row uses — they are `menu::SettingsRow`s like any other.
+            (Some(logical), MenuEvent::Left | MenuEvent::Right | MenuEvent::Confirm) => {
                 let from = menu::toggle_value(self.settings_target(), logical);
                 let detected = self.detected_gamepad_type;
                 if menu::adjust_setting(self.settings_target_mut(), logical, true, detected) {
                     self.capture_game_override(logical);
                     if let Some(from) = from {
-                        self.modal.switch_anim = Some((Instant::now(), from, row));
+                        self.arm_switch_anim(from);
                     }
                 }
             }
@@ -53,7 +44,8 @@ impl App {
                 if scope == menu::SettingsScope::Global {
                     self.persist();
                 }
-                self.screen = Screen::Settings(scope);
+                // Back into the list this was opened from: it keeps its place.
+                self.nav.resume(Screen::Settings(scope));
             }
             _ => {}
         }

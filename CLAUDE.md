@@ -35,16 +35,23 @@ machine) ← `runtime` (the two top-level loops).
   flat inside `ui` via `ui::prelude`.
 - **`app`** splits per screen by concern: `state::<screen>` (events, transitions) and
   `view::<screen>` (geometry, draw list). `app::render` holds `tile` (which tile is which),
-  `key` (what its pixels depend on — hashed, never stored) and `ctx` (`RenderCtx`, threaded
-  through every `prepare_*`). State is grouped, not flat: `grid`, `modal`, `spinner`, `hero`,
-  `hosts`, `menu`.
+  `key` (what its pixels depend on — hashed, never stored), `ctx` (`RenderCtx`, threaded
+  through every `prepare_*`) and `prepare_grid` (the O(visible) card passes, one method each). `App` is 19 fields and owns almost nothing directly: `nav` (screen,
+  previous screen, one focus cursor per screen), `jobs` (every background receiver, one
+  `drain_jobs`), `library` (the selected host's games, art and pins), `hosts` (the known list,
+  reachability, rooted), `settings_ui` (the document plus its dropdown/override/slider),
+  `screens::slots` (per-screen payloads) and `render::state` (grid, modal, hero, press, scroll
+  windows, dirty flags). `screens::{list,confirm}` hold what a whole family of screens shares.
+  Every field is `pub(crate)`; `runtime` writes through named setters.
 - **`runtime`** alternates two phases: `ui_flow` (menu) and `stream`, on
   `StreamOutcome::ReturnToMenu` vs `Quit`.
 
 Rendering is a `tiny_skia` software framebuffer composited by SDL, redrawn on change.
-Add a screen: build on `ui::widgets::ListModal` (copy `app/{state,view}/hostmenu.rs`); ~8
-`Screen` match sites, all found by the compiler at once. A `ScreenView` trait to collapse them
-was evaluated and rejected — see R6 in `docs/UI-PIPELINE-PLAN.md`.
+Add a screen: build on `ui::widgets::ListModal` (copy `app/{state,view}/hostmenu.rs`) and say
+which family it joins in `app::screens` — `list` (rows) or `confirm` (two buttons); both tables
+are exhaustive over `Screen`, so the compiler asks. ~22 `Screen` match sites otherwise. A
+`ScreenView` trait to collapse them was evaluated and rejected (R6) — see "Explicitly not
+doing" under Phase 4 in `docs/APP-REWORK-PLAN.md`.
 
 ## Invariants worth knowing before you edit
 

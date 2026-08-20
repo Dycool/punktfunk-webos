@@ -2,7 +2,7 @@
 //!
 //! The webOS remote is a pointer as well as a d-pad, so every focusable widget needs a
 //! hit test beside its `MenuEvent` handler. Both entry points ([`App::handle_mouse_motion`]
-//! and [`App::handle_mouse_click`]) are one `match self.screen`, and each arm measures
+//! and [`App::handle_mouse_click`]) are one `match self.nav.screen`, and each arm measures
 //! against the same `app::view` geometry the painter draws with — hover previews exactly
 //! what a click will hit because neither side derives the rects itself.
 //!
@@ -11,16 +11,24 @@
 
 use std::time::Instant;
 
+use crate::app::nav::ScreenKey;
 use crate::app::{menu, view, App, ConnectTarget, HomeFocus, PairingFocus, Screen};
 use crate::core::event::MenuEvent;
 use crate::ui;
 use crate::ui::render::Rect;
 
 impl App {
-    /// Handed to `SDL_SetTextInputRect` by the render loop.
-    pub fn address_field_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::text::Fonts) -> Rect {
-        let (_, subtitle) = self.address_copy();
-        view::addhost::field_rect(screen_w, screen_h, fonts, &subtitle, self.keyboard_shown)
+    /// Handed to `SDL_SetTextInputRect` by the render loop. `None` off the address screens,
+    /// which are the only ones that take text input at all.
+    pub fn address_field_rect(&self, screen_w: u32, screen_h: u32, fonts: &ui::text::Fonts) -> Option<Rect> {
+        let (_, subtitle) = self.address_copy()?;
+        Some(view::addhost::field_rect(
+            screen_w,
+            screen_h,
+            fonts,
+            &subtitle,
+            self.keyboard_shown,
+        ))
     }
 
     /// Updates focus/hover to whatever the Magic Remote's pointer is over, returning
@@ -38,7 +46,7 @@ impl App {
         // A press already landed on the Bitrate track (see `handle_mouse_click`) — every
         // motion until release drags the thumb, rather than re-hit-testing the row list
         // under a pointer that may have wandered off it.
-        if self.slider_drag {
+        if self.settings_ui.slider_drag {
             self.drag_bitrate_slider(x, screen_w, screen_h);
             return true;
         }
@@ -47,8 +55,8 @@ impl App {
         // (and shows the new row's caption). Home drives its own `focus_anim` instead, so
         // it's excluded. An open dropdown is excluded too — hover there only moves the
         // option cursor, so popping the parent row (as the D-pad also declines to) is wrong.
-        if focus_changed && self.dropdown.is_none() && !matches!(self.screen, Screen::Home) {
-            self.modal.focus_anim = Some(Instant::now());
+        if focus_changed && self.settings_ui.dropdown.is_none() && !matches!(self.nav.screen, Screen::Home) {
+            self.render.modal.focus_anim = Some(Instant::now());
         }
         let close_changed = self.hover_close_at(x, y, screen_w, screen_h, fonts);
         focus_changed || close_changed
@@ -94,6 +102,7 @@ impl App {
         // Diagnostics), and uses the same overlay geometry the renderer draws against.
         if let Some(i) = self.dropdown_option_at(x, y, screen_w, screen_h, fonts) {
             let dd = self
+                .settings_ui
                 .dropdown
                 .as_mut()
                 .expect("dropdown_option_at yields Some only when one is open");
@@ -103,10 +112,10 @@ impl App {
         }
         // A dropdown open but not hovered still swallows hover — the row list behind
         // it must not take the selection.
-        if self.dropdown.is_some() {
+        if self.settings_ui.dropdown.is_some() {
             return false;
         }
-        match self.screen {
+        match self.nav.screen {
             // The held card's submenu takes hover whole, like an open dropdown does — the
             // grid behind it must not steal focus out from under an open menu.
             Screen::Home if self.card_menu.is_some() => {
@@ -122,7 +131,7 @@ impl App {
                 // The ⋯ button sits inside its row, so it's tested first — same order
                 // as `handle_mouse_click`, so hover previews exactly what a click hits.
                 if let Some(idx) =
-                    view::sidebar::hit_test_menu_button(x, y, self.entries.len(), self.sidebar_len(), screen_h)
+                    view::sidebar::hit_test_menu_button(x, y, self.hosts.entries.len(), self.sidebar_len(), screen_h)
                 {
                     return self.set_home_focus(HomeFocus::SidebarMenu(idx));
                 }
@@ -144,21 +153,21 @@ impl App {
                 let Some(row) = self.settings_row_at(x, y, screen_w, screen_h) else {
                     return false;
                 };
-                let changed = self.settings_focused != row;
-                self.settings_focused = row;
+                let changed = self.nav.cursor(ScreenKey::Settings) != row;
+                self.nav.set_cursor(ScreenKey::Settings, row);
                 changed
             }
             Screen::HostMenu => {
                 let Some((i, dots)) = self.host_menu_row_at(x, y, screen_w, screen_h, fonts) else {
                     return false;
                 };
-                let changed = self.menu_focused != i || self.host_menu_dots != dots;
-                self.menu_focused = i;
-                self.host_menu_dots = dots;
+                let changed = self.nav.cursor(ScreenKey::HostMenu) != i || self.screens.host_menu_dots != dots;
+                self.nav.set_cursor(ScreenKey::HostMenu, i);
+                self.screens.host_menu_dots = dots;
                 changed
             }
             // Identical row-list geometry; only which focus field they carry differs.
-            Screen::Diagnostics | Screen::Experimental | Screen::CursorSettings(_) => {
+            Screen::WakeSettings | Screen::Diagnostics | Screen::Experimental | Screen::CursorSettings(_) => {
                 let Some(row) = self.modal_list_row_at(x, y, screen_w, screen_h, fonts) else {
                     return false;
                 };
@@ -174,8 +183,8 @@ impl App {
             Screen::Pairing => {
                 let card = view::pairing::card_rect(screen_w, screen_h, fonts);
                 if view::pairing::request_button_rect(card, fonts).contains_point((x, y)) {
-                    let changed = self.pairing_focus != PairingFocus::RequestAccess;
-                    self.pairing_focus = PairingFocus::RequestAccess;
+                    let changed = self.screens.pairing_focus != PairingFocus::RequestAccess;
+                    self.screens.pairing_focus = PairingFocus::RequestAccess;
                     changed
                 } else {
                     false
@@ -196,7 +205,7 @@ impl App {
                 self.set_confirm_focused(i)
             }
             // No positional focus to move: single-card info/entry modals (AddHost,
-            // EditHost, About, WakeSettings, PinLimit) and Settings with a dropdown open.
+            // EditHost, About, PinLimit) and Settings with a dropdown open.
             _ => false,
         }
     }
@@ -211,7 +220,7 @@ impl App {
         // landing on a card with the Magic Remote renders it already finished. Only on a
         // change: the pointer streams motion events and each would restart the clock.
         if changed && matches!(focus, HomeFocus::Grid(_)) {
-            self.focus_anim = Some(Instant::now());
+            self.render.focus_anim = Some(Instant::now());
         }
         changed
     }
@@ -220,7 +229,7 @@ impl App {
     /// option overlay to, matching what `draw_list` renders so hit-testing lands
     /// exactly where options are drawn. `None` for a screen with no dropdown.
     pub(crate) fn dropdown_geom(&self, screen_w: u32, screen_h: u32, fonts: &ui::text::Fonts) -> Option<(Rect, i32)> {
-        match self.screen {
+        match self.nav.screen {
             // Anchored to the animated offset (`settings_content_scroll`) so an open
             // dropdown stays attached to its row while the list is still settling.
             Screen::Settings(_) => Some(self.settings_content_scroll(screen_w, screen_h)),
@@ -269,10 +278,10 @@ impl App {
     /// whatever press started the drag), so this is the one geometry lookup both the arming
     /// click and every later drag motion need.
     fn bitrate_row_and_track(&self, screen_w: u32, screen_h: u32) -> (Rect, Rect) {
-        let row_rect = self.settings_row_rect(self.settings_focused, screen_w, screen_h);
+        let row_rect = self.settings_row_rect(self.nav.cursor(ScreenKey::Settings), screen_w, screen_h);
         // A marked row's track shifts left (see `row_layout`), so the drag reads the same
         // geometry the draw did rather than deriving its own.
-        let marked = menu::override_is_set(&self.editing_override(), menu::ROW_BITRATE);
+        let marked = menu::override_is_set(&self.editing_override(), menu::SettingsRow::Bitrate);
         (row_rect, ui::widgets::row_layout(row_rect, marked).track)
     }
 
@@ -282,7 +291,7 @@ impl App {
     fn set_bitrate_from_x(&mut self, x: i32, track: Rect) {
         let fraction = (x - track.x()) as f32 / track.width() as f32;
         menu::set_bitrate_fraction(self.settings_target_mut(), fraction);
-        self.capture_game_override(menu::ROW_BITRATE);
+        self.capture_game_override(menu::SettingsRow::Bitrate);
     }
 
     /// Drags the Bitrate slider to `x`.
@@ -303,10 +312,10 @@ impl App {
         screen_h: u32,
         fonts: &ui::text::Fonts,
     ) -> Option<usize> {
-        let dd = self.dropdown.as_ref()?;
+        let dd = self.settings_ui.dropdown.as_ref()?;
         let (content, scroll_px) = self.dropdown_geom(screen_w, screen_h, fonts)?;
         let overlay = view::settings::dropdown_overlay_rect_at_px(content, dd.row, scroll_px);
-        let options_len = self.dropdown_options_len(dd.row);
+        let options_len = self.dropdown_len(dd.row);
         (0..options_len).find(|&i| ui::widgets::dropdown_option_rect(overlay, i).contains_point((x, y)))
     }
 
@@ -368,9 +377,9 @@ impl App {
             // Home draws no close button, but `hover_close` is only ever set true by a
             // modal branch — without clearing it on the way back to Home it stayed stuck
             // `true` forever (nothing on Home reset it), and `handle_mouse_click`'s
-            // `if self.hover_close { return self.back() }` then swallowed every Home
+            // `if self.render.hover_close { return self.back() }` then swallowed every Home
             // click. Not reported as a visible change: Home draws no close button.
-            self.hover_close = false;
+            self.render.hover_close = false;
             return false;
         };
         self.set_hover_close(ui::widgets::modal_close_rect(card).contains_point((x, y)))
@@ -380,8 +389,8 @@ impl App {
     /// screen's close-button hover check in `handle_mouse_motion` follows this same
     /// shape.
     pub(crate) fn set_hover_close(&mut self, hover_close: bool) -> bool {
-        let changed = hover_close != self.hover_close;
-        self.hover_close = hover_close;
+        let changed = hover_close != self.render.hover_close;
+        self.render.hover_close = hover_close;
         changed
     }
 
@@ -399,13 +408,13 @@ impl App {
         // MouseButtonDown can carry a slightly different (x, y) than the last
         // MouseMotion (the physical button press can jostle the remote a little).
         self.handle_mouse_motion(x, y, screen_w, screen_h, fonts);
-        if self.hover_close {
+        if self.render.hover_close {
             // Same "what Back means here" as everywhere else — see `back`'s docs.
             return self.back(screen_w, screen_h, fonts);
         }
         // An open dropdown owns the click wherever it landed: an option, or outside it,
         // which closes it. Same as hover.
-        if self.dropdown.is_some() {
+        if self.settings_ui.dropdown.is_some() {
             let ev = self.dropdown_click_event(x, y, screen_w, screen_h, fonts);
             self.handle_menu_event(ev, screen_w, screen_h, fonts);
             return None;
@@ -415,7 +424,7 @@ impl App {
         // than whatever the keyboard/remote last focused elsewhere. Each arm only
         // *places* focus (or bails on a click that landed on nothing); the shared
         // `press` below is what confirms it, so a click and an OK press act alike.
-        match self.screen {
+        match self.nav.screen {
             Screen::Home if self.card_menu.is_some() => {
                 // The held card's submenu is over the grid: a click either picks one of its
                 // rows or dismisses it. Nothing underneath is reachable while it is up.
@@ -431,7 +440,7 @@ impl App {
                 // The ⋯ button sits inside its row, so it has to be tested first or the
                 // click just reads as a click on the host.
                 if let Some(idx) =
-                    view::sidebar::hit_test_menu_button(x, y, self.entries.len(), self.sidebar_len(), screen_h)
+                    view::sidebar::hit_test_menu_button(x, y, self.hosts.entries.len(), self.sidebar_len(), screen_h)
                 {
                     self.home_focus = HomeFocus::SidebarMenu(idx);
                     self.open_host_menu(idx);
@@ -454,20 +463,27 @@ impl App {
             Screen::Settings(_) => {
                 // `?` bails if the click hit the gap between rows or outside the
                 // viewport — nothing to focus or confirm.
-                self.settings_focused = self.settings_row_at(x, y, screen_w, screen_h)?;
+                self.nav
+                    .set_cursor(ScreenKey::Settings, self.settings_row_at(x, y, screen_w, screen_h)?);
                 // A press on the Bitrate track sets the value under the cursor directly and
                 // arms the drag (see `handle_mouse_motion`) instead of nudging one notch the
                 // way `Confirm` below would — a slider is for landing on a value, not stepping
                 // to it one click at a time.
-                if menu::settings_logical_row(self.settings_scope(), self.settings_focused) == menu::ROW_BITRATE
-                    && menu::row_lock(menu::ROW_BITRATE, self.settings_target(), self.detected_gamepad_type).is_none()
+                if menu::settings_logical_row(self.settings_scope(), self.nav.cursor(ScreenKey::Settings))
+                    == Some(menu::SettingsRow::Bitrate)
+                    && menu::row_lock(
+                        menu::SettingsRow::Bitrate,
+                        self.settings_target(),
+                        self.detected_gamepad_type,
+                    )
+                    .is_none()
                 {
                     let (row_rect, track) = self.bitrate_row_and_track(screen_w, screen_h);
                     // Full row height, not just the thin track — vertical precision on a
                     // slider isn't worth demanding of a Magic Remote pointer.
                     let in_track = x >= track.x() && x < track.right() && y >= row_rect.y() && y < row_rect.bottom();
                     if in_track {
-                        self.slider_drag = true;
+                        self.settings_ui.slider_drag = true;
                         self.set_bitrate_from_x(x, track);
                         return None;
                     }
@@ -480,22 +496,15 @@ impl App {
                 if !view::pairing::request_button_rect(card, fonts).contains_point((x, y)) {
                     return None;
                 }
-                self.pairing_focus = PairingFocus::RequestAccess;
+                self.screens.pairing_focus = PairingFocus::RequestAccess;
             }
             Screen::HostMenu => {
                 let (i, dots) = self.host_menu_row_at(x, y, screen_w, screen_h, fonts)?;
-                self.menu_focused = i;
-                self.host_menu_dots = dots;
-            }
-            // One row, already focused — the click only has to have landed on it.
-            Screen::WakeSettings => {
-                let (_, content) = self.modal_list_geometry(screen_w, screen_h, fonts)?;
-                if !ui::widgets::focus_row_rect(content, 0).contains_point((x, y)) {
-                    return None;
-                }
+                self.nav.set_cursor(ScreenKey::HostMenu, i);
+                self.screens.host_menu_dots = dots;
             }
             // Identical row-list geometry; only which focus field they carry differs.
-            Screen::Diagnostics | Screen::Experimental | Screen::CursorSettings(_) => {
+            Screen::WakeSettings | Screen::Diagnostics | Screen::Experimental | Screen::CursorSettings(_) => {
                 let row = self.modal_list_row_at(x, y, screen_w, screen_h, fonts)?;
                 *self.list_modal_focused_mut()? = row;
             }

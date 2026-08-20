@@ -6,13 +6,14 @@ use crate::ui::render::Rect;
 use crate::ui::text::Fonts;
 use crate::ui::widgets::FocusRow;
 use crate::ui::Canvas;
+use crate::ui::ModalMetrics;
 use crate::ui::ModalScreen;
 use anyhow::Result;
 
 pub const TITLE: &str = "Cursor";
 pub const SUBTITLE: &str = "How the pointer behaves in a stream.";
 
-/// Order must match `menu::CURSOR_ROW_*`.
+/// Order must match [`menu::CURSOR_ROWS`].
 ///
 /// `over` is the per-game override this screen is editing (empty on the global one) — a row
 /// it sets wears the same dot the per-game row list gives its own rows. `focused` is `None` for
@@ -35,19 +36,14 @@ pub fn rows(settings: &Settings, over: &SettingsOverride, focused: Option<usize>
             "Hold OK to right-click or red remote button",
         )),
     ];
-    for (cursor_row, row) in rows.iter_mut().enumerate() {
-        menu::decorate_override(
-            row,
-            over,
-            menu::cursor_logical_row(cursor_row),
-            focused == Some(cursor_row),
-        );
+    for (i, (row, &logical)) in rows.iter_mut().zip(menu::CURSOR_ROWS.iter()).enumerate() {
+        menu::decorate_override(row, over, logical, focused == Some(i));
     }
     rows
 }
 
 pub fn card_rect(screen_w: u32, screen_h: u32, fonts: &Fonts) -> Rect {
-    ui::widgets::list_modal_card_rect(screen_w, screen_h, fonts, SUBTITLE, menu::CURSOR_ROW_COUNT)
+    ui::widgets::list_modal_card_rect(screen_w, screen_h, fonts, SUBTITLE, menu::CURSOR_ROWS.len())
 }
 
 /// The cursor settings list as a [`ModalScreen`].
@@ -56,7 +52,7 @@ pub(crate) struct Modal<'a> {
     pub over: &'a SettingsOverride,
 }
 
-impl ModalScreen for Modal<'_> {
+impl ModalMetrics for Modal<'_> {
     fn card_rect(&self, screen_w: u32, screen_h: u32, fonts: &Fonts) -> Rect {
         card_rect(screen_w, screen_h, fonts)
     }
@@ -66,10 +62,12 @@ impl ModalScreen for Modal<'_> {
             card,
             fonts,
             SUBTITLE,
-            menu::CURSOR_ROW_COUNT,
+            menu::CURSOR_ROWS.len(),
         ))
     }
+}
 
+impl ModalScreen for Modal<'_> {
     fn render(&self, c: &mut Canvas, hover_close: bool) -> Result<()> {
         let card = self.card_rect(c.screen_w, c.screen_h, c.fonts);
         // Always unfocused: the focused row is composited from its own tile, and
