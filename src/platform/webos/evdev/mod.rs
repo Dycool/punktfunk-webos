@@ -1,8 +1,9 @@
 //! Raw HID mouse **and keyboard** input straight from `/dev/input/event*`, bypassing SDL.
 //!
-//! **Also a pad's touchpad.** A `DualSense`'s touchpad is a third evdev node the compositor would
-//! otherwise turn into a cursor (see [`is_pad_touchpad`]); it's claimed here and decoded into
-//! rich-input contacts for the host's virtual pad, the only route a game's touchpad swipes have.
+//! **Also a pad's touchpad and motion sensors.** Those are two more evdev nodes the compositor
+//! would otherwise turn into cursors; this reader claims them and [`pad`] decodes them into rich
+//! input for the host's virtual pad — the only route a game's touchpad swipes and gyro aiming
+//! have.
 //!
 //! **Why.** SDL mouse events on webOS come from the compositor's pointer, smoothed/resampled
 //! for a wrist-waved remote rather than a 125–1000 Hz mouse — jittery deltas no matter what the
@@ -47,6 +48,10 @@ use std::time::{Duration, Instant};
 use punktfunk_core::input::InputEvent;
 use punktfunk_core::quic::RichInput;
 
+mod pad;
+
+use pad::Pad;
+
 use super::keyboard;
 use super::mouse;
 
@@ -55,23 +60,12 @@ const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 const EV_ABS: u16 = 0x03;
 
-/// End of one report — every `EV_ABS` since the last one describes the same instant, so touch
-/// contacts are only sent here (see [`read_touch`]).
+/// End of one report — every `EV_ABS` since the last one describes the same instant, so [`pad`]
+/// only sends contacts and motion samples here.
 const SYN_REPORT: u16 = 0x00;
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
-/// The motion node's six axes, contiguous and in the `DualSense` report's own order: `ABS_X`..`_Z`
-/// accelerometer, `ABS_RX`..`_RZ` gyro (pitch/yaw/roll).
-const ABS_Z: u16 = 0x02;
-const ABS_RX: u16 = 0x03;
-const ABS_RZ: u16 = 0x05;
-/// Multitouch protocol B: which contact the following `ABS_MT_*` values belong to.
-const ABS_MT_SLOT: u16 = 0x2f;
-const ABS_MT_POSITION_X: u16 = 0x35;
-const ABS_MT_POSITION_Y: u16 = 0x36;
-/// `-1` lifts the slot's contact; anything else is a new or continuing one.
-const ABS_MT_TRACKING_ID: u16 = 0x39;
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
@@ -82,17 +76,6 @@ const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
-/// Finger-on-surface, which only touch-class nodes carry — the pad's own node reports
-/// `BTN_SOUTH`/`BTN_EAST` and never this. See [`is_pad_touchpad`].
-const BTN_TOUCH: u16 = 0x14a;
-
-/// The pad's own south face button — what parts the gamepad node from the motion node, which
-/// advertises the same six absolute axes but no buttons at all. See [`is_pad_motion`].
-const BTN_SOUTH: u16 = 0x130;
-
-/// Sony's USB/BT vendor id. `hid-playstation` binds only Sony pads, and it's the split-node
-/// layout that creates the touchpad node this identifies.
-const VENDOR_SONY: u16 = 0x054c;
 
 const KEY_LEFTCTRL: u16 = 29;
 const KEY_A: u16 = 30;
@@ -317,55 +300,10 @@ struct Device {
     mouse: bool,
     /// Alphanumeric/modifier keys. Magic Remote nodes are excluded by [`open_hid`].
     keyboard: bool,
-    /// A pad's touchpad ([`is_pad_touchpad`]), claimed so the compositor can't make a cursor of
-    /// it and decoded into [`RichInput::Touchpad`] contacts instead. `None` on every other node.
-    touchpad: Option<Touchpad>,
-    /// A pad's motion sensors ([`is_pad_motion`]), on their own node — never set together with
-    /// [`Self::touchpad`]. `None` on every other node.
-    sensors: Option<Sensors>,
-}
-
-/// Motion decode state. Sensor readings are levels, not deltas, so a read burst collapses to its
-/// newest sample and an unchanged sample is worth no datagram at all — a resting pad reports at
-/// its full rate forever.
-#[derive(Default)]
-struct Sensors {
-    /// Pitch/yaw/roll then accelerometer, in the pad's own units (`hid-playstation` keeps the
-    /// report's scale), as the wire orders them.
-    axes: [i32; 6],
-    /// A `SYN_REPORT` completed a sample since the last send.
-    dirty: bool,
-    /// Last sample actually sent, for the unchanged-sample skip.
-    sent: Option<[i16; 6]>,
-}
-
-/// Multitouch decode state for a claimed pad touchpad, plus the axis ranges its coordinates are
-/// normalized against.
-///
-/// Protocol B (`ABS_MT_SLOT` + `ABS_MT_TRACKING_ID`), which is what `hid-playstation` reports and
-/// all the wire has room for: two contacts, matching the `finger` field's `0`/`1`.
-struct Touchpad {
-    /// The slot `ABS_MT_*` values currently apply to. Out-of-range slots are parked on the last
-    /// finger rather than dropped, so a driver reporting more contacts than the wire carries
-    /// can't silently write past the array.
-    slot: usize,
-    fingers: [Finger; 2],
-    /// `(min, max)` of `ABS_MT_POSITION_X` / `_Y`, for the 0..=65535 normalization.
-    x_range: (i32, i32),
-    y_range: (i32, i32),
-}
-
-#[derive(Clone, Copy, Default)]
-struct Finger {
-    active: bool,
-    /// The host currently believes this contact is down. Gates the lift: a node claimed with a
-    /// finger already on it reports coordinates without a `ABS_MT_TRACKING_ID`, which would
-    /// otherwise send a lift for a contact the host never saw start.
-    sent: bool,
-    x: i32,
-    y: i32,
-    /// Something in this report changed the contact — sent at the next `SYN_REPORT` and cleared.
-    dirty: bool,
+    /// Set only on a `PlayStation` pad's touchpad or motion node, which this reader claims and
+    /// decodes into rich input rather than pointer events — see [`pad`]. `None` on every other
+    /// node.
+    pad: Option<Pad>,
 }
 
 impl Drop for Device {
@@ -449,8 +387,7 @@ fn open_hid(path: &Path, grab_mouse: bool) -> Probe {
         grab_warned_for: None,
         mouse: false,
         keyboard: false,
-        touchpad: None,
-        sensors: None,
+        pad: None,
     };
     let rel = event_bits(fd, EV_REL);
     let abs = event_bits(fd, EV_ABS);
@@ -471,12 +408,8 @@ fn open_hid(path: &Path, grab_mouse: bool) -> Probe {
     dev.mouse = pointer && (grab_mouse || dev.keyboard);
     // Claimed in both cursor modes, unlike a mouse node: leaving it to the compositor is what
     // produces the stuck left button, which desktop mode wants gone just as much.
-    if is_pad_touchpad(absolute_pointer, bit(&key, BTN_TOUCH), || device_vendor(fd)) {
-        dev.touchpad = Some(Touchpad::new(fd));
-    } else if is_pad_motion(&abs, bit(&key, BTN_TOUCH) || bit(&key, BTN_SOUTH), || device_vendor(fd)) {
-        dev.sensors = Some(Sensors::default());
-    }
-    if !dev.mouse && !dev.keyboard && dev.touchpad.is_none() && dev.sensors.is_none() {
+    dev.pad = Pad::probe(fd, &abs, &key, absolute_pointer);
+    if !dev.mouse && !dev.keyboard && dev.pad.is_none() {
         // Not ours, or a pointer-only node in desktop mode — left with the compositor so the
         // TV cursor is still the one you aim.
         return Probe::Skip;
@@ -484,10 +417,8 @@ fn open_hid(path: &Path, grab_mouse: bool) -> Probe {
     if dev.keyboard {
         set_repeat(fd);
     }
-    let kind = if dev.touchpad.is_some() {
-        "pad touchpad"
-    } else if dev.sensors.is_some() {
-        "pad motion"
+    let kind = if let Some(pad) = &dev.pad {
+        pad.kind()
     } else if dev.mouse && dev.keyboard {
         "mouse+keyboard"
     } else if dev.mouse {
@@ -508,65 +439,9 @@ fn set_repeat(fd: RawFd) {
     }
 }
 
-/// LG's virtual remotes advertise a full QWERTY keymap, so a "has `KEY_A`" filter would steal
-/// the Magic Remote / RCU from the compositor and leave the TV unnavigable. Names as they read
-/// in `/proc/bus/input/devices` on-device.
-/// A `PlayStation` pad's touchpad, which the kernel publishes as its own absolute/multitouch node
-/// alongside the pad itself — the source of the stuck left button [`mouse::is_touch_emulated`]
-/// describes, since the compositor drives the TV cursor from it. Claiming it takes it away from
-/// the compositor entirely and gives [`read_touch`] the contacts to forward as
-/// [`RichInput::Touchpad`], which is what makes a game's touchpad swipes work. The pad's own
-/// *click* doesn't come through here at all — that arrives on the pad node as `BTN_TOUCHPAD`
-/// through SDL's controller layer.
-///
-/// Matched on ids and capability bits, not the device name, which varies by driver and firmware:
-/// `BTN_TOUCH` on an absolute pointer (the pad's own node reports face buttons instead), from a
-/// Sony vendor id. `vendor` is lazy because it costs an ioctl the bit tests don't.
-fn is_pad_touchpad(absolute_pointer: bool, has_btn_touch: bool, vendor: impl FnOnce() -> u16) -> bool {
-    absolute_pointer && has_btn_touch && vendor() == VENDOR_SONY
-}
-
-/// A `PlayStation` pad's motion sensors, published as a third node beside the pad and its
-/// touchpad. SDL2 never reads it, so gyro aiming reaches the host only if this reader forwards it
-/// as [`RichInput::Motion`].
-///
-/// Matched on capability bits and vendor, like [`is_pad_touchpad`]: all six sensor axes and no
-/// buttons. Both other nodes carry those same axes — the pad node's are its sticks and triggers,
-/// the touchpad's are the contact — so the buttons (`BTN_SOUTH`, `BTN_TOUCH`) are what part them.
-/// Matching the pad node here would grab the gamepad away from SDL entirely.
-fn is_pad_motion(abs: &[u8; 128], has_buttons: bool, vendor: impl FnOnce() -> u16) -> bool {
-    (ABS_X..=ABS_RZ).all(|c| bit(abs, c)) && !has_buttons && vendor() == VENDOR_SONY
-}
-
-impl Touchpad {
-    /// Reads the node's axis ranges once, at open. A node whose `ABS_MT_POSITION_*` ranges are
-    /// unusable is still worth claiming (the compositor must not have it) — it just reports no
-    /// contacts, which [`normalize`] enforces.
-    fn new(fd: RawFd) -> Self {
-        Self {
-            slot: 0,
-            fingers: [Finger::default(); 2],
-            x_range: abs_range(fd, ABS_MT_POSITION_X),
-            y_range: abs_range(fd, ABS_MT_POSITION_Y),
-        }
-    }
-}
-
-/// Device units → the wire's `0..=65535` across the pad. `None` when the driver gave no range to
-/// scale against, since a bogus coordinate is worse than no contact at all.
-fn normalize(x: i32, y: i32, x_range: (i32, i32), y_range: (i32, i32)) -> Option<(u16, u16)> {
-    let scale = |v: i32, (min, max): (i32, i32)| {
-        let span = i64::from(max) - i64::from(min);
-        (span > 0).then(|| ((i64::from(v.clamp(min, max)) - i64::from(min)) * 65535 / span) as u16)
-    };
-    // evdev's +y is already down, the direction the wire and the host's virtual pad expect.
-    Some((scale(x, x_range)?, scale(y, y_range)?))
-}
-
-/// `EVIOCGABS(code)`'s `(minimum, maximum)` out of `struct input_absinfo`
-/// (`value, minimum, maximum, fuzz, flat, resolution`). Falls back to `(0, 0)` when the ioctl
-/// fails, which [`normalize`] reads as "no usable range".
-fn abs_range(fd: RawFd, code: u16) -> (i32, i32) {
+/// `EVIOCGABS(code)` — `struct input_absinfo` as `value, minimum, maximum, fuzz, flat,
+/// resolution`. All zeroes when the ioctl fails, which every caller reads as "no usable value".
+fn abs_info(fd: RawFd, code: u16) -> [i32; 6] {
     let mut info = [0i32; 6];
     // SAFETY: as `event_bits` — length-encoding request, buffer of exactly that length.
     let rc = unsafe {
@@ -577,9 +452,22 @@ fn abs_range(fd: RawFd, code: u16) -> (i32, i32) {
         )
     };
     if rc < 0 {
-        return (0, 0);
+        return [0; 6];
     }
+    info
+}
+
+/// The axis's `(minimum, maximum)`; `(0, 0)` when unknown, which [`normalize`] reads as "no
+/// usable range".
+fn abs_range(fd: RawFd, code: u16) -> (i32, i32) {
+    let info = abs_info(fd, code);
     (info[1], info[2])
+}
+
+/// The axis's `resolution` — units per deg/s on a gyro axis, per g on an accelerometer one.
+/// `0` when the driver publishes none.
+fn abs_resolution(fd: RawFd, code: u16) -> i32 {
+    abs_info(fd, code)[5]
 }
 
 /// The vendor id out of `EVIOCGID`'s `struct input_id` (`bustype, vendor, product, version`) —
@@ -594,6 +482,9 @@ fn device_vendor(fd: RawFd) -> u16 {
     id[1]
 }
 
+/// LG's virtual remotes advertise a full QWERTY keymap, so a "has `KEY_A`" filter would steal
+/// the Magic Remote / RCU from the compositor and leave the TV unnavigable. Names as they read
+/// in `/proc/bus/input/devices` on-device.
 fn is_tv_builtin(name: &str) -> bool {
     name.starts_with("LGE") || name.starts_with("Bluetooth-audio") || matches!(name, "CHECK INPUT" | "IoT keypad")
 }
@@ -621,10 +512,10 @@ fn apply_grab(devices: &mut [Device], want: bool) {
     for dev in devices {
         // A pad touchpad is claimed whether the reader is active or not: ungrabbing it hands the
         // compositor back a node it turns into a cursor with a stuck left button, which is the
-        // whole reason it's claimed (see `is_pad_touchpad`).
+        // whole reason it's claimed (see `pad::is_pad_touchpad`).
         // Same for the motion node: it too advertises absolute axes the compositor would
         // otherwise turn into a cursor, and its samples are only useful forwarded.
-        let want = want || dev.touchpad.is_some() || dev.sensors.is_some();
+        let want = want || dev.pad.is_some();
         if dev.grabbed == want {
             continue;
         }
@@ -697,7 +588,7 @@ fn reader_loop(sink: &impl Fn(HidReport), shared: &Shared) {
                     if fds[i].revents & DEAD == 0 {
                         continue;
                     }
-                    release_touches(&mut devices[i], sink);
+                    release_pad(&mut devices[i], sink);
                     let gone = devices.remove(i);
                     tracing::info!("HID device gone: {}", gone.path.display());
                     seen.retain(|p| *p != gone.path);
@@ -731,7 +622,14 @@ fn reader_loop(sink: &impl Fn(HidReport), shared: &Shared) {
     }
     // Stopping with a finger on the pad must not leave the host holding it.
     for dev in &mut devices {
-        release_touches(dev, sink);
+        release_pad(dev, sink);
+    }
+}
+
+/// [`Pad::release`] on a node that has one.
+fn release_pad(dev: &mut Device, sink: &impl Fn(HidReport)) {
+    if let Some(pad) = dev.pad.as_mut() {
+        pad.release(sink);
     }
 }
 
@@ -767,12 +665,8 @@ fn read_device(dev: &mut Device, sink: &impl Fn(HidReport), keys: &KeyActivity) 
             return; // EAGAIN on an empty non-blocking node, or the node went away
         }
         let n = n as usize;
-        // A claimed touchpad shares none of the mouse/keyboard decode below — different axes,
-        // different wire plane — so it takes the whole burst on its own path.
-        if let Some(pad) = dev.touchpad.as_mut() {
-            read_touch(pad, &buf[..n], size, sink);
-        } else if let Some(sensors) = dev.sensors.as_mut() {
-            read_sensors(sensors, &buf[..n], size);
+        if let Some(pad) = dev.pad.as_mut() {
+            pad.read(&buf[..n], size, sink);
         } else {
             decode_hid(dev, &buf[..n], size, sink, keys);
         }
@@ -781,8 +675,8 @@ fn read_device(dev: &mut Device, sink: &impl Fn(HidReport), keys: &KeyActivity) 
         }
     }
     flush_motion(dev, sink);
-    if let Some(sensors) = dev.sensors.as_mut() {
-        flush_sensors(sensors, sink);
+    if let Some(pad) = dev.pad.as_mut() {
+        pad.flush(sink);
     }
 }
 
@@ -833,133 +727,6 @@ fn decode_hid(dev: &mut Device, buf: &[u8], size: usize, sink: &impl Fn(HidRepor
     }
 }
 
-/// Decodes one read burst off a claimed pad touchpad into [`RichInput::Touchpad`] contacts.
-///
-/// Contacts are sent at `SYN_REPORT`, not per axis event: a moving finger reports x and y as two
-/// events, and sending between them would put half the samples on a stale axis. Only contacts a
-/// report actually touched are sent, so a resting finger costs one burst of decode and no
-/// datagrams at all.
-fn read_touch(pad: &mut Touchpad, buf: &[u8], size: usize, sink: &impl Fn(HidReport)) {
-    for chunk in buf.chunks_exact(size) {
-        // SAFETY: as `read_device` — exact-size chunk of plain `repr(C)` integers, read unaligned.
-        let ev = unsafe { chunk.as_ptr().cast::<InputEventRaw>().read_unaligned() };
-        match (ev.kind, ev.code) {
-            // A slot the wire can't carry is parked on the last finger, where its coordinates are
-            // simply overwritten by a contact that does fit — the pad only ever reports two.
-            (EV_ABS, ABS_MT_SLOT) => pad.slot = (ev.value.max(0) as usize).min(pad.fingers.len() - 1),
-            (EV_ABS, ABS_MT_TRACKING_ID) => {
-                let finger = &mut pad.fingers[pad.slot];
-                finger.active = ev.value >= 0;
-                finger.dirty = true;
-            }
-            (EV_ABS, ABS_MT_POSITION_X | ABS_MT_POSITION_Y) => {
-                let finger = &mut pad.fingers[pad.slot];
-                if ev.code == ABS_MT_POSITION_X {
-                    finger.x = ev.value;
-                } else {
-                    finger.y = ev.value;
-                }
-                finger.dirty = true;
-            }
-            (EV_SYN, SYN_REPORT) => {
-                let (x_range, y_range) = (pad.x_range, pad.y_range);
-                for (i, finger) in pad.fingers.iter_mut().enumerate() {
-                    if !finger.dirty {
-                        continue;
-                    }
-                    finger.dirty = false;
-                    if !finger.active && !finger.sent {
-                        continue; // never announced — nothing to lift
-                    }
-                    let Some(contact) = contact(i, finger, x_range, y_range) else {
-                        continue;
-                    };
-                    finger.sent = finger.active;
-                    sink(HidReport::Rich(contact));
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Lifts every contact the host still believes is down on this node. A touch is a level, not an
-/// edge: a pad unplugged (or a reader stopped) mid-gesture would otherwise leave the finger down
-/// on the host's virtual pad with nothing left to release it.
-fn release_touches(dev: &mut Device, sink: &impl Fn(HidReport)) {
-    let Some(pad) = dev.touchpad.as_mut() else {
-        return;
-    };
-    let (x_range, y_range) = (pad.x_range, pad.y_range);
-    for (i, finger) in pad.fingers.iter_mut().enumerate() {
-        if !std::mem::take(&mut finger.sent) {
-            continue;
-        }
-        finger.active = false;
-        finger.dirty = false;
-        if let Some(contact) = contact(i, finger, x_range, y_range) {
-            sink(HidReport::Rich(contact));
-        }
-    }
-}
-
-/// One contact for the wire, or `None` when the node gave no usable axis range ([`normalize`]).
-///
-/// A lift's coordinates are whatever the contact last had, which is what the host wants — the
-/// release still has to land where the finger was. `pad` is 0 throughout: this client drives a
-/// single pad.
-fn contact(finger_idx: usize, finger: &Finger, x_range: (i32, i32), y_range: (i32, i32)) -> Option<RichInput> {
-    let (x, y) = normalize(finger.x, finger.y, x_range, y_range)?;
-    Some(RichInput::Touchpad {
-        pad: 0,
-        finger: finger_idx as u8,
-        active: finger.active,
-        x,
-        y,
-    })
-}
-
-/// Decodes one read burst off a claimed motion node into the newest complete sample.
-fn read_sensors(sensors: &mut Sensors, buf: &[u8], size: usize) {
-    for chunk in buf.chunks_exact(size) {
-        // SAFETY: as `read_device` — exact-size chunk of plain `repr(C)` integers, read unaligned.
-        let ev = unsafe { chunk.as_ptr().cast::<InputEventRaw>().read_unaligned() };
-        match (ev.kind, ev.code) {
-            // Gyro first, then accelerometer: the wire's order, so no shuffling at send.
-            (EV_ABS, ABS_RX..=ABS_RZ) => sensors.axes[(ev.code - ABS_RX) as usize] = ev.value,
-            (EV_ABS, ABS_X..=ABS_Z) => sensors.axes[(ev.code - ABS_X) as usize + 3] = ev.value,
-            // Only a completed report is a sample: sending mid-report would mix axes from two.
-            (EV_SYN, SYN_REPORT) => sensors.dirty = true,
-            _ => {}
-        }
-    }
-}
-
-/// Sends the newest sample once per read burst, and only when it moved — a pad lying still
-/// reports forever, and re-sending its resting attitude at 500 Hz would cost a datagram per
-/// sample to tell the host nothing.
-///
-/// Clamped to `i16`: the wire carries the `DualSense` report's own signed-16 units, and
-/// `hid-playstation`'s calibration can push a sample a little past that at the extremes.
-fn flush_sensors(sensors: &mut Sensors, sink: &impl Fn(HidReport)) {
-    if !std::mem::take(&mut sensors.dirty) {
-        return;
-    }
-    let axes = sensors
-        .axes
-        .map(|v| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
-    if sensors.sent == Some(axes) {
-        return;
-    }
-    sensors.sent = Some(axes);
-    let [gx, gy, gz, ax, ay, az] = axes;
-    sink(HidReport::Rich(RichInput::Motion {
-        pad: 0,
-        gyro: [gx, gy, gz],
-        accel: [ax, ay, az],
-    }));
-}
-
 /// Sends the accumulated deltas as one `MouseMove`, undamped — damping is for the remote's
 /// coarse deltas and would make a real mouse sluggish.
 fn flush_motion(dev: &mut Device, sink: &impl Fn(HidReport)) {
@@ -986,7 +753,7 @@ fn button_code(code: u16) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_pad_motion, is_pad_touchpad, is_tv_builtin, ABS_RZ, ABS_X};
+    use super::is_tv_builtin;
 
     #[test]
     fn tv_builtins_are_skipped_by_name() {
@@ -995,34 +762,5 @@ mod tests {
         assert!(is_tv_builtin("CHECK INPUT"));
         assert!(!is_tv_builtin("M720 Triathlon Mouse"));
         assert!(!is_tv_builtin("MX MCHNCL M Keyboard"));
-    }
-
-    /// Sony's other nodes must not match: claiming the pad node would take the gamepad away from
-    /// SDL, and the motion-sensor node reports absolutely without ever being touched.
-    #[test]
-    fn pad_touchpad_matches_only_the_touch_node() {
-        let sony = || 0x054c;
-        // Touchpad: BTN_TOUCH on an absolute pointer.
-        assert!(is_pad_touchpad(true, true, sony));
-        // Pad node — absolute (sticks), face buttons instead of BTN_TOUCH.
-        assert!(!is_pad_touchpad(true, false, sony));
-        // Motion sensors — no touch, no pointer axes.
-        assert!(!is_pad_touchpad(false, false, sony));
-        // A touchscreen from anyone else stays the compositor's.
-        assert!(!is_pad_touchpad(true, true, || 0x046d));
-    }
-
-    #[test]
-    fn pad_motion_matches_only_the_sensor_node() {
-        let sony = || 0x054c;
-        let mut sensors = [0u8; 128];
-        for c in ABS_X..=ABS_RZ {
-            sensors[(c / 8) as usize] |= 1 << (c % 8);
-        }
-        assert!(is_pad_motion(&sensors, false, sony));
-        // The touchpad node (BTN_TOUCH) and the pad node (BTN_SOUTH, sticks and triggers) cover
-        // the same six axes — the buttons are the only thing that parts them from the sensors.
-        assert!(!is_pad_motion(&sensors, true, sony));
-        assert!(!is_pad_motion(&sensors, false, || 0x046d));
     }
 }
