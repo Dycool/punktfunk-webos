@@ -25,7 +25,6 @@ pub enum Screen {
     About,
     SpeedTest,
     WakeSettings,
-    PinLimit,
     /// Log level debug aid (see `app/diagnostics.rs`).
     Diagnostics,
     /// Experimental/unstable toggles (see `app/experimental.rs`).
@@ -36,6 +35,15 @@ pub enum Screen {
     CursorSettings(SettingsScope),
     /// "Send logs to developer" confirmation (see `app/sendlogs.rs`).
     SendLogs,
+    /// Which collection a held card belongs to (see `app/collections.rs`). A scrolling row
+    /// list, since a host may have every one of `MAX_COLLECTIONS` plus Library.
+    Collections,
+    /// Naming a collection: a new one, or one being renamed (see `app/state/collections.rs`).
+    /// One screen, because the two differ only in what they start from and what they commit
+    /// to.
+    RenameCollection,
+    /// "Remove collection?" — its games return to Library (see `app/state/collections.rs`).
+    RemoveCollection,
 }
 
 /// Pairing modal's focused input: PIN row or "Request access" button.

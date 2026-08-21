@@ -28,7 +28,6 @@ use crate::ui::render::Rect;
 use anyhow::Result;
 use tiny_skia::Pixmap;
 
-use crate::app::grid::GridCard;
 use crate::app::hosts::HostEntry;
 use crate::app::nav::ScreenKey;
 use crate::core::event::MenuEvent;
@@ -43,7 +42,6 @@ use crate::ui;
 /// around it to grow into.
 pub(crate) const CARD_GROWTH: f32 = 0.045;
 pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
-const PIN_BADGE_MARGIN: i32 = 10;
 pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
 pub(crate) const CARD_POP_SHRINK: f32 = 0.14;
 /// Transparent margin the modal tile leaves around the card so its drop shadow
@@ -107,7 +105,7 @@ pub struct App {
     pub(crate) nav: nav::Nav,
     /// Every background job in flight — see [`jobs::Jobs`].
     pub(crate) jobs: jobs::Jobs,
-    /// The selected host's games, art and pin bookkeeping — see [`library::Library`].
+    /// The selected host's games, art and grid sections — see [`library::Library`].
     pub(crate) library: library::Library,
     /// Every host the menu knows about — see [`hosts::HostsState`].
     pub(crate) hosts: hosts::HostsState,
@@ -124,20 +122,29 @@ pub struct App {
     /// success, which wiped the error a second after the user landed back on the grid. Anything
     /// the user's own actions produce replaces it as usual.
     pub(crate) home_status_sticky: bool,
+    /// A one-shot toast the state machine wants shown, waiting for the loop that owns the
+    /// [`Notification`](crate::ui::widgets::Notification) to pick it up (`take_toast`). An
+    /// outbox rather than a call, since `App` has no handle on the overlay: this is the same
+    /// arrangement `launch_ready` uses for a launch.
+    pub(crate) toast: Option<String>,
     /// When the current status line went up, so `tick_animations` can expire it after
     /// `HOME_STATUS_LIFETIME`. Stamped by `set_home_status`, which every writer goes through.
     home_status_shown_at: Option<Instant>,
     pub(crate) launch_ready: Option<ConnectTarget>,
     pub(crate) launch_anim: Option<Instant>,
     pub(crate) launch_anim_idx: Option<usize>,
-    /// The submenu raised over a held grid card's title strip (Pin/Unpin + Settings), and
-    /// the only way to `Screen::GameSettings`. `None` when no card is held open.
+    /// The submenu raised over a held grid card's title strip (where the card lives, plus
+    /// its per-game settings). `None` when no card is held open.
     pub(crate) card_menu: Option<state::cardmenu::CardMenu>,
     /// Whether the card submenu's introduction (`state::cardmenu::INTRO_HINT`) is still owed —
     /// set on the first launch of a build that stamped a new version into the document, spent
     /// on the status line as soon as a library has actually landed to hold the cards it talks
     /// about.
     pub(crate) intro_hint_owed: bool,
+    /// When each host last launched each game — what orders the Library section (see
+    /// [`services::recents`](crate::services::recents)). Loaded once at startup; a cache, so
+    /// nothing here fails.
+    pub(crate) recents: crate::services::recents::Recents,
     /// Persists settings off UI thread to avoid blocking.
     pub(crate) state_writer: store::StateWriter,
     /// The attached pad's type per `gamepad::detect_type`, refreshed on hotplug in
@@ -197,6 +204,17 @@ impl App {
         self.home_status_sticky = sticky;
     }
 
+    /// Queues a transient toast. Replaces any still waiting — a second action before the loop
+    /// has ticked means the first is already stale.
+    pub(crate) fn toast(&mut self, message: impl Into<String>) {
+        self.toast = Some(message.into());
+    }
+
+    /// Takes whatever [`toast`](Self::toast) queued, for the loop to hand its overlay.
+    pub fn take_toast(&mut self) -> Option<String> {
+        self.toast.take()
+    }
+
     /// Ends a bitrate-slider drag; the button can only come up on the loop that owns events.
     pub fn end_slider_drag(&mut self) {
         self.settings_ui.slider_drag = false;
@@ -239,12 +257,14 @@ impl App {
             home_focus: HomeFocus::Sidebar(0),
             home_status: None,
             home_status_sticky: false,
+            toast: None,
             home_status_shown_at: None,
             launch_ready: None,
             launch_anim: None,
             launch_anim_idx: None,
             card_menu: None,
             intro_hint_owed: new_build,
+            recents: crate::services::recents::Recents::load(),
             state_writer,
             detected_gamepad_type: None,
             keyboard_shown: false,
@@ -368,25 +388,10 @@ impl App {
         rows
     }
 
-    /// Scrolls `settings_focused` into view.
-    pub(crate) fn scroll_settings_into_view(&mut self, screen_h: u32) {
-        let set = self.settings_scope();
-        let visible = view::settings::visible_rows(set, screen_h);
-        self.render.scroll.scroll_into_view(
-            self.nav.cursor(ScreenKey::Settings),
-            menu::settings_row_count(set),
-            visible,
-        );
-    }
-
     /// `(row, focused, alpha)` for the open dropdown or its close-fade; `None` if neither.
     pub(crate) fn dropdown_draw_state(&self) -> Option<(usize, usize, f32)> {
         if let Some(dd) = &self.settings_ui.dropdown {
-            Some((
-                dd.row,
-                dd.focused,
-                self.settings_ui.dropdown_fade.open_alpha(),
-            ))
+            Some((dd.row, dd.focused, self.settings_ui.dropdown_fade.open_alpha()))
         } else {
             self.settings_ui
                 .dropdown_fade
@@ -398,16 +403,15 @@ impl App {
     /// Grid geometry bridges — `view::home` is pure geometry, so these supply the two
     /// pieces of live state (the section shape and the scroll offset) it takes.
     pub(crate) fn unscrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
-        view::home::unscrolled_card_rect(idx, columns, grid_x, available_w, self.grid_sections(columns))
+        view::home::unscrolled_card_rect(idx, grid_x, available_w, self.library.layout(columns))
     }
 
     pub(crate) fn scrolled_card_rect(&self, idx: usize, columns: usize, grid_x: i32, available_w: u32) -> Rect {
         view::home::scrolled_card_rect(
             idx,
-            columns,
             grid_x,
             available_w,
-            self.grid_sections(columns),
+            self.library.layout(columns),
             self.render.grid.scroll,
         )
     }
@@ -421,11 +425,9 @@ impl App {
             return None;
         }
         view::home::card_at_point(
-            self.grid_len(columns),
-            columns,
             grid_x,
             available_w,
-            self.grid_sections(columns),
+            self.library.layout(columns),
             (x, y + self.render.grid.scroll),
         )
     }
@@ -603,6 +605,12 @@ impl App {
                     true
                 }
             }
+            Screen::RenameCollection => {
+                !self.screens.collections.name.text().is_empty() && {
+                    self.screens.collections.name.backspace();
+                    true
+                }
+            }
             Screen::Pairing => self.erase_pin_digit(),
             _ => false,
         }
@@ -621,7 +629,8 @@ impl App {
         if matches!(self.nav.screen, Screen::Home) {
             // A held card's submenu is up: Back dismisses it rather than stepping focus
             // out from under it.
-            if self.card_menu.take().is_some() {
+            if self.card_menu.is_some() {
+                self.close_card_menu();
                 return None;
             }
             match self.home_focus {
@@ -733,11 +742,16 @@ impl App {
         self.hosts.known.iter().find(|h| h.host == host && h.port == port)
     }
 
-    /// The `KnownHost` record backing `selected_host`, if any — shared by every
-    /// pin-related lookup (the focused card's badge, `toggle_focused_pin`).
+    /// The `KnownHost` record backing `selected_host`, if any — shared by every lookup
+    /// that needs the selected host's collections or per-game settings.
     pub(crate) fn selected_known_host(&self) -> Option<&KnownHost> {
         let (host, port) = self.library.selected_host.as_ref()?;
         self.known_host(host, *port)
+    }
+
+    /// Which of the selected host's collections holds `pin_id`, or `None` for Library.
+    pub(crate) fn collection_of_card(&self, pin_id: &str) -> Option<usize> {
+        self.selected_known_host()?.collection_of(pin_id)
     }
 
     pub(crate) fn known_host_mut(&mut self, host: &str, port: u16) -> Option<&mut KnownHost> {
@@ -754,8 +768,7 @@ impl App {
     /// building already filters padding gaps out).
     pub(crate) fn grid_card_content(&self, idx: usize, columns: usize) -> (&str, Option<&Pixmap>) {
         match self.grid_card_at(idx, columns) {
-            Some(GridCard::Desktop) => ("Desktop", None),
-            Some(GridCard::Game(game)) => (game.title.as_str(), self.library.art.get(&game.id)),
+            Some(game) => (game.title.as_str(), self.library.art.get(&game.id)),
             None => unreachable!("idx filtered to a real card before building"),
         }
     }

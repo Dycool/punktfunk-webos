@@ -38,11 +38,13 @@ impl App {
             Screen::SpeedTest => self.handle_speed_test_event(ev),
             Screen::EditHost => self.handle_edit_host_event(ev),
             Screen::About => self.handle_about_event(ev, screen_w, screen_h, fonts),
-            Screen::PinLimit => self.handle_pin_limit_event(ev),
             Screen::Diagnostics => self.handle_diagnostics_event(ev),
             Screen::Experimental => self.handle_experimental_event(ev),
             Screen::CursorSettings(_) => self.handle_cursor_settings_event(ev),
             Screen::SendLogs => self.handle_send_logs_event(ev),
+            Screen::Collections => self.handle_collections_event(ev, screen_w, screen_h),
+            Screen::RenameCollection => self.handle_name_collection_event(ev, screen_w, screen_h),
+            Screen::RemoveCollection => self.handle_remove_collection_event(ev),
         }
         None
     }
@@ -91,7 +93,7 @@ impl App {
             Screen::Home => matches!(self.home_focus, HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_)),
             // The button only; the PIN digits above it are a field.
             Screen::Pairing => matches!(self.screens.pairing_focus, PairingFocus::RequestAccess),
-            Screen::Wake | Screen::ForgetHost | Screen::SpeedTest | Screen::SendLogs => true,
+            Screen::Wake | Screen::ForgetHost | Screen::SpeedTest | Screen::SendLogs | Screen::RemoveCollection => true,
             // Rows, not buttons.
             Screen::Settings(_)
             | Screen::AddHost
@@ -99,10 +101,11 @@ impl App {
             | Screen::About
             | Screen::HostMenu
             | Screen::WakeSettings
-            | Screen::PinLimit
             | Screen::Diagnostics
             | Screen::Experimental
-            | Screen::CursorSettings(_) => false,
+            | Screen::CursorSettings(_)
+            | Screen::Collections
+            | Screen::RenameCollection => false,
         }
     }
 

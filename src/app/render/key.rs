@@ -10,6 +10,7 @@
 //! Every key here is hashed the moment it is built and then dropped — nothing stores one (see
 //! `App::modal_shell_version`). The borrowed `&str` fields say so in the type: a key that could
 //! outlive the state it describes would have to own a copy of every label, once per frame.
+use crate::app::screens::rowbuttons::RowButton;
 use crate::app::state::hostmenu::HostAction;
 use crate::core::model::{GamepadType, LogLevelOverride, Settings, SettingsOverride};
 
@@ -29,10 +30,10 @@ pub enum ModalFocusKey<'a> {
     ForgetButton(usize),
     /// Carries label to prevent stale tiles across screen changes.
     SpeedTestButton(usize, &'a str),
-    /// (focused row, its action, the host's pairing state, ⋯ focused). The action and the
-    /// pairing state are what the row's label is derived from, so they stand in for it —
-    /// see `app::state::hostmenu::host_menu_row`.
-    MenuRow(usize, HostAction, bool, bool),
+    /// (focused row, its action, the host's pairing state, which trailing button is focused).
+    /// The action and the pairing state are what the row's label is derived from, so they
+    /// stand in for it — see `app::state::hostmenu::host_menu_row`.
+    MenuRow(usize, HostAction, bool, Option<RowButton>),
     /// (focused row, log level, stats-overlay on, show-logs on) — any change invalidates the tile.
     DiagnosticsRow(usize, LogLevelOverride, bool, bool),
     ExperimentalRow(usize, bool, bool, Option<bool>),
@@ -41,12 +42,18 @@ pub enum ModalFocusKey<'a> {
     CursorSettingsRow(usize, bool, bool, SettingsOverride),
     /// Which `Screen::SendLogs` button is focused (0 = Cancel, 1 = Send).
     SendLogsButton(usize),
+    /// Which `Screen::RemoveCollection` button is focused (0 = Remove, 1 = Cancel).
+    RemoveCollectionButton(usize),
+    /// (focused row, the row's name, whether it is the one already holding the card, which
+    /// trailing button is focused, whether the row is being dragged) — what the focused row
+    /// draws, and nothing else: the list behind it is its own tiles.
+    CollectionRow(usize, &'a str, bool, Option<RowButton>, bool),
 }
 
 /// Scrollable modal content keys. Paired with Screen for staleness checks.
 ///
 /// Settings has no variant here: its rows are baked one tile each, keyed by
-/// [`ui::widgets::FocusRow::key`] — see [`tile::settings_row`]. A single strip keyed on the
+/// [`ui::widgets::FocusRow::key`] — see [`tile::list_row`]. A single strip keyed on the
 /// whole `Settings` struct meant one changed value re-rasterized every row.
 #[derive(PartialEq, Eq, Hash)]
 pub enum ScrollContentKey {
@@ -116,4 +123,16 @@ pub enum ModalShellKey<'a> {
     },
     /// Fixed warning copy + two buttons — nothing screen-specific left to key on.
     SendLogs,
+    /// The card it asks about, by what the subtitle is derived from.
+    RemoveCollection {
+        name: &'a str,
+        games: usize,
+    },
+    /// The shell is title, rule and the card being moved — the rows are their own tiles, so
+    /// nothing about the collections themselves belongs here except how many there are (the
+    /// card's height follows the row count).
+    Collections {
+        card: &'a str,
+        rows: usize,
+    },
 }

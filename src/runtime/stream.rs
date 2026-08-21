@@ -709,9 +709,7 @@ pub(super) fn run_inner() -> Result<()> {
             }
             overlay_was_active = overlay_active;
             // A fade in flight needs frequent frames; steady-state stats/log are fine at ~2Hz.
-            let fading = notif_active
-                || stats_fade.is_animating()
-                || log_fade.is_animating();
+            let fading = notif_active || stats_fade.is_animating() || log_fade.is_animating();
             let redraw_interval = if fading {
                 Duration::from_millis(33)
             } else {

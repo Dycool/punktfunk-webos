@@ -36,14 +36,10 @@ pub fn sidebar_icon_rect(drawn: Rect) -> Rect {
     )
 }
 
+/// A row's ⋯ button. The single-button case of a focus row's trailing buttons — one
+/// geometry, so the sidebar's ⋯ and a list row's cannot drift apart.
 pub fn sidebar_menu_button_rect(row_rect: Rect) -> Rect {
-    let inset = 10i32;
-    Rect::new(
-        row_rect.right() - SIDEBAR_MENU_BTN as i32 - inset,
-        row_rect.y() + (row_rect.height() as i32 - SIDEBAR_MENU_BTN as i32) / 2,
-        SIDEBAR_MENU_BTN,
-        SIDEBAR_MENU_BTN,
-    )
+    super::trailing_button_rect(row_rect, 1, 0)
 }
 
 impl Painter {
@@ -121,24 +117,42 @@ impl Widget for SidebarRow<'_> {
 }
 
 impl Canvas<'_, '_> {
-    /// The ⋯ button itself: a rounded highlight plate once it has focus, then the glyph.
+    /// The ⋯ button itself: the one-icon case of [`Canvas::row_button`].
     pub fn sidebar_menu_button(&mut self, row_rect: Rect, row_focused: bool, menu_focused: bool) -> Result<()> {
-        let btn = sidebar_menu_button_rect(row_rect);
-        if menu_focused {
-            self.painter
-                .fill_rounded_rect(btn, (SIDEBAR_MENU_BTN / 2) as i32, palette().accent);
+        self.row_button(
+            sidebar_menu_button_rect(row_rect),
+            icons().overflow,
+            row_focused,
+            menu_focused,
+            false,
+        )
+    }
+
+    /// One icon button inside a row: a rounded highlight plate once it has focus, then the
+    /// glyph. `active` is a button held *open* rather than merely focused (a drag handle
+    /// while its row is being moved), which reads brighter still — a mode has to look
+    /// different from a focus.
+    pub fn row_button(&mut self, btn: Rect, icon: &str, row_focused: bool, focused: bool, active: bool) -> Result<()> {
+        if focused || active {
+            let plate = if active {
+                palette().accent_bright
+            } else {
+                palette().accent
+            };
+            self.painter.fill_rounded_rect(btn, (btn.height() / 2) as i32, plate);
         }
+        let glyph = SIDEBAR_MENU_GLYPH;
         let glyph_rect = Rect::new(
-            btn.x() + (btn.width() as i32 - SIDEBAR_MENU_GLYPH as i32) / 2,
-            btn.y() + (btn.height() as i32 - SIDEBAR_MENU_GLYPH as i32) / 2,
-            SIDEBAR_MENU_GLYPH,
-            SIDEBAR_MENU_GLYPH,
+            btn.x() + (btn.width() as i32 - glyph as i32) / 2,
+            btn.y() + (btn.height() as i32 - glyph as i32) / 2,
+            glyph,
+            glyph,
         );
-        let color = if menu_focused || row_focused {
+        let color = if focused || active || row_focused {
             palette().text
         } else {
             palette().muted
         };
-        self.icon(glyph_rect, icons().overflow, color)
+        self.icon(glyph_rect, icon, color)
     }
 }

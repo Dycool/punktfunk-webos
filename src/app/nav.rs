@@ -5,6 +5,7 @@
 //! Every table had to name the same field as the other three; one of them already didn't (see
 //! `WakeSettings` in `docs/APP-REWORK-PLAN.md` §1, P3). Here the mapping is the array index,
 //! so there is nothing left to keep in step.
+use crate::app::screens::is_scroll_list;
 use crate::core::screen::Screen;
 
 /// A [`Screen`] without its payload — what a cursor is filed under, so the two settings
@@ -23,15 +24,17 @@ pub(crate) enum ScreenKey {
     About,
     SpeedTest,
     WakeSettings,
-    PinLimit,
     Diagnostics,
     Experimental,
     CursorSettings,
     SendLogs,
+    Collections,
+    RenameCollection,
+    RemoveCollection,
 }
 
 impl ScreenKey {
-    pub const COUNT: usize = Self::SendLogs as usize + 1;
+    pub const COUNT: usize = Self::RemoveCollection as usize + 1;
 
     pub const fn of(screen: Screen) -> Self {
         match screen {
@@ -46,24 +49,34 @@ impl ScreenKey {
             Screen::About => Self::About,
             Screen::SpeedTest => Self::SpeedTest,
             Screen::WakeSettings => Self::WakeSettings,
-            Screen::PinLimit => Self::PinLimit,
             Screen::Diagnostics => Self::Diagnostics,
             Screen::Experimental => Self::Experimental,
             Screen::CursorSettings(_) => Self::CursorSettings,
             Screen::SendLogs => Self::SendLogs,
+            Screen::Collections => Self::Collections,
+            Screen::RenameCollection => Self::RenameCollection,
+            Screen::RemoveCollection => Self::RemoveCollection,
         }
     }
 }
 
-/// Whether `screen` is the settings list or one of the sub-pages that open over it and
-/// return to it.
+/// Whether `screen` is a scrolling row list or one of the sub-pages that open over one and
+/// return to it — the settings list and its pages, or the collections list and its dialogs.
 ///
 /// Here rather than on [`Screen`] itself: which screens make a family is this layer's
 /// business (see [`ScreenKey::of`] and `app::screens`), not the domain's.
-pub(crate) const fn over_settings(screen: Screen) -> bool {
+pub(crate) const fn over_scroll_list(screen: Screen) -> bool {
+    if is_scroll_list(screen) {
+        return true;
+    }
     matches!(
         screen,
-        Screen::Settings(_) | Screen::Experimental | Screen::Diagnostics | Screen::CursorSettings(_) | Screen::SendLogs
+        Screen::Experimental
+            | Screen::Diagnostics
+            | Screen::CursorSettings(_)
+            | Screen::SendLogs
+            | Screen::RenameCollection
+            | Screen::RemoveCollection
     )
 }
 

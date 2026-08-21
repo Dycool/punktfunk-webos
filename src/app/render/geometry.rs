@@ -5,59 +5,14 @@
 //! agree about a scrollable modal's extent, and deriving it twice is how they stop
 //! agreeing.
 use crate::app::nav::ScreenKey;
-use crate::app::{menu, view, App, PairingFocus, Screen, MODAL_TILE_PAD};
+use crate::app::screens::scrolllist::scroll_list_width_frac;
+use crate::app::screens::{is_confirm, is_list_modal, is_scroll_list};
+use crate::app::{view, App, PairingFocus, Screen, MODAL_TILE_PAD};
 use crate::ui;
 use crate::ui::render::Rect;
 use crate::ui::Painter;
 
-/// Whether `screen` is one of the two-button confirm dialogs — the family that shares a card
-/// (one subtitle sizes it), a button row and a focus cursor, differing only in its labels.
-///
-/// Exhaustive on purpose: a new screen has to say which family it joins rather than being
-/// absorbed by a `_ =>` arm into the wrong geometry.
-pub(crate) const fn is_confirm(screen: Screen) -> bool {
-    match screen {
-        Screen::Wake | Screen::ForgetHost | Screen::SendLogs | Screen::SpeedTest => true,
-        Screen::Home
-        | Screen::Pairing
-        | Screen::Settings(_)
-        | Screen::AddHost
-        | Screen::HostMenu
-        | Screen::EditHost
-        | Screen::About
-        | Screen::WakeSettings
-        | Screen::PinLimit
-        | Screen::Diagnostics
-        | Screen::Experimental
-        | Screen::CursorSettings(_) => false,
-    }
-}
 
-/// Whether `screen` is a plain list modal: a card holding one `FocusRow` per line, hit-tested
-/// and focused by row index. Same contract as [`is_confirm`], and the same reason it is
-/// exhaustive — `WakeSettings` silently missing from a table like this is the bug in
-/// `docs/APP-REWORK-PLAN.md` §1, P3.
-pub(crate) const fn is_list_modal(screen: Screen) -> bool {
-    match screen {
-        Screen::HostMenu
-        | Screen::WakeSettings
-        | Screen::Diagnostics
-        | Screen::Experimental
-        | Screen::CursorSettings(_) => true,
-        Screen::Home
-        | Screen::Pairing
-        // Settings is a list, but a scrolling one that owns its own geometry.
-        | Screen::Settings(_)
-        | Screen::AddHost
-        | Screen::Wake
-        | Screen::ForgetHost
-        | Screen::EditHost
-        | Screen::About
-        | Screen::SpeedTest
-        | Screen::PinLimit
-        | Screen::SendLogs => false,
-    }
-}
 
 impl App {
     /// `(total units, visible units, card rect, content/viewport rect)` for whichever
@@ -89,10 +44,11 @@ impl App {
             // The scope comes off the passed screen, not `self.nav.screen`: a closing Settings(Game)
             // is asked about after `self.nav.screen` has moved on, and reading the live scope there
             // measures the global list instead of the one being faded out.
-            Screen::Settings(set) => {
-                let (card, content) = view::settings::layout(set, screen_w, screen_h);
-                let visible = view::settings::visible_rows(set, screen_h);
-                Some((menu::settings_row_count(set), visible, card, content))
+            Screen::Settings(_) | Screen::Collections => {
+                let total = self.scroll_list_row_count_for(screen);
+                let (card, content) =
+                    view::scrolllist::layout(total, screen_w, screen_h, scroll_list_width_frac(screen));
+                Some((total, view::scrolllist::visible_rows(total, screen_h), card, content))
             }
             Screen::About => {
                 let card = view::about::card_rect(screen_w, screen_h);
@@ -215,11 +171,13 @@ impl App {
         let offset = self.render.scroll.clamped(total, visible);
         // Biased back by one peek so the *top* edge also cuts mid-row: sitting on the row grid
         // would put nothing but the gap between rows under the top fade, which is invisible
-        // (see `view::settings::PEEK`). The clamps then pin the first and last positions flush,
-        // where there is genuinely nothing beyond the edge to hint at.
-        let bias = match screen {
-            Screen::Settings(_) => view::settings::PEEK as i32,
-            _ => 0,
+        // (see `view::scrolllist::PEEK`). The clamps then pin the first and last positions
+        // flush, where there is genuinely nothing beyond the edge to hint at. About scrolls
+        // wrapped text, not rows, and has no peek.
+        let bias = if is_scroll_list(screen) {
+            view::scrolllist::PEEK as i32
+        } else {
+            0
         };
         let target = (offset as i32 * stride - bias)
             .min(Self::max_scroll_px(total, stride, viewport_h))
@@ -241,7 +199,7 @@ impl App {
     /// Same as `scroll_stride`, but for an explicit screen — see `scroll_geometry_for`.
     pub(crate) fn scroll_stride_for(&self, screen: Screen, fonts: &ui::text::Fonts) -> i32 {
         match screen {
-            Screen::Settings(_) => ui::widgets::FOCUS_ROW_H as i32 + ui::widgets::FOCUS_ROW_GAP,
+            Screen::Settings(_) | Screen::Collections => ui::widgets::focus_row_stride() as i32,
             Screen::About => view::about::line_stride(fonts.raster, fonts.value),
             // Nothing else has a scrolling body. `1` rather than `0` because the stride is a
             // divisor in the scroll arithmetic, and this is only reached where
@@ -255,30 +213,68 @@ impl App {
             | Screen::EditHost
             | Screen::SpeedTest
             | Screen::WakeSettings
-            | Screen::PinLimit
             | Screen::Diagnostics
             | Screen::Experimental
             | Screen::CursorSettings(_)
-            | Screen::SendLogs => 1,
+            | Screen::SendLogs
+            | Screen::RenameCollection
+            | Screen::RemoveCollection => 1,
         }
     }
 
-    /// Title and subtitle of the address form, which serves both Add host and Edit
-    /// address — the only difference between the two screens.
-    /// `None` off the two address screens — the copy is the only thing that separates them,
-    /// so a third screen falling in here would silently render as an address form.
-    pub(crate) fn address_copy(&self) -> Option<(&'static str, String)> {
-        Some(match self.nav.screen {
+    /// The open text form — the address form (Add host / Edit address) or the collection
+    /// name dialog — built from whichever screen is up. `None` off them, so a screen that
+    /// types into nothing cannot fall in here and render as a form.
+    ///
+    /// One value rather than a copy table plus a construction site: the geometry, the
+    /// painter and `SDL_SetTextInputRect` all measure the same form.
+    pub(crate) fn text_form(&self) -> Option<view::textform::Modal<'_>> {
+        let (title, subtitle, typed, hint) = match self.nav.screen {
             Screen::EditHost => {
                 let name = self
                     .screens
                     .edit_host_index
                     .and_then(|i| self.hosts.entries.get(i))
                     .map_or_else(String::new, |e| e.name().to_string());
-                (view::addhost::EDIT_TITLE, view::addhost::edit_subtitle(&name))
+                (
+                    view::addhost::EDIT_TITLE,
+                    view::addhost::edit_subtitle(&name),
+                    self.screens.add_host.text(),
+                    None,
+                )
             }
-            Screen::AddHost => (view::addhost::ADD_TITLE, view::addhost::ADD_SUBTITLE.to_string()),
+            Screen::AddHost => (
+                view::addhost::ADD_TITLE,
+                view::addhost::ADD_SUBTITLE.to_string(),
+                self.screens.add_host.text(),
+                None,
+            ),
+            Screen::RenameCollection => {
+                let renaming = self
+                    .screens
+                    .collections
+                    .renaming
+                    .and_then(|i| self.selected_known_host()?.collections().get(i))
+                    .map(|c| c.name.clone());
+                (
+                    if renaming.is_some() {
+                        view::collections::RENAME_TITLE
+                    } else {
+                        view::collections::ADD_TITLE
+                    },
+                    view::collections::name_subtitle(renaming.as_deref(), &self.screens.collections.title),
+                    self.screens.collections.name.text(),
+                    self.collection_name_hint(),
+                )
+            }
             _ => return None,
+        };
+        Some(view::textform::Modal {
+            title,
+            subtitle,
+            typed,
+            hint,
+            keyboard_shown: self.keyboard_shown,
         })
     }
 
@@ -361,7 +357,8 @@ impl App {
         fonts: &ui::text::Fonts,
     ) -> Option<Rect> {
         match screen {
-            Screen::Settings(_) => {
+            // The scrolling row lists: one focused row, positioned the same way on both.
+            Screen::Settings(_) | Screen::Collections => {
                 let (total, _, _, content) = self.scroll_geometry_for(screen, screen_w, screen_h, fonts)?;
                 // Positioned from the animated pixel offset, not the row index: the baked
                 // list is cropped at that offset, and the focus tile *is* the focused row
@@ -371,13 +368,13 @@ impl App {
                 let px = self.clamped_scroll_px(total, stride, content.height());
                 Some(ui::widgets::focus_row_rect_at_px(
                     content,
-                    self.nav.cursor(ScreenKey::Settings),
+                    self.nav.cursor(ScreenKey::of(screen)),
                     px,
                 ))
             }
             // Every two-button confirm dialog: one subtitle drives the card, so one
             // button-row geometry serves all four.
-            Screen::Wake | Screen::ForgetHost | Screen::SendLogs | Screen::SpeedTest => self
+            Screen::Wake | Screen::ForgetHost | Screen::SendLogs | Screen::SpeedTest | Screen::RemoveCollection => self
                 .confirm_subtitle()
                 .zip(self.confirm_focused())
                 .map(|(subtitle, i)| Self::confirm_focus_button_rect(screen_w, screen_h, fonts, &subtitle, i)),
@@ -398,7 +395,9 @@ impl App {
             | Screen::Diagnostics
             | Screen::Experimental
             | Screen::CursorSettings(_) => self.list_modal_focus_rect(screen_w, screen_h, fonts),
-            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
+            // No single focused widget: a text form is one always-active field, and About is
+            // a scrolling document.
+            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::RenameCollection | Screen::About => None,
         }
     }
 
@@ -461,20 +460,17 @@ impl App {
                 set,
                 game: self.editing_game().map(|gs| gs.title.as_str()),
             }),
+            Screen::Collections => f(&view::collections::Modal {
+                rows: self.collections_row_count(),
+                card: Some(self.collections_heading()),
+            }),
             Screen::Pairing => f(&view::pairing::Modal {
                 pin_digits: &self.screens.pin_digits,
                 status: self.screens.pairing_status.as_ref(),
                 busy: self.screens.pairing_busy,
             }),
-            Screen::AddHost | Screen::EditHost => {
-                let (title, subtitle) = self.address_copy()?;
-                f(&view::addhost::Modal {
-                    title,
-                    subtitle,
-                    typed: self.screens.add_host.text(),
-                    keyboard_shown: self.keyboard_shown,
-                })
-            }
+            // Every one-field text form, described once by `text_form`.
+            Screen::AddHost | Screen::EditHost | Screen::RenameCollection => f(&self.text_form()?),
             Screen::Wake => f(&view::wake::Modal {
                 wake: self.screens.wake.as_ref()?,
                 confirm: confirm.as_ref(),
@@ -498,9 +494,6 @@ impl App {
                 host_name: &self.screens.speed_test_name,
                 confirm: confirm.as_ref(),
             }),
-            Screen::PinLimit => f(&view::pinlimit::Modal {
-                message: Self::PIN_LIMIT_MESSAGE,
-            }),
             Screen::Diagnostics => f(&view::diagnostics::Modal {
                 settings: &self.settings_ui.settings,
             }),
@@ -514,6 +507,10 @@ impl App {
             }),
             Screen::SendLogs => f(&view::confirm::Modal {
                 title: view::sendlogs::TITLE,
+                confirm: confirm.as_ref()?,
+            }),
+            Screen::RemoveCollection => f(&view::confirm::Modal {
+                title: view::collections::REMOVE_TITLE,
                 confirm: confirm.as_ref()?,
             }),
         })

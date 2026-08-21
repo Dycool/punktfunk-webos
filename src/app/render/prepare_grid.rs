@@ -13,6 +13,7 @@ use crate::app::grid::{GridLayout, CARD_BUILD_BUDGET, CARD_BUILD_BURST, CARD_KEE
 use crate::app::library::Library;
 use crate::app::render::ctx::RenderCtx;
 use crate::app::render::tile;
+use crate::app::state::cardmenu::CardMenuRow;
 use crate::app::{view, App, HomeFocus, Screen};
 use crate::ui;
 use crate::ui::cache;
@@ -23,8 +24,8 @@ use crate::ui::cache;
 ///
 /// A free function rather than a closure so both the build pass and the reveal check can use it
 /// while `&mut self` is live elsewhere in the same frame.
-fn art_ready(library: &Library, layout: &GridLayout, idx: usize) -> bool {
-    layout.game_at(&library.games, idx).is_none_or(|game| {
+fn art_ready(library: &Library, layout: GridLayout, idx: usize) -> bool {
+    layout.card_at(&library.games, idx).is_none_or(|game| {
         library.art.contains_key(&game.id) || (game.art.portrait.is_none() && game.art.header.is_none())
     })
 }
@@ -91,14 +92,16 @@ impl App {
         // Held by value, not re-derived per index — and, unlike the `App`
         // helpers, it maps indices without borrowing all of `self`, so the art
         // lookups below can sit next to `&mut self.jobs.art`.
-        let layout = self.grid_layout(columns);
-        self.evict_cards_outside(keep_window, &layout, ctx.tiles);
-        let pending = self.build_card_window(build_window.clone(), &layout, columns, card_w, card_h, ctx)?;
-        self.prepare_focused_card_tiles(&layout, columns, card_w, card_h, pending, ctx)?;
+        // Rebuilt inside each helper rather than hoisted: a `GridLayout` borrows the library,
+        // and these all mutate `self.render` while reading it. Rebuilding is a slice reborrow
+        // and an integer copy, so there is nothing to hoist.
+        self.evict_cards_outside(keep_window, columns, ctx.tiles);
+        let pending = self.build_card_window(build_window.clone(), columns, card_w, card_h, ctx)?;
+        self.prepare_focused_card_tiles(columns, card_w, card_h, pending, ctx)?;
         // Order against the reveal below doesn't matter: both only ensure tiles and record what
         // they rebuilt.
         self.prepare_grid_shared_tiles(card_w, card_h, ctx)?;
-        self.advance_grid_reveal(build_window, &layout, ctx);
+        self.advance_grid_reveal(build_window, columns, ctx);
         Ok(())
     }
 
@@ -133,7 +136,7 @@ impl App {
     fn evict_cards_outside(
         &mut self,
         keep_window: std::ops::Range<usize>,
-        layout: &GridLayout,
+        columns: usize,
         tiles: &mut ui::cache::TileStore,
     ) {
         // Evict first, so a long scroll frees textures in the same frame it needs new
@@ -149,6 +152,7 @@ impl App {
         // lists are `GridState` scratch, cleared and refilled rather than allocated.
         let mut keep = std::mem::take(&mut self.render.grid.scratch.keep);
         keep.clear();
+        let layout = self.library.layout(columns);
         keep.extend(
             keep_window
                 .filter_map(|idx| layout.pin_id_at(&self.library.games, idx))
@@ -192,7 +196,6 @@ impl App {
     fn build_card_window(
         &mut self,
         build_window: std::ops::Range<usize>,
-        layout: &GridLayout,
         columns: usize,
         card_w: u32,
         card_h: u32,
@@ -213,6 +216,7 @@ impl App {
         let mut waiting = std::mem::take(&mut self.render.grid.scratch.waiting);
         ready.clear();
         waiting.clear();
+        let layout = self.library.layout(columns);
         for idx in build_window {
             // Nothing to build or fetch art for in the padding after a partial
             // pinned row.
@@ -221,7 +225,7 @@ impl App {
             };
             // Ask for this card's cover as it enters the window, not for the whole
             // library at once (see `art::ArtLoader`).
-            if let (Some(loader), Some(game)) = (&mut self.jobs.art, layout.game_at(&self.library.games, idx)) {
+            if let (Some(loader), Some(game)) = (&mut self.jobs.art, layout.card_at(&self.library.games, idx)) {
                 loader.request(game);
             }
             if self.render.grid.card_ids.get(id).is_some_and(|t| tiles.contains(t)) {
@@ -284,7 +288,6 @@ impl App {
     /// the submenu panel a hold raises over it.
     fn prepare_focused_card_tiles(
         &mut self,
-        layout: &GridLayout,
         columns: usize,
         card_w: u32,
         card_h: u32,
@@ -307,7 +310,7 @@ impl App {
         // actually looking at behind a full-screen fetch and decode.
         if self.render.grid.reveal.is_revealed() && !pending {
             if let HomeFocus::Grid(focus_idx) = self.home_focus {
-                if let Some(game) = layout.game_at(&self.library.games, focus_idx) {
+                if let Some(game) = self.library.layout(columns).card_at(&self.library.games, focus_idx) {
                     if let Some(loader) = &mut self.jobs.art {
                         loader.request_hero(game);
                     }
@@ -322,7 +325,7 @@ impl App {
         // `Canvas::poster_frost_panel`), so the card's art is in neither the tile nor
         // its key, and finished art no longer rebuilds the strip.
         if let HomeFocus::Grid(idx) = self.home_focus {
-            if let Some(pin_id) = layout.pin_id_at(&self.library.games, idx) {
+            if let Some(pin_id) = self.library.pin_id_at(idx, columns) {
                 let (title, _) = self.grid_card_content(idx, columns);
                 // Keyed by card identity like the card tiles themselves (`CardIds`),
                 // not by title — two games can share one.
@@ -353,20 +356,20 @@ impl App {
                 // to come back up.
                 let menu_open = self.card_menu.as_ref().is_some_and(|m| m.pin_id == pin_id);
                 if menu_open || (self.render.grid.reveal.is_revealed() && !pending) {
+                    let kinds = self.card_menu_row_kinds(pin_id);
                     let rows = self.card_menu_rows(pin_id);
                     // No focused row in this key: the glass and the title are composited
                     // under the selection, so moving between the menu's rows rebuilds
                     // neither. The two row tiles are the exception — the focused row moved
                     // out of the list and into the band — and get their own keys below.
                     let version = cache::version(&(pin_id, card_w, card_h, &rows, overridden));
-                    let focused = self
-                        .card_menu
-                        .as_ref()
-                        .map_or(crate::app::state::cardmenu::ROW_PIN, |m| m.focused);
+                    let focused = self.card_menu.as_ref().map_or(0, |m| m.focused);
                     let rows_version = cache::version(&(pin_id, card_w, card_h, &rows, overridden, focused));
                     // The dot follows what owns it: the title while the strip is collapsed,
                     // the Settings row once the panel is up.
-                    let marked = overridden.then_some(crate::app::state::cardmenu::ROW_SETTINGS);
+                    let marked = overridden
+                        .then(|| kinds.iter().position(|k| *k == CardMenuRow::Settings))
+                        .flatten();
                     if tiles.ensure(tile::CARD_MENU, version, || {
                         ui::rasterize(
                             ui::tiles::CardMenuTile {
@@ -446,13 +449,13 @@ impl App {
             updated,
             ..
         } = ctx;
-        // The grid's section headings. Built unconditionally like the pin badge: two
-        // lines of text, and whether they are *drawn* is the compose path's call.
-        for (id, label) in [
-            (tile::SECTION_PINNED, crate::app::view::home::SECTION_PINNED_LABEL),
-            (tile::SECTION_LIBRARY, crate::app::view::home::SECTION_LIBRARY_LABEL),
-        ] {
-            if tiles.ensure_static(id, || {
+        // The grid's section headings, one slot per drawn section. Versioned by the label
+        // rather than static: the names are the user's collections now, and a rename must
+        // re-raster exactly the one slot that carries it.
+        for (i, group) in self.library.groups.iter().enumerate() {
+            let Some(id) = tile::section(i) else { break };
+            let label = group.name.as_str();
+            if tiles.ensure(id, cache::version(&label), || {
                 ui::rasterize(
                     ui::tiles::TextTile {
                         font: fonts.title,
@@ -465,14 +468,6 @@ impl App {
             })? {
                 updated.push(id);
             }
-        }
-
-        // The pinned badge tile — built once, composited over the focused
-        // card in `draw_list` rather than baked into individual card tiles.
-        if tiles.ensure_static(tile::PIN_BADGE, || {
-            ui::rasterize(ui::tiles::PinBadgeTile, text_cache, fonts)
-        })? {
-            updated.push(tile::PIN_BADGE);
         }
 
         // One shared tile at the current card size, so the card size *is* the
@@ -501,10 +496,11 @@ impl App {
     fn advance_grid_reveal(
         &mut self,
         mut build_window: std::ops::Range<usize>,
-        layout: &GridLayout,
+        columns: usize,
         ctx: &mut RenderCtx<'_>,
     ) {
         let RenderCtx { tiles, updated, .. } = ctx;
+        let layout = self.library.layout(columns);
         if !self.render.grid.reveal.is_revealed() {
             // Rechecks the whole window rather than trusting `!pending`, since a card built
             // earlier can still be waiting behind a re-dirtied sibling; requires `art_ready`

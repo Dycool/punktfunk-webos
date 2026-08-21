@@ -5,21 +5,44 @@
 //! The panel's glass and title are baked without any notion of focus, so moving between rows
 //! rebuilds neither; the *selection* — its geometry here, its pixels in
 //! `ui::tiles::CardMenuBandTile` — is what a row move costs.
-use crate::app::state::cardmenu::ROW_COUNT;
+use crate::app::state::cardmenu::CardMenuRow;
 use crate::app::{view, App};
 use crate::ui;
 use crate::ui::render::Rect;
 
 impl App {
-    /// The submenu's rows for `pin_id`'s card. Takes the card rather than reading the open
-    /// menu: the panel is baked when the card takes focus, before there is a menu to ask.
-    /// Pin's label is the action it performs, not the state it reads.
-    pub(crate) fn card_menu_rows(&self, pin_id: &str) -> [(&'static str, &'static str); ROW_COUNT] {
-        let pinned = self.selected_known_host().is_some_and(|h| h.is_pinned(pin_id));
-        [
-            (crate::ui::theme::icons().pin, if pinned { "Unpin" } else { "Pin" }),
-            (view::icons::ICON_SETTINGS, "Settings"),
-        ]
+    /// Which rows `pin_id`'s card shows. The one table over the submenu's shape: its labels,
+    /// its baked height, its tile key, its hit test and its handler all count rows through
+    /// here.
+    ///
+    /// Takes the card rather than reading the open menu: the panel is baked when the card
+    /// takes focus, before there is a menu to ask — membership is available there too, so the
+    /// count is safe at that point.
+    pub(crate) fn card_menu_row_kinds(&self, pin_id: &str) -> &'static [CardMenuRow] {
+        // Nothing to remove a Library card from — Library *is* "in no collection".
+        if self.collection_of_card(pin_id).is_some() {
+            &[CardMenuRow::MoveTo, CardMenuRow::Remove, CardMenuRow::Settings]
+        } else {
+            &[CardMenuRow::MoveTo, CardMenuRow::Settings]
+        }
+    }
+
+    /// [`card_menu_row_kinds`](Self::card_menu_row_kinds) with the icon and label each row
+    /// draws.
+    pub(crate) fn card_menu_rows(&self, pin_id: &str) -> Vec<(&'static str, &'static str)> {
+        self.card_menu_row_kinds(pin_id)
+            .iter()
+            .map(|kind| match kind {
+                CardMenuRow::MoveTo => (crate::ui::theme::icons().pin, "Add to\u{2026}"),
+                CardMenuRow::Remove => (view::icons::ICON_DELETE, "Remove"),
+                CardMenuRow::Settings => (view::icons::ICON_SETTINGS, "Settings"),
+            })
+            .collect()
+    }
+
+    /// How many rows the submenu on `pin_id`'s card has — what its geometry divides by.
+    pub(crate) fn card_menu_row_count(&self, pin_id: &str) -> usize {
+        2 + usize::from(self.collection_of_card(pin_id).is_some())
     }
 
     /// The open submenu's rows band in screen space, and the card it hangs off — the
@@ -31,7 +54,8 @@ impl App {
     /// above the rows on screen — enough to mispick at a row boundary, and to drop clicks in
     /// the panel's bottom edge (which read as "clicked outside" and dismiss the menu).
     pub(crate) fn card_menu_rows_rect(&self, screen_w: u32, fonts: &ui::text::Fonts) -> Option<Rect> {
-        let menu = self.card_menu.as_ref()?;
+        // Nothing to hit while the panel is collapsed for a reorder (see `compose_grid`).
+        let menu = self.card_menu.as_ref().filter(|m| !m.moved)?;
         let available_w = screen_w.saturating_sub(ui::widgets::SIDEBAR_W);
         let columns = view::home::grid_columns(available_w);
         // The latch is only good while the grid still holds that card at that index — a
@@ -41,7 +65,8 @@ impl App {
             return None;
         }
         let card = self.scrolled_card_rect(menu.idx, columns, ui::widgets::SIDEBAR_W as i32, available_w);
-        let panel_h = ui::widgets::card_menu_strip_h(fonts.raster, fonts.value, card.height(), ROW_COUNT);
+        let rows = self.card_menu_row_count(&menu.pin_id);
+        let panel_h = ui::widgets::card_menu_strip_h(fonts.raster, fonts.value, card.height(), rows);
         let title_h = ui::widgets::title_strip_h(fonts.raster, fonts.value, card.height());
         let top = card.bottom() - panel_h as i32 + title_h as i32;
         let band = Rect::new(card.x(), top, card.width(), panel_h.saturating_sub(title_h));
@@ -66,16 +91,16 @@ impl App {
         if !band.contains_point((x, y)) {
             return None;
         }
+        let count = self.card_menu_row_count(&self.card_menu.as_ref()?.pin_id);
         // Into the panel's own coordinates first, then split by the same constants the rows
         // are drawn at: the band carries the focused card's scale (see `card_menu_rows_rect`),
         // so on screen every row and both pads are that much taller.
-        let local =
-            (y - band.y()) as f32 * ui::widgets::card_menu_rows_h(ROW_COUNT) as f32 / band.height().max(1) as f32;
+        let local = (y - band.y()) as f32 * ui::widgets::card_menu_rows_h(count) as f32 / band.height().max(1) as f32;
         let row =
             ((local - ui::widgets::CARD_MENU_ROWS_PAD as f32).max(0.0) / ui::widgets::CARD_MENU_ROW_H as f32) as usize;
         // Clamped, not rejected: the block's top and bottom padding belong to the row nearest
         // them, so a click just off a row still picks it rather than dismissing the menu.
-        Some(row.min(ROW_COUNT - 1))
+        Some(row.min(count.saturating_sub(1)))
     }
 
     /// The selection band in screen space, clipped to the part of the panel the wipe has
@@ -99,7 +124,8 @@ impl App {
         let menu = self.card_menu.as_ref()?;
         // Panel-local: the rows block starts at `rows_top`, and the band is that block's row
         // rect — one function with the tile that draws the labels into it.
-        let block = Rect::new(0, rows_top, card.width(), ui::widgets::card_menu_rows_h(ROW_COUNT));
+        let count = self.card_menu_row_count(&menu.pin_id);
+        let block = Rect::new(0, rows_top, card.width(), ui::widgets::card_menu_rows_h(count));
         let row = ui::widgets::card_menu_row_rect(block, menu.focused);
         // Only the bottom can be clipped: the block hangs off the revealed window's top edge,
         // so every row sits below it and a row the rise has not reached yet runs off the

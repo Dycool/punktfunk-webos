@@ -5,8 +5,9 @@
 //! that are `Option` are `None` off-screen; the flat ones (pairing's PIN, the host-menu cursor
 //! into the sidebar) are reset by the `open_*` that raises their screen.
 
-use crate::app::state::addhost::AddHostState;
+use crate::app::state::collections::CollectionsState;
 use crate::app::state::speedtest::SpeedTestState;
+use crate::app::state::textfield::TextField;
 use crate::app::WakeState;
 use crate::core::screen::PairingFocus;
 
@@ -15,17 +16,20 @@ pub(crate) struct ScreenSlots {
     /// The sidebar row the host menu (and everything reached from it) is acting on, `None`
     /// otherwise.
     pub(crate) host_menu_index: Option<usize>,
-    /// Whether focus is on the ⋯ button of the host menu's focused row rather than on the row
-    /// body — the list-modal counterpart of `HomeFocus::SidebarMenu`. Only the "Wake host" row
-    /// has one (see `host_menu_actions`).
-    pub(crate) host_menu_dots: bool,
+    /// Which of the focused row's trailing buttons has focus, rather than the row body — the
+    /// row-list counterpart of `HomeFocus::SidebarMenu`. Shared by every screen whose rows
+    /// carry them (the host menu's ⋯, a collection's rename/remove), because focus is only
+    /// ever on one row of one list at a time. Cleared by any vertical move.
+    pub(crate) row_button: Option<super::rowbuttons::RowButton>,
     /// The sidebar row `Screen::EditHost` is editing, `None` otherwise.
     pub(crate) edit_host_index: Option<usize>,
     /// The in-flight/finished speed test, `None` when that screen isn't open.
     pub(crate) speed_test: Option<SpeedTestState>,
     /// The host being measured, for the status line.
     pub(crate) speed_test_name: String,
-    pub(crate) add_host: AddHostState,
+    pub(crate) add_host: TextField,
+    /// The card `Screen::Collections` is moving, and its title — see [`CollectionsState`].
+    pub(crate) collections: CollectionsState,
     /// The active "host unreachable — wake it?" prompt/wait, if any — see `WakeState`.
     pub(crate) wake: Option<WakeState>,
     /// PIN entry: 4 digits, each 0-9, edited one at a time.

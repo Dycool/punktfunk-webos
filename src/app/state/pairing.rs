@@ -150,6 +150,7 @@ impl App {
                         // Only reaches a genuinely new host — `upsert_known_host` keeps an
                         // existing record's pins and wol_auto.
                         games: store::new_host_games(&self.settings_ui.settings),
+                        collections: Some(store::new_host_collections()),
                         ..KnownHost::default()
                     },
                 );
@@ -190,7 +191,8 @@ impl App {
     /// there is nothing left to undo — an all-zero PIN, or a ceremony already in flight
     /// (whose only meaningful key is the Back that cancels it).
     pub(crate) fn erase_pin_digit(&mut self) -> bool {
-        if self.screens.pairing_busy || self.screens.pin_digits == [0; 4] {
+        // Not `pin_digits == [0; 4]`: a typed leading 0 is still an erasable digit.
+        if self.screens.pairing_busy || (self.screens.pin_digit_index == 0 && self.screens.pin_digits[0] == 0) {
             return false;
         }
         self.screens.pairing_focus = PairingFocus::Pin;

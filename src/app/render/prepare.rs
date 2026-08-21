@@ -11,12 +11,13 @@ use anyhow::Result;
 use crate::app::hosts::HostEntry;
 use crate::app::nav::ScreenKey;
 use crate::app::render::ctx::RenderCtx;
+use crate::app::screens::is_scroll_list;
 use crate::app::render::key::{ModalFocusKey, ModalShellKey, ScrollContentKey};
 use crate::app::render::tile;
 use crate::app::render::SnapshotBody;
+use crate::app::screens::rowbuttons::RowButton;
 use crate::app::{
-    menu, view, App, HomeFocus, PairingFocus, Screen, ABOUT_WINDOW_BUDGET, ABOUT_WINDOW_MARGIN,
-    SCROLL_INDICATOR_TILE_W,
+    menu, view, App, HomeFocus, PairingFocus, Screen, ABOUT_WINDOW_BUDGET, ABOUT_WINDOW_MARGIN, SCROLL_INDICATOR_TILE_W,
 };
 use crate::ui;
 use crate::ui::cache;
@@ -160,7 +161,7 @@ impl App {
         // its rows where they are and redraws from them; stitching them into one full-height
         // painter here is what made leaving Settings slower than leaving any other modal.
         let content = match left {
-            Screen::Settings(_) => self
+            screen if is_scroll_list(screen) => self
                 .scroll_view_for(left, screen_w, screen_h, fonts)
                 .map(|(total, content, scroll_px)| SnapshotBody::Rows(total, content, scroll_px)),
             // `src_rect` first: a screen whose body lives in its shell tile has no crop, and
@@ -205,6 +206,10 @@ impl App {
         let key = match self.nav.screen {
             Screen::Settings(_) => Some(ModalShellKey::Settings {
                 game: self.editing_game().map(|gs| gs.title.as_str()),
+            }),
+            Screen::Collections => Some(ModalShellKey::Collections {
+                card: self.collections_heading(),
+                rows: self.collections_row_count(),
             }),
             Screen::Wake => self.screens.wake.as_ref().map(|w| ModalShellKey::Wake {
                 name: &w.name,
@@ -254,11 +259,13 @@ impl App {
                 over: self.editing_override(),
             }),
             Screen::SendLogs => Some(ModalShellKey::SendLogs),
+            Screen::RemoveCollection => self
+                .removed_collection()
+                .map(|(name, games)| ModalShellKey::RemoveCollection { name, games }),
             // `EditHost` joins `AddHost` in having no shell key: its typed-digit
             // display has no separate focus tile to protect, so it just redraws on
-            // any `content_dirty` tick — same for `PinLimit`, which is a fixed
-            // message plus one always-focused button.
-            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::PinLimit => None,
+            // any `content_dirty` tick.
+            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::RenameCollection => None,
         };
         // Hashed with the key rather than carried inside it: the close-button hover changes
         // every shell alike (see `ModalShellKey`).
@@ -281,6 +288,23 @@ impl App {
                 self.editing_override(),
                 self.detected_gamepad_type,
             )),
+            Screen::Collections => {
+                let row = self.nav.cursor(ScreenKey::Collections);
+                let host = self.selected_known_host();
+                let holding = host
+                    .zip(self.screens.collections.target.as_deref())
+                    .is_some_and(|(h, target)| h.collection_of(target).or_else(|| h.library_index()) == Some(row));
+                let name = host
+                    .and_then(|h| h.collections().get(row))
+                    .map_or("", |c| c.name.as_str());
+                Some(ModalFocusKey::CollectionRow(
+                    row,
+                    name,
+                    holding,
+                    self.screens.row_button,
+                    self.screens.collections.dragging.is_some(),
+                ))
+            }
             Screen::Wake => self
                 .screens
                 .wake
@@ -302,7 +326,7 @@ impl App {
                         self.nav.cursor(ScreenKey::HostMenu),
                         action,
                         self.host_menu_paired(),
-                        self.screens.host_menu_dots,
+                        self.screens.row_button,
                     )
                 }),
             Screen::WakeSettings => Some(ModalFocusKey::WakeToggle(
@@ -331,10 +355,12 @@ impl App {
                 self.editing_override(),
             )),
             Screen::SendLogs => Some(ModalFocusKey::SendLogsButton(self.nav.cursor(ScreenKey::SendLogs))),
-            // Neither has a single focused widget: the address form is one always-active
-            // field, About is a scrolling document, and `PinLimit`'s one button is
-            // always drawn focused directly in `render_pin_limit`.
-            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
+            Screen::RemoveCollection => Some(ModalFocusKey::RemoveCollectionButton(
+                self.nav.cursor(ScreenKey::RemoveCollection),
+            )),
+            // None has a single focused widget: the address form is one always-active
+            // field, and About is a scrolling document.
+            Screen::Home | Screen::AddHost | Screen::EditHost | Screen::RenameCollection | Screen::About => None,
         };
         key.as_ref().map(cache::version)
     }
@@ -351,7 +377,7 @@ impl App {
             fonts,
             screen: size,
             updated,
-            settings_rows,
+            scroll_list_rows,
             ..
         } = ctx;
         let (screen_w, screen_h) = (size.w, size.h);
@@ -414,50 +440,60 @@ impl App {
                 // the descriptor that proves the arm reachable is the same value it draws
                 // from, so an arm cannot assert its way past a `None` any more.
                 let tile = match self.nav.screen {
-                    Screen::Settings(_) => {
-                        let (_, content) = view::settings::layout(self.settings_scope(), screen_w, screen_h);
-                        let rows = settings_rows.get_or_insert_with(|| self.settings_rows());
-                        let dropdown_open = self
-                            .settings_ui
-                            .dropdown
-                            .as_ref()
-                            .is_some_and(|dd| dd.row == self.nav.cursor(ScreenKey::Settings));
-                        let target_on = rows
-                            .get(self.nav.cursor(ScreenKey::Settings))
-                            .is_some_and(|r| r.value == "On");
-                        Some(ui::rasterize(
-                            ui::widgets::FocusRowTile {
-                                rows,
-                                content_width: content.width(),
-                                index: self.nav.cursor(ScreenKey::Settings),
-                                dropdown_open,
-                                switch_frac: self.toggle_frac(target_on, self.nav.cursor(ScreenKey::Settings)),
-                            },
-                            text_cache,
-                            fonts,
-                        )?)
-                    }
-                    // Every two-button confirm dialog shares the button geometry (one subtitle
-                    // sizes the card, so one button row falls out of it) and describes its own
-                    // labels — one value, not a match arm per screen.
-                    Screen::Wake | Screen::ForgetHost | Screen::SendLogs | Screen::SpeedTest => {
-                        match (self.confirm_of(), self.confirm_focused()) {
-                            (Some(confirm), Some(i)) => {
-                                let rect =
-                                    Self::confirm_focus_button_rect(screen_w, screen_h, fonts, &confirm.subtitle, i);
+                    // The scrolling row lists: one focused row re-rendered on its own tile,
+                    // over the cropped strip the rest of the list is baked into.
+                    screen @ (Screen::Settings(_) | Screen::Collections) => {
+                        let index = self.nav.cursor(ScreenKey::of(screen));
+                        match (
+                            self.scroll_list_layout(screen, screen_w, screen_h),
+                            scroll_list_rows.get_or_insert_with(|| self.scroll_list_rows().unwrap_or_default()),
+                        ) {
+                            (Some((_, content)), rows) => {
+                                let dropdown_open =
+                                    self.settings_ui.dropdown.as_ref().is_some_and(|dd| dd.row == index);
+                                let target_on = rows.get(index).is_some_and(|r| r.value == "On");
                                 Some(ui::rasterize(
-                                    ui::widgets::ConfirmButtonTile {
-                                        button: &confirm.widgets()[i],
-                                        w: rect.width(),
-                                        h: rect.height(),
+                                    ui::widgets::FocusRowTile {
+                                        rows,
+                                        content_width: content.width(),
+                                        index,
+                                        dropdown_open,
+                                        switch_frac: self.toggle_frac(target_on, index),
+                                        trailing_focused: self.screens.row_button.and_then(RowButton::trailing),
+                                        leading_focused: self.screens.row_button == Some(RowButton::Leading),
+                                        // The handle of a held row, lit for as long as it
+                                        // is held: a mode must look different from a focus.
+                                        leading_active: self.dragged_handle(screen),
                                     },
                                     text_cache,
                                     fonts,
                                 )?)
                             }
-                            _ => None,
+                            (None, _) => None,
                         }
                     }
+                    // Every two-button confirm dialog shares the button geometry (one subtitle
+                    // sizes the card, so one button row falls out of it) and describes its own
+                    // labels — one value, not a match arm per screen.
+                    Screen::Wake
+                    | Screen::ForgetHost
+                    | Screen::SendLogs
+                    | Screen::SpeedTest
+                    | Screen::RemoveCollection => match (self.confirm_of(), self.confirm_focused()) {
+                        (Some(confirm), Some(i)) => {
+                            let rect = Self::confirm_focus_button_rect(screen_w, screen_h, fonts, &confirm.subtitle, i);
+                            Some(ui::rasterize(
+                                ui::widgets::ConfirmButtonTile {
+                                    button: &confirm.widgets()[i],
+                                    w: rect.width(),
+                                    h: rect.height(),
+                                },
+                                text_cache,
+                                fonts,
+                            )?)
+                        }
+                        _ => None,
+                    },
                     Screen::Pairing => Some(match self.screens.pairing_focus {
                         PairingFocus::Pin => {
                             let digit = self.screens.pin_digits[self.screens.pin_digit_index].to_string();
@@ -493,7 +529,7 @@ impl App {
                     | Screen::Diagnostics
                     | Screen::Experimental
                     | Screen::CursorSettings(_) => {
-                        let rows = self.list_focus_rows().unwrap_or_default();
+                        let rows = self.list_modal_rows().unwrap_or_default();
                         let content = self.modal_list_content(screen_w, screen_h, fonts);
                         self.list_modal_focused()
                             .map(|focused| {
@@ -507,6 +543,9 @@ impl App {
                                         index: focused,
                                         dropdown_open,
                                         switch_frac: self.toggle_frac(target_on, focused),
+                                        trailing_focused: self.screens.row_button.and_then(RowButton::trailing),
+                                        leading_focused: self.screens.row_button == Some(RowButton::Leading),
+                                        leading_active: false,
                                     },
                                     text_cache,
                                     fonts,
@@ -516,7 +555,9 @@ impl App {
                     }
                     // No single focused widget to draw — `modal_focus_version` is `None` on
                     // these, so this is the arm that never runs rather than one that panics.
-                    Screen::Home | Screen::AddHost | Screen::EditHost | Screen::About | Screen::PinLimit => None,
+                    Screen::Home | Screen::AddHost | Screen::EditHost | Screen::RenameCollection | Screen::About => {
+                        None
+                    }
                 };
                 if let Some(tile) = tile {
                     tiles.put(tile::MODAL_FOCUS, version, tile);
@@ -589,9 +630,9 @@ impl App {
 
     /// Releases settings-row tiles from `first` on: the tail of a list that just got
     /// shorter, or the whole band once the settings screens are left.
-    fn evict_settings_rows_from(&mut self, first: usize, tiles: &mut ui::cache::TileStore) {
-        for i in first..tile::SETTINGS_ROW_SLOTS {
-            let Some(id) = tile::settings_row(i) else { break };
+    fn evict_list_rows_from(&mut self, first: usize, tiles: &mut ui::cache::TileStore) {
+        for i in first..tile::LIST_ROW_SLOTS {
+            let Some(id) = tile::list_row(i) else { break };
             if tiles.remove(id) {
                 self.render.evicted_tiles.push(id);
             }
@@ -606,7 +647,7 @@ impl App {
             fonts,
             screen: size,
             updated,
-            settings_rows,
+            scroll_list_rows,
             ..
         } = ctx;
         let (screen_w, screen_h) = (size.w, size.h);
@@ -614,10 +655,10 @@ impl App {
         // it rather than holding a list's worth of textures behind whatever is on screen now.
         // Stepping into a sub-page is not leaving them: the fade draws from that band, and
         // keeping it makes the return a shell rebuild rather than a whole list of rows.
-        let keeps_rows = crate::app::nav::over_settings(self.nav.screen)
-            || self.render.modal.prev.is_some_and(|p| p.holds_settings_rows());
+        let keeps_rows = crate::app::nav::over_scroll_list(self.nav.screen)
+            || self.render.modal.prev.is_some_and(|p| p.holds_list_rows());
         if !keeps_rows {
-            self.evict_settings_rows_from(0, tiles);
+            self.evict_list_rows_from(0, tiles);
         }
         // Whichever modal's content overflows its viewport (Settings' rows, About's
         // document) gets its scroll indicator and content tile refreshed here — see
@@ -652,36 +693,20 @@ impl App {
             self.sync_modal_scroll(self.nav.screen, total, visible, content.height(), stride);
 
             match self.nav.screen {
-                Screen::Settings(_) => {
+                screen if is_scroll_list(screen) => {
                     let dropdown_row = self.settings_ui.dropdown.as_ref().map(|dd| dd.row);
-                    let row_count = menu::settings_row_count(self.settings_scope());
-                    // What the whole list is derived from (see `App::settings_rows`). Checked
-                    // before the list is built at all: the per-row keys below still arbitrate
-                    // which row rebuilds, but on a pure animation frame — the common case
-                    // while Settings is open — this comparison is the entire cost.
-                    let rows_version = cache::version(&(
-                        self.nav.screen,
-                        *self.settings_target(),
-                        self.editing_override(),
-                        self.detected_gamepad_type,
-                        // The Controller row's caption turns on whether the pad is actually
-                        // bound to hid-playstation, which a hotplug can change on its own.
-                        crate::platform::webos::dualsense::hid_playstation_bound(),
-                        // The focused row carries the override-clear hint (`decorate_override`).
-                        self.nav.cursor(ScreenKey::Settings),
-                        dropdown_row,
-                        content.width(),
-                    ));
-                    let cached = self.render.modal.settings_rows_version == Some(rows_version)
-                        && (0..row_count).all(|i| tile::settings_row(i).is_some_and(|id| tiles.contains(id)));
+                    let row_count = self.scroll_list_row_count();
+                    let rows_version = self.scroll_list_rows_version(content.width());
+                    let cached = self.render.modal.scroll_list_rows_version_cached == Some(rows_version)
+                        && (0..row_count).all(|i| tile::list_row(i).is_some_and(|id| tiles.contains(id)));
                     if !cached {
-                        let rows = settings_rows.get_or_insert_with(|| self.settings_rows());
+                        let rows = scroll_list_rows.get_or_insert_with(|| self.scroll_list_rows().unwrap_or_default());
                         // One tile per row, each keyed on that row's own content. Rebuilding the
                         // whole list as one strip cost 25-60ms on armv7 every time a single value
                         // moved; this pays for the row that actually changed and reads the rest
                         // straight out of the cache.
                         for (i, row) in rows.iter().enumerate() {
-                            let Some(id) = tile::settings_row(i) else { break };
+                            let Some(id) = tile::list_row(i) else { break };
                             let key = cache::version(&(self.nav.screen, i, row.key(), dropdown_row == Some(i)));
                             if tiles.is_fresh(id, key) {
                                 continue;
@@ -700,8 +725,8 @@ impl App {
                         }
                         // Slots past the end of a list that just got shorter (a sub-page is a
                         // shorter list on the same screen) would otherwise keep drawing.
-                        self.evict_settings_rows_from(rows.len(), tiles);
-                        self.render.modal.settings_rows_version = Some(rows_version);
+                        self.evict_list_rows_from(rows.len(), tiles);
+                        self.render.modal.scroll_list_rows_version_cached = Some(rows_version);
                     }
                     // Every row is baked, so the window is the whole list — the crop
                     // rebase in `scroll_src_rect` has nothing to shift.
@@ -782,6 +807,9 @@ impl App {
                 index: 0,
                 dropdown_open: false,
                 switch_frac: 0.0,
+                trailing_focused: None,
+                leading_focused: false,
+                leading_active: false,
             },
             text_cache,
             fonts,

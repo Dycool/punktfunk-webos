@@ -3,12 +3,14 @@
 //! The GPU half — pure bookkeeping over already-rasterized tiles. Position, scroll, every
 //! focus pop and every fade is a texture-copy parameter here, never a re-raster (see
 //! `platform::webos::compositor`). Split out of `app/mod.rs` alongside `prepare`.
+use std::ops::Range;
+
+use crate::app::grid::GridLayout;
 use crate::app::render::tile;
 use crate::app::render::SnapshotBody;
 use crate::app::{
     hero, render_input, view, App, HomeFocus, Screen, CARD_GROWTH, CARD_POP, CARD_POP_SHRINK, LAUNCH_GROWTH,
-    MODAL_TILE_PAD, PIN_BADGE_MARGIN, SCROLL_INDICATOR_FADE, SCROLL_INDICATOR_HOLD,
-    SCROLL_INDICATOR_TILE_W, STATUS_BG_PAD,
+    MODAL_TILE_PAD, SCROLL_INDICATOR_FADE, SCROLL_INDICATOR_HOLD, SCROLL_INDICATOR_TILE_W, STATUS_BG_PAD,
 };
 use crate::ui;
 use crate::ui::cache::TileStore;
@@ -97,7 +99,11 @@ impl App {
             self.push_frost(cmds, region, (255.0 * m) as u8);
         }
         if let Some((alpha, prev)) = closing {
-            self.push_frost(cmds, prev.region.offset(0, ui::animation::modal_rise(alpha)), (255.0 * alpha) as u8);
+            self.push_frost(
+                cmds,
+                prev.region.offset(0, ui::animation::modal_rise(alpha)),
+                (255.0 * alpha) as u8,
+            );
         }
         if scrim > 0.0 {
             cmds.push(DrawCmd::Fill {
@@ -130,7 +136,7 @@ impl App {
                     alpha: a,
                 }),
                 Some(SnapshotBody::Rows(total, content, scroll_px)) => {
-                    Self::push_settings_rows(cmds, total, content, scroll_px, dy, a, &NO_FADES);
+                    Self::push_list_rows(cmds, total, content, scroll_px, dy, a, &NO_FADES);
                 }
                 None => {}
             }
@@ -224,10 +230,10 @@ impl App {
                     )
                 }),
             ];
-            // Settings' body is one tile per row (see `tile::settings_row`), so it is
-            // placed row by row; every other scrolling modal crops its single baked tile.
-            if matches!(screen, Screen::Settings(_)) {
-                Self::push_settings_rows(cmds, total, content, scroll_px, dy, alpha, fades);
+            // A row list's body is one tile per row (see `tile::list_row`), so it is placed
+            // row by row; every other scrolling modal crops its single baked tile.
+            if crate::app::screens::is_scroll_list(screen) {
+                Self::push_list_rows(cmds, total, content, scroll_px, dy, alpha, fades);
             } else if let Some((src, dst)) = self.scroll_src_rect(screen, screen_w, screen_h, fonts) {
                 Self::push_faded(cmds, tile::SCROLL_CONTENT, src, dst.offset(0, dy), alpha, fades);
             }
@@ -237,7 +243,7 @@ impl App {
         // not one block.
         let dropdown = self.dropdown_draw_state().and_then(|(row, focused, dd_alpha)| {
             let (content, scroll_px) = self.dropdown_geom(screen_w, screen_h, fonts)?;
-            let overlay_rect = view::settings::dropdown_overlay_rect_at_px(content, row, scroll_px);
+            let overlay_rect = view::scrolllist::dropdown_overlay_rect_at_px(content, row, scroll_px);
             Some((row, focused, overlay_rect, (255.0 * m * dd_alpha) as u8))
         });
         // Dropdown overlay (Settings or Diagnostics).
@@ -346,7 +352,7 @@ impl App {
         }
     }
 
-    fn push_settings_rows(
+    fn push_list_rows(
         cmds: &mut Vec<DrawCmd>,
         total: usize,
         content: Rect,
@@ -357,7 +363,7 @@ impl App {
     ) {
         let viewport = content.offset(0, dy);
         for i in 0..total {
-            let Some(id) = tile::settings_row(i) else { break };
+            let Some(id) = tile::list_row(i) else { break };
             let dst = ui::widgets::focus_row_rect_at_px(content, i, scroll_px).offset(0, dy);
             // Rows scrolled fully out of the viewport cost nothing but this test; the ones
             // straddling an edge are cropped rather than allowed to paint over the chrome.
@@ -452,23 +458,19 @@ impl App {
             HomeFocus::Grid(_) | HomeFocus::Sidebar(_) | HomeFocus::SidebarMenu(_) => None,
         };
         let pad = ui::tiles::CARD_SHADOW_PAD;
-        let layout = self.grid_layout(columns);
-        // One layout and one section shape for the whole frame: both rescan the host's pin
-        // list, and every card rect below would otherwise rebuild them (see `home_focus_map`).
-        let sections = layout.sections(self.library.games.len());
-        let card_rect =
-            |idx| view::home::scrolled_card_rect(idx, columns, grid_x, available_w, sections, self.render.grid.scroll);
+        // One layout for the whole frame: every card rect below would otherwise rebuild it
+        // (see `home_focus_map`).
+        let layout = self.library.layout(columns);
+        let card_rect = |idx| view::home::scrolled_card_rect(idx, grid_x, available_w, layout, self.render.grid.scroll);
         // The on-screen window, computed rather than found by testing every card in the
         // library once per frame (`view::home::visible_cards`).
-        let visible = view::home::visible_cards(
-            count,
-            columns,
-            available_w,
-            sections,
-            self.render.grid.scroll,
-            screen_h as i32,
-            pad,
-        );
+        let visible = view::home::visible_cards(available_w, layout, self.render.grid.scroll, screen_h as i32, pad);
+        // While a held card's new place in its collection is unwritten, the rest of that
+        // collection is dimmed to the modal scrim's level: the block whose order is in flux,
+        // and nothing else. A scale on the card's own alpha rather than a `Fill` over it — a
+        // fill is a square rect and would square off the card's rounded corners.
+        let unfixed = self.reordering_slots(layout);
+        let dimmed = 1.0 - f32::from(ui::theme::palette().scrim.a) / 255.0;
         for idx in visible {
             if Some(idx) == focused {
                 continue; // drawn last, on top of its neighbors
@@ -485,7 +487,12 @@ impl App {
             let card = slot.id;
             // A card that just landed is still zooming up to full size.
             let pop = ui::animation::anim_frac(slot.pop, CARD_POP);
-            let alpha = (255.0 * pop) as u8;
+            let dim = if unfixed.as_ref().is_some_and(|s| s.contains(&idx)) {
+                dimmed
+            } else {
+                1.0
+            };
+            let alpha = (255.0 * pop * dim) as u8;
             cmds.push(DrawCmd::Tex {
                 tile: tile::CARD_SHADOW,
                 dst: ui::animation::pop_in_rect(r.inflate(pad), pop, CARD_POP_SHRINK),
@@ -497,29 +504,14 @@ impl App {
                 alpha,
             });
         }
-        // The two section headings, in place of the hairline that used to divide the blocks —
+        // One heading per section, in place of the hairline that used to divide the blocks —
         // scrolled with everything else (there's no separate fixed region), so they are just
         // tiles at their own scrolled positions, culled the same way. Bottom-aligned in their
         // band, sitting on the block they name.
-        for (shown, first_idx, id) in [
-            (sections.pinned_heading, 0, tile::SECTION_PINNED),
-            (
-                sections.library_heading,
-                sections.pinned_rows * columns.max(1),
-                tile::SECTION_LIBRARY,
-            ),
-        ] {
-            if !shown {
-                continue;
-            }
-            let band = view::home::section_heading_rect(
-                first_idx,
-                columns,
-                grid_x,
-                available_w,
-                sections,
-                self.render.grid.scroll,
-            );
+        for (i, (first_idx, _)) in layout.headings().enumerate() {
+            let Some(id) = tile::section(i) else { break };
+            let band =
+                view::home::section_heading_rect(first_idx, grid_x, available_w, layout, self.render.grid.scroll);
             if band.bottom() < 0 || band.y() > screen_h as i32 {
                 continue;
             }
@@ -538,9 +530,25 @@ impl App {
         }
         if let Some(idx) = focused {
             if let Some(pin_id) = layout.pin_id_at(&self.library.games, idx) {
-                self.compose_focused_card(tiles, cmds, pin_id, card_rect(idx), pad);
+                // The dip on the card's own rect, so the panel, its frost and the ring all
+                // ride it: on Home nothing else arms one (a card is not `pressable`), and
+                // an in-collection swap with nowhere to go is what does (see
+                // `App::swap_card_in_collection`).
+                let r = self.press_dip(Screen::Home).rect(card_rect(idx));
+                self.compose_focused_card(tiles, cmds, pin_id, r, pad);
             }
         }
+    }
+
+    /// The grid slots of the collection whose order a held card has changed and not yet
+    /// fixed, if any — what `compose_grid` dims. `None` is the usual case, and costs one
+    /// `Option` test.
+    fn reordering_slots(&self, layout: GridLayout<'_>) -> Option<Range<usize>> {
+        let menu = self.card_menu.as_ref().filter(|m| m.moved)?;
+        layout
+            .placed()
+            .find(|p| p.slots().contains(&menu.idx))
+            .map(|p| p.slots())
     }
 
     /// The focused card, drawn last and on top of its neighbours: its glow, contact shadow,
@@ -603,22 +611,6 @@ impl App {
             )),
             alpha: (255.0 * f * pop) as u8,
         });
-        if self.selected_known_host().is_some_and(|h| h.is_pinned(pin_id)) {
-            let badge = ui::tiles::PIN_BADGE_SIZE;
-            let badge_base = Rect::new(
-                r.right() - badge as i32 - PIN_BADGE_MARGIN,
-                r.y() + PIN_BADGE_MARGIN,
-                badge,
-                badge,
-            );
-            // Corner-anchored, so it only fades — scaling it around its
-            // own center would drift it off the shrunken card.
-            cmds.push(DrawCmd::Tex {
-                tile: tile::PIN_BADGE,
-                dst: ui::animation::zoom_rect(badge_base, f, CARD_GROWTH),
-                alpha: (255.0 * pop) as u8,
-            });
-        }
     }
 
     /// The blur under a focused card's glass, whether that is the one-line title strip or the
@@ -674,7 +666,11 @@ impl App {
         // so they can ride the growing window's top edge. Falls back to the plain
         // strip until all three are built, which is what the first frames after
         // launch see.
-        let menu = self.card_menu.as_ref().and_then(|_| {
+        // Collapsed to a bare title strip while the card is being reordered: the panel names
+        // what Confirm does, and mid-reorder Confirm means "leave it there" rather than any
+        // of its rows (see `App::fix_card_position`). Dropping to `None` here is the whole
+        // collapse — the arm below draws the plain strip.
+        let menu = self.card_menu.as_ref().filter(|m| !m.moved).and_then(|_| {
             tiles.get(tile::CARD_MENU_TITLE)?;
             Some((
                 tiles.get(tile::CARD_MENU).map(ui::Painter::height)?,
@@ -877,7 +873,8 @@ impl App {
         // by the same clock — the card keeps zooming for the whole fade.
         if let (Some(t), Some(idx)) = (self.launch_anim, self.launch_anim_idx) {
             let f = ui::animation::anim_frac(Some(t), hero::LAUNCH_FADE);
-            let base = self.scrolled_card_rect(idx, columns, grid_x, available_w);
+            let layout = self.library.layout(columns);
+            let base = view::home::scrolled_card_rect(idx, grid_x, available_w, layout, self.render.grid.scroll);
             if let Some(card) = self
                 .pin_id_at_grid_idx(idx, columns)
                 .and_then(|pin_id| self.render.grid.card_ids.get(pin_id))

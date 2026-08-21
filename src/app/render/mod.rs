@@ -20,9 +20,9 @@ pub(crate) struct ModalSnapshot {
 }
 
 impl ModalSnapshot {
-    /// Whether this fade still needs the settings row band — the snapshot says what it wants
-    /// kept, rather than the eviction rule reading its variant.
-    pub fn holds_settings_rows(&self) -> bool {
+    /// Whether this fade still needs the scroll-list row band — the snapshot says what it
+    /// wants kept, rather than the eviction rule reading its variant.
+    pub fn holds_list_rows(&self) -> bool {
         matches!(self.content, Some(SnapshotBody::Rows(..)))
     }
 }
@@ -36,7 +36,7 @@ pub(crate) enum SnapshotBody {
     /// `(src crop, dst rect)` of [`tile::MODAL_PREV_CONTENT`], a clone of the leaving
     /// screen's single body tile.
     Cropped(Rect, Rect),
-    /// Settings' row count, viewport, and the scroll offset frozen at the frame it was left.
+    /// A row list's count, viewport, and the scroll offset frozen at the frame it was left.
     /// Nothing is copied: the band outlives the screen (see `prepare_scroll`'s eviction), so
     /// the fade-out is the same handful of blits the live screen was.
     Rows(usize, Rect, i32),

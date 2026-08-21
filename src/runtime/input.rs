@@ -399,7 +399,7 @@ pub(super) fn home_key_fired(prev: &mut bool) -> bool {
 /// stops it on the way out, and `SDL_SetTextInputRect` tells webOS where the field is
 /// so the panel doesn't cover it. Committed text arrives as `Event::TextInput`.
 pub(super) fn text_input_screen(screen: Screen) -> bool {
-    matches!(screen, Screen::AddHost | Screen::EditHost)
+    matches!(screen, Screen::AddHost | Screen::EditHost | Screen::RenameCollection)
 }
 
 /// Edge-triggers Back off `held`: a repeat/OS-resent press while already held
@@ -452,7 +452,7 @@ pub(super) enum EventAction {
 /// and the OK press arm through here so the two gestures can never disagree about what a
 /// hold is; `screen_w` is the full screen width, the sidebar taken off inside.
 fn arm_card_hold(input: &mut UiInput, app: &App, screen_w: u32) -> bool {
-    let columns = crate::app::view::home::grid_columns(screen_w.saturating_sub(crate::ui::widgets::SIDEBAR_W));
+    let columns = crate::app::view::home::grid_columns_for_screen(screen_w);
     if app.focused_pin_id(columns).is_none() {
         return false;
     }
@@ -645,6 +645,7 @@ pub(super) fn handle_ui_event(
             // List-modal screens (row-per-page, not pixel scroll): one detent
             // moves focus exactly one row, same as an Up/Down key press.
             Screen::Settings(_)
+            | Screen::Collections
             | Screen::HostMenu
             | Screen::WakeSettings
             | Screen::Diagnostics
@@ -697,12 +698,19 @@ pub(super) fn handle_ui_event(
         // Direct digit entry via the remote's number buttons — PIN entry on the
         // pairing screen, IP entry on the add/edit-host screens.
         Event::KeyDown { keycode: Some(k), .. }
-            if matches!(app.nav.screen, Screen::Pairing | Screen::AddHost | Screen::EditHost) =>
+            if matches!(
+                app.nav.screen,
+                Screen::Pairing | Screen::AddHost | Screen::EditHost | Screen::RenameCollection
+            ) =>
         {
             if let Some(digit) = crate::platform::webos::input::digit_key_value(k) {
                 match app.nav.screen {
                     Screen::Pairing => app.enter_pin_digit(digit),
                     Screen::AddHost | Screen::EditHost => app.enter_add_host_digit(digit),
+                    // A digit is an ordinary character in a name.
+                    Screen::RenameCollection => {
+                        app.enter_collection_name_char((b'0' + digit) as char);
+                    }
                     _ => unreachable!(),
                 }
                 return EventAction::Next;
@@ -734,6 +742,11 @@ pub(super) fn handle_ui_event(
                 Screen::AddHost | Screen::EditHost => {
                     for c in text.chars() {
                         app.enter_host_address_char(c);
+                    }
+                }
+                Screen::RenameCollection => {
+                    for c in text.chars() {
+                        app.enter_collection_name_char(c);
                     }
                 }
                 _ => {}

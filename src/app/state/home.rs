@@ -1,15 +1,13 @@
 //! Home screen logic: sidebar/grid navigation, host selection, game library fetch,
 //! launching. Grid pixel geometry (rect helpers) lives in `app::view::home`.
-use crate::app::grid::{GridCard, GridLayout};
 use crate::app::hosts::HostEntry;
 use crate::app::nav::ScreenKey;
-use crate::app::state::addhost::AddHostState;
+use crate::app::state::textfield::TextField;
 use crate::app::view;
 use crate::app::App;
 use crate::app::ConnectTarget;
 use crate::core::event::MenuEvent;
 use crate::core::screen::{HomeFocus, Screen, SettingsScope};
-use crate::services::store::{self};
 use crate::ui;
 use std::time::Instant;
 
@@ -26,51 +24,38 @@ impl App {
         self.hosts.entries.len() + 2
     }
 
-    /// Grid shape at `columns` columns — plain field reads (see [`App::desktop_pin`]), so a
-    /// caller in a loop may still prefer to hoist it.
-    pub(crate) fn grid_layout(&self, columns: usize) -> GridLayout {
-        GridLayout::new(
-            self.library.pinned_count,
-            self.library.desktop_pin,
-            self.library.games_loaded,
-            columns,
-        )
-    }
-
+    /// Read-only forwards to [`Library`](crate::app::library::Library)'s geometry, for the
+    /// call sites that only need one answer. Anything that then mutates `self` must go
+    /// through `self.library` directly: a `GridLayout` borrows the library alone, where one
+    /// of these borrows the whole of `App`.
+    ///
     /// Total grid nav positions — `0` (no cards at all) only when no host is
     /// selected yet, or one's selected but hasn't answered a library fetch yet.
     pub(crate) fn grid_len(&self, columns: usize) -> usize {
         if self.library.selected_host.is_none() {
             return 0;
         }
-        self.grid_layout(columns).len(self.library.games.len())
-    }
-
-    /// The grid's vertical section shape at `columns` columns — what every card rect and the
-    /// scroll extent are offset by (see `GridLayout::sections`). Callers already holding a
-    /// `GridLayout` should ask it directly rather than rebuild one through here.
-    pub(crate) fn grid_sections(&self, columns: usize) -> view::home::GridSections {
-        self.grid_layout(columns).sections(self.library.games.len())
+        self.library.grid_len(columns)
     }
 
     /// The card at grid index `idx`, or `None` for the padding after a partial
-    /// pinned row, or out of range.
-    pub(crate) fn grid_card_at(&self, idx: usize, columns: usize) -> Option<GridCard<'_>> {
-        self.grid_layout(columns).card_at(&self.library.games, idx)
+    /// section row, or out of range.
+    pub(crate) fn grid_card_at(&self, idx: usize, columns: usize) -> Option<&crate::core::model::GameEntry> {
+        self.library.card_at(idx, columns)
     }
 
     /// The pin id for whatever's at grid index `idx` — see `GridLayout::pin_id_at`.
     pub(crate) fn pin_id_at_grid_idx(&self, idx: usize, columns: usize) -> Option<&str> {
-        self.grid_layout(columns).pin_id_at(&self.library.games, idx)
+        self.library.pin_id_at(idx, columns)
     }
 
     /// Inverse of `pin_id_at_grid_idx`: grid index for a pin ID, keeping focus after reorder.
     pub(crate) fn grid_idx_for_pin_id(&self, id: &str, columns: usize) -> Option<usize> {
-        self.grid_layout(columns).idx_for_pin_id(&self.library.games, id)
+        self.library.idx_for_pin_id(id, columns)
     }
 
     /// Whether grid index `idx` is an actual card rather than empty padding
-    /// after a partial pinned row.
+    /// after a partial section row.
     pub(crate) fn is_grid_card(&self, idx: usize, columns: usize) -> bool {
         self.grid_card_at(idx, columns).is_some()
     }
@@ -129,22 +114,14 @@ impl App {
         }
 
         // One layout for the whole sweep: `is_grid_card`/`unscrolled_card_rect` would
-        // each rebuild it — and rescan the host's pin list — for every card.
-        let layout = self.grid_layout(columns);
-        let sections = layout.sections(self.library.games.len());
-        let grid_len = if self.library.selected_host.is_some() {
-            layout.len(self.library.games.len())
-        } else {
-            0
-        };
+        // each rebuild it for every card.
+        let layout = self.library.layout(columns);
         // Only the cards a single move can actually reach (see `view::home::focus_window`) —
         // one item per card in the library made every keypress allocate and rescan the whole
         // list to answer a question about its immediate neighbours.
         let focus_window = view::home::focus_window(
-            grid_len,
-            columns,
             available_w,
-            sections,
+            layout,
             self.render.grid.scroll_target,
             screen_h as i32,
             match self.home_focus {
@@ -156,8 +133,7 @@ impl App {
             if layout.card_at(&self.library.games, idx).is_none() {
                 continue;
             }
-            let r =
-                view::home::unscrolled_card_rect(idx, columns, ui::widgets::SIDEBAR_W as i32, available_w, sections);
+            let r = view::home::unscrolled_card_rect(idx, ui::widgets::SIDEBAR_W as i32, available_w, layout);
             // Screen space, at the scroll the grid is easing *toward* — so that a move
             // crossing into the sidebar compares against its rows on equal terms.
             map.item(
@@ -174,7 +150,7 @@ impl App {
     /// `home_focus_map`). Layout holes, the pinned-row split and the row/⋯ split all
     /// fall out of the rects themselves.
     fn navigate_home(&mut self, dir: ui::focus::Dir, screen_w: u32, screen_h: u32) {
-        let columns = view::home::grid_columns(screen_w.saturating_sub(ui::widgets::SIDEBAR_W));
+        let columns = view::home::grid_columns_for_screen(screen_w);
         let Some(next) = self
             .home_focus_map(columns, screen_w, screen_h)
             .navigate(self.home_focus, dir)
@@ -209,7 +185,7 @@ impl App {
                     self.confirm_sidebar_host(i);
                 }
                 HomeFocus::Sidebar(i) if i == self.hosts.entries.len() => {
-                    self.screens.add_host = AddHostState::default();
+                    self.screens.add_host = TextField::ipv4();
                     self.nav.screen = Screen::AddHost;
                 }
                 HomeFocus::Sidebar(_) => {
@@ -247,115 +223,68 @@ impl App {
         }
     }
 
-    /// Toggles focused card pin state and reorders the grid; opens pin-limit
-    /// alert on overflow.
-    pub(crate) fn toggle_focused_pin(&mut self, screen_w: u32, screen_h: u32) {
-        let available_w = screen_w.saturating_sub(ui::widgets::SIDEBAR_W);
-        let columns = view::home::grid_columns(available_w);
-        let HomeFocus::Grid(old_idx) = self.home_focus else {
+    /// Moves the focused card into collection `to` (or back to Library with `None`),
+    /// regroups the grid and carries focus with it. The one path every move takes — the card
+    /// menu's Remove, and the Collections screen's confirm.
+    pub(crate) fn move_focused_card(&mut self, to: Option<usize>, screen_w: u32, screen_h: u32) {
+        let columns = view::home::grid_columns_for_screen(screen_w);
+        let HomeFocus::Grid(idx) = self.home_focus else {
             return;
         };
-        let Some(id) = self.pin_id_at_grid_idx(old_idx, columns).map(str::to_string) else {
+        let Some(id) = self.pin_id_at_grid_idx(idx, columns).map(str::to_string) else {
             return;
         };
-        let Some(known) = self.selected_known_host() else {
-            return;
-        };
-        if !known.can_toggle_pin(&id) {
-            // At MAX_PINNED_GAMES already — explain instead of a silent no-op.
-            self.open_pin_limit();
-            return;
-        }
-        let was_pinned = known.is_pinned(&id);
+        self.move_card(&id, to, columns, screen_w, screen_h);
+    }
 
-        let Some(known) = self.selected_known_host_mut() else {
-            return;
+    /// [`Self::move_focused_card`] for a card named by id — what the collections modal
+    /// confirms with, since the card it targets need not be the focused one by then.
+    /// `false` when the card already sits in `to` and nothing moved.
+    pub(crate) fn move_card(&mut self, id: &str, to: Option<usize>, columns: usize, screen_w: u32, screen_h: u32) -> bool {
+        let Some(known) = self.selected_known_host() else {
+            return false;
         };
-        known.toggle_pin(&id);
+        if known.collection_of(id) == to {
+            return false;
+        }
+        let Some(known) = self.selected_known_host_mut() else {
+            return false;
+        };
+        known.move_to(id, to);
         self.persist();
 
-        self.reorder_games_by_pin();
-        if let Some(new_idx) = self.grid_idx_for_pin_id(&id, columns) {
+        self.regroup_games();
+        if let Some(new_idx) = self.grid_idx_for_pin_id(id, columns) {
             self.home_focus = HomeFocus::Grid(new_idx);
             self.render.grid.focus_last = new_idx;
             self.ensure_grid_visible(new_idx, columns, screen_w, screen_h);
         }
-        self.replay_reorder_pop(&id, was_pinned, columns);
+        // Only the card that moved pops. Every other card slides one slot along — a shift the
+        // eye already follows — and re-arming the whole reshuffled tail read as the grid
+        // reloading rather than as one card changing places.
+        self.render.grid.arm_card_pop(id, Instant::now());
+        true
     }
 
-    /// Reorder's appear animation — the same "every card pops in together" look
-    /// as a fresh library reveal (see `app::spinner::GridReveal`), scoped to what
-    /// actually needs it: the newly pinned card alone (top row — an already-
-    /// pinned card that just changed order doesn't replay), plus every card in
-    /// the unpinned "rest" section, which reshuffles regardless of direction.
-    /// Card tiles themselves need no rebuilding either way — they're keyed by
-    /// pin id (see `card_tiles`), which reordering never changes.
-    fn replay_reorder_pop(&mut self, id: &str, was_pinned: bool, columns: usize) {
-        let now = Instant::now();
-        let layout = self.grid_layout(columns);
-        // Driven off what is rasterized, not off the library: a card outside the scroll window
-        // has no pop on screen to replay, and `prepare_grid` arms its clock when it is built.
-        // Off the whole library this armed a clock per game, for cards with no tile to show
-        // one on. The pinned block is the grid's first `front_count` indices, so
-        // "in the rest section" is decidable from a set bounded by `MAX_PINNED_GAMES`.
-        let pinned: std::collections::HashSet<&str> = (0..layout.front_count)
-            .filter_map(|idx| layout.pin_id_at(&self.library.games, idx))
-            .collect();
-        let rest_ids: Vec<String> = self
-            .render
-            .grid
-            .card_ids
-            .pin_ids()
-            .filter(|id| !pinned.contains(id))
-            .map(str::to_string)
-            .collect();
-        // Re-arm the pop clock unconditionally (not gated on a built tile like the old
-        // per-`CardTile` clock): a not-yet-built card has no visible pop to replay, and
-        // its clock is overwritten with a fresh one when `prepare_grid` builds it.
-        if !was_pinned {
-            self.render.grid.arm_card_pop(id, now);
-        }
-        for pin_id in rest_ids {
-            self.render.grid.arm_card_pop(&pin_id, now);
-        }
-    }
-
-    /// Re-sorts games: pinned first (in pin order), rest untouched. A pin for a game
-    /// not currently listed just doesn't sort — it is *not* dropped here, because this
-    /// runs on every pin toggle and a host that failed to answer has an empty
-    /// `self.library.games`. Dropping is [`App::prune_stale_game_prefs`]'s job.
-    pub(crate) fn reorder_games_by_pin(&mut self) {
-        let Some(known_idx) = self.selected_known_host_idx() else {
-            self.clear_grid_pins();
-            return;
-        };
-        self.library.desktop_pin = self.hosts.known[known_idx].is_pinned(store::DESKTOP_PIN_ID);
-        let pinned_ids: Vec<String> = self.hosts.known[known_idx]
-            .pinned_ids()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let mut pinned = Vec::new();
-        for id in &pinned_ids {
-            // Desktop isn't in `self.library.games`, so it never sorts here.
-            if let Some(pos) = self.library.games.iter().position(|g| &g.id == id) {
-                pinned.push(self.library.games.remove(pos));
+    /// Re-lays the grid out over the selected host's collections — see
+    /// [`Library::regroup`](crate::app::library::Library::regroup). Every path that changes a
+    /// collection, the selected host or the library ends here.
+    pub(crate) fn regroup_games(&mut self) {
+        match self.selected_known_host_idx() {
+            Some(idx) => {
+                // Split the borrow: `regroup` needs the host record while it rewrites the
+                // library, and both live on `self`.
+                let host = std::mem::take(&mut self.hosts.known[idx]);
+                self.library
+                    .regroup(&host, self.recents.for_host(&host.host, host.port));
+                self.hosts.known[idx] = host;
             }
+            None => self.library.clear_groups(),
         }
-        self.library.pinned_count = pinned.len();
-        pinned.append(&mut self.library.games);
-        self.library.games = pinned;
     }
 
-    /// Forgets the pin state the grid is drawn from — for the paths that drop the library
-    /// itself, where there is no host left to recompute it from.
-    fn clear_grid_pins(&mut self) {
-        self.library.pinned_count = 0;
-        self.library.desktop_pin = false;
-    }
-
-    /// Drops per-game state (pins *and* settings overrides) for games the host no longer
-    /// lists — otherwise a removed game keeps counting toward `MAX_PINNED_GAMES` and its
+    /// Drops per-game state (collection membership *and* settings overrides) for games the
+    /// host no longer lists — otherwise a removed game keeps a slot in its collection and its
     /// overrides linger forever.
     ///
     /// Call only from the success arm of [`App::drain_games`]: `self.library.games` is empty
@@ -366,8 +295,16 @@ impl App {
             return;
         };
         let live: std::collections::HashSet<&str> = self.library.games.iter().map(|g| g.id.as_str()).collect();
+        let (host, port) = (
+            self.hosts.known[known_idx].host.clone(),
+            self.hosts.known[known_idx].port,
+        );
         if self.hosts.known[known_idx].prune_games(|id| live.contains(id)) {
             self.persist();
+        }
+        // The play times go the same way, or `recents.json` keeps ids nothing can reach.
+        if self.recents.prune(&host, port, |id| live.contains(id)) {
+            self.recents.save();
         }
     }
 
@@ -391,7 +328,7 @@ impl App {
     /// everything already fits on screen.
     pub(crate) fn max_grid_scroll(&self, columns: usize, available_w: u32, screen_h: u32) -> i32 {
         let viewport_h = screen_h as i32 - view::home::GRID_PAD - view::home::GRID_TOP_Y;
-        let extra = self.grid_sections(columns).total_extra();
+        let extra = self.library.layout(columns).total_extra();
         (view::home::grid_layer_height(self.grid_len(columns), columns, available_w) as i32 + extra
             - 2 * view::home::GRID_LAYER_PAD
             - viewport_h)
@@ -452,10 +389,7 @@ impl App {
     /// its grid stays on screen with no row to go back to.
     pub(crate) fn clear_selected_host(&mut self) {
         self.library.selected_host = None;
-        self.library.games = Vec::new();
-        self.library.games_loaded = false;
-        self.clear_grid_pins();
-        self.library.art.clear();
+        self.library.clear();
         self.jobs.cancel_library();
         self.set_home_status(None, false);
         self.home_focus = HomeFocus::Sidebar(0);
@@ -477,10 +411,7 @@ impl App {
         // launch left on screen. The reload `App::new` starts is not this — it runs before
         // `home_status_sticky` is ever set.
         self.set_home_status(Some(format!("Loading library from {name}…")), false);
-        self.library.games = Vec::new();
-        self.clear_grid_pins();
-        self.library.games_loaded = false;
-        self.library.art.clear();
+        self.library.clear();
         // Dropping the loader stops its worker (its request channel closes), so a host
         // switch abandons in-flight fetches for the previous library.
         self.jobs.art = None;
@@ -525,13 +456,7 @@ impl App {
             result,
         } = loaded;
         match result {
-            Ok(mut games) => {
-                // The host returns its own scan order, which is neither stable nor
-                // meaningful to a reader. On a TV the grid is navigated a card at a time
-                // with a d-pad, so alphabetical is the difference between "find the game"
-                // and "sweep the whole library". Case-insensitive so casing doesn't
-                // scatter otherwise-adjacent titles.
-                games.sort_by_key(|g| g.title.to_lowercase());
+            Ok(games) => {
                 tracing::info!("library: {} games from {host}:{mgmt_port}", games.len());
                 let identity = (self.identity.0.clone(), self.identity.1.clone());
                 let known = self.hosts.known.iter().find(|h| h.host == host && h.port == port);
@@ -546,8 +471,7 @@ impl App {
                     fingerprint,
                     self.render.grid.card_size,
                 ));
-                self.library.games = games;
-                self.library.games_loaded = true;
+                self.library.load_games(games);
                 // Hand the grid the focus `select_host` held back — only if the user hasn't
                 // navigated off that row, so a late fetch can't yank them.
                 if matches!(self.home_focus, HomeFocus::Sidebar(i) if Some(i) == self.sidebar_index_of_selected_host())
@@ -563,7 +487,7 @@ impl App {
                     self.set_home_status(Some(crate::app::state::cardmenu::INTRO_HINT.to_string()), false);
                 }
                 self.prune_stale_game_prefs();
-                self.reorder_games_by_pin();
+                self.regroup_games();
             }
             Err(e) => {
                 tracing::warn!("library fetch failed ({host}:{mgmt_port}): {e}");
@@ -595,7 +519,8 @@ impl App {
         } else {
             // The host answered — just not with a usable library — so Desktop is a
             // legitimate fallback here, unlike the `Unreachable` branch above.
-            self.library.games_loaded = true;
+            self.library.load_games(Vec::new());
+            self.regroup_games();
             self.set_home_status(Some(reason), false);
         }
     }
@@ -618,9 +543,11 @@ impl App {
         let Some(fingerprint) = known.fingerprint else {
             return;
         };
+        // Desktop is the host's own session rather than a game it lists, so it launches with
+        // no id — the one thing left that tells it apart from any other card.
         let launch = match self.grid_card_at(idx, columns) {
-            Some(GridCard::Desktop) => None,
-            Some(GridCard::Game(game)) => Some(game.id.clone()),
+            Some(game) if game.id == crate::core::model::DESKTOP_PIN_ID => None,
+            Some(game) => Some(game.id.clone()),
             None => return,
         };
         // The loading screen's backdrop. Desktop has no art, so it keeps the plain fade to
@@ -674,6 +601,9 @@ impl App {
         };
         let (host, port) = (h.host.clone(), h.port);
         self.hosts.known.retain(|k| !(k.host == host && k.port == port));
+        if self.recents.forget_host(&host, port) {
+            self.recents.save();
+        }
         crate::services::art::reconcile_host_caches(&self.hosts.known);
         self.rebuild_entries();
         if self.library.selected_host.as_ref() == Some(&(host, port)) {
