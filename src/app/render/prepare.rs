@@ -47,7 +47,7 @@ impl App {
             // that would otherwise be reallocated on every host list change.
             // The outer condition has already decided this is stale, so the version just
             // has to differ from the last one — `ensure_in_place` would otherwise see an
-            // unchanged `STATIC` and skip the rebuild it was called to do.
+            // unchanged `static_version` and skip the rebuild it was called to do.
             self.render.sidebar_gen = self.render.sidebar_gen.wrapping_add(1);
             tiles.ensure_in_place(
                 tile::SIDEBAR,
@@ -166,10 +166,10 @@ impl App {
             .scroll_src_rect(left, screen_w, screen_h, fonts)
             .zip(body)
             .map(|((src, dst), body)| (body, src, dst));
-        tiles.put(tile::MODAL_PREV, cache::STATIC, shell);
+        tiles.put(tile::MODAL_PREV, cache::static_version(), shell);
         updated.push(tile::MODAL_PREV);
         let content = content.map(|(body, src, dst)| {
-            tiles.put(tile::MODAL_PREV_CONTENT, cache::STATIC, body);
+            tiles.put(tile::MODAL_PREV_CONTENT, cache::static_version(), body);
             updated.push(tile::MODAL_PREV_CONTENT);
             (src, dst)
         });
@@ -394,8 +394,18 @@ impl App {
             Some(_) => !tiles.contains(tile::MODAL) || self.render.modal.shell_version != shell_version,
             None => content_dirty || !tiles.contains(tile::MODAL),
         };
-        self.render.modal.shell_version = shell_version;
-        if modal_open && (screen_changed || modal_stale) {
+        // A list modal bakes its rows into the shell, and its shell key carries their values —
+        // so flipping a toggle invalidates the whole card. Re-rastering it (glass blur included)
+        // costs more than the 140ms slide, which then never gets a frame: the knob is already at
+        // the far end by the time the card comes back. The focused row is drawn by
+        // `tile::MODAL_FOCUS` on top of the shell anyway, so the stale shell underneath shows
+        // nothing wrong; the rebuild lands the tick after `switch_anim` retires. Settings needs
+        // none of this — its shell key holds no values (its rows are tiles of their own).
+        let defer_shell = self.render.modal.switch_anim.is_some() && tiles.contains(tile::MODAL) && !screen_changed;
+        if !defer_shell {
+            self.render.modal.shell_version = shell_version;
+        }
+        if modal_open && !defer_shell && (screen_changed || modal_stale) {
             // Sized to the card's bounding box, not the whole screen: the render fns
             // below draw at absolute, screen-centered coordinates, and the painter's
             // origin shift (see `Painter::set_origin`) maps that geometry into the
@@ -409,9 +419,9 @@ impl App {
             self.with_modal_screen(|s| s.render(c, hover_close)).transpose()?;
             // Staleness was already decided above, against `modal.shell_version` rather than
             // against the store — the keyless screens have no version to compare, so they turn
-            // on `content_dirty` instead. Hence `STATIC` here: the store is told to keep this
+            // on `content_dirty` instead. Hence `static_version` here: the store is told to keep this
             // until something removes it, not to arbitrate.
-            tiles.put(tile::MODAL, cache::STATIC, p);
+            tiles.put(tile::MODAL, cache::static_version(), p);
             updated.push(tile::MODAL);
         }
         // Whichever modal is open has at most one focused, zoom-animated widget
@@ -580,7 +590,7 @@ impl App {
 
             let focused = cache::version(&(self.nav.screen, dd.row, dd.focused));
             if tiles.ensure(tile::DROPDOWN_FOCUS, focused, || {
-                let option = options.get(dd.focused).map_or("", String::as_str);
+                let option = options.get(dd.focused).map_or("", AsRef::as_ref);
                 ui::rasterize(
                     ui::widgets::DropdownOptionTile {
                         option,
@@ -657,30 +667,6 @@ impl App {
                 )
             })? {
                 updated.push(tile::SCROLL_INDICATOR);
-            }
-            // Static ramps, so these are once-per-run bakes rather than keyed rebuilds —
-            // scrolling and resizing both leave them valid (the GPU restretches them).
-            if tiles.ensure_static(tile::SCROLL_FADE, || {
-                ui::rasterize(
-                    ui::widgets::ScrollFadeTile {
-                        edge: ui::widgets::FadeEdge::Bottom,
-                    },
-                    text_cache,
-                    fonts,
-                )
-            })? {
-                updated.push(tile::SCROLL_FADE);
-            }
-            if tiles.ensure_static(tile::SCROLL_FADE_TOP, || {
-                ui::rasterize(
-                    ui::widgets::ScrollFadeTile {
-                        edge: ui::widgets::FadeEdge::Top,
-                    },
-                    text_cache,
-                    fonts,
-                )
-            })? {
-                updated.push(tile::SCROLL_FADE_TOP);
             }
             let stride = self.scroll_stride(fonts);
             self.sync_modal_scroll(self.nav.screen, total, visible, content.height(), stride);
@@ -850,7 +836,7 @@ impl App {
                             font: ctx.fonts.label,
                             text: s,
                             max_w,
-                            color: ui::style::theme().muted,
+                            color: ui::theme::palette().muted,
                             line_gap: 6,
                         },
                         ctx.text,

@@ -77,6 +77,9 @@ pub enum SettingsRow {
     /// this list: neither is something a user sets more than once, and pairing them makes the
     /// gesture toggle discoverable next to the capture mode it interacts with.
     Cursor,
+    /// Which look the menus draw in — see `ui::theme::PRESETS`. Cosmetic and device-wide, so
+    /// it is on the global list only, and applies the moment it is picked.
+    Theme,
     /// Not a setting — a link to `Screen::Experimental` (unstable toggles: NDL audio offload,
     /// and Game mode on rooted sets). Grouped off the main list so an untested option isn't
     /// one keystroke away.
@@ -97,7 +100,7 @@ pub enum SettingsRow {
 }
 
 /// The global list, in display order.
-const GLOBAL_ROWS: [SettingsRow; 12] = [
+const GLOBAL_ROWS: [SettingsRow; 13] = [
     SettingsRow::Resolution,
     SettingsRow::Framerate,
     SettingsRow::Bitrate,
@@ -107,6 +110,7 @@ const GLOBAL_ROWS: [SettingsRow; 12] = [
     SettingsRow::Audio,
     SettingsRow::Gamepad,
     SettingsRow::Cursor,
+    SettingsRow::Theme,
     SettingsRow::Experimental,
     SettingsRow::Diagnostics,
     SettingsRow::About,
@@ -290,6 +294,7 @@ fn row_fields(row: SettingsRow) -> &'static [OverrideField] {
         // Rows that override nothing: the backend is a process-global, and the rest are links
         // out or an action.
         SettingsRow::VideoBackend
+        | SettingsRow::Theme
         | SettingsRow::Experimental
         | SettingsRow::Diagnostics
         | SettingsRow::About
@@ -311,7 +316,7 @@ pub fn override_is_set(over: &SettingsOverride, row: SettingsRow) -> bool {
 /// since a lock explains why the row can't be used at all. The colour lives here rather than
 /// in `ui`, which knows only that some rows carry a mark.
 pub fn decorate_override(row: &mut FocusRow, over: &SettingsOverride, logical: SettingsRow, focused: bool) {
-    row.mark = override_is_set(over, logical).then(|| crate::ui::style::theme().warning);
+    row.mark = override_is_set(over, logical).then(|| crate::ui::theme::palette().warning);
     if row.mark.is_some() && focused && row.subtext.is_none() {
         row.subtext = Some(RowSubtext::hint("Delete to use the global setting"));
     }
@@ -384,11 +389,8 @@ pub fn log_level_label(l: LogLevelOverride) -> &'static str {
 /// Diagnostics' one dropdown row — options list + current index, same shape as
 /// `dropdown_options`/`dropdown_current_index` but for `Screen::Diagnostics`
 /// rather than a `Settings` row (there is no row-index namespace to share).
-pub fn log_level_dropdown_options() -> Vec<String> {
-    LOG_LEVEL_OPTIONS
-        .iter()
-        .map(|&l| log_level_label(l).to_string())
-        .collect()
+pub fn log_level_dropdown_options() -> Vec<Label> {
+    LOG_LEVEL_OPTIONS.iter().map(|&l| log_level_label(l).into()).collect()
 }
 
 pub fn log_level_dropdown_current_index(level: LogLevelOverride) -> usize {
@@ -470,28 +472,35 @@ fn video_backend_label(backend: VideoBackend) -> &'static str {
     }
 }
 
+/// One dropdown option's label. A `Cow`, because most rows offer `&'static str` constants and
+/// only three (resolution, framerate, the detected-gamepad line) format anything: the open
+/// dropdown's labels are rebuilt every frame it is up, so a `String` per option per frame is
+/// an allocation storm for text that is usually already in the binary.
+pub type Label = std::borrow::Cow<'static, str>;
+
 /// Dropdown labels for a row.
-pub fn dropdown_options(row: SettingsRow, detected: Option<GamepadType>) -> Vec<String> {
+pub fn dropdown_options(row: SettingsRow, detected: Option<GamepadType>) -> Vec<Label> {
     match row {
+        SettingsRow::Theme => crate::ui::theme::PRESETS.iter().map(|t| t.name.into()).collect(),
         SettingsRow::VideoBackend => VIDEO_BACKENDS.iter().map(|&b| video_backend_label(b).into()).collect(),
         SettingsRow::Resolution => RESOLUTIONS
             .iter()
-            .map(|(w, h, _, name)| resolution_dropdown_label(*w, *h, name))
+            .map(|(w, h, _, name)| resolution_dropdown_label(*w, *h, name).into())
             .collect(),
-        SettingsRow::Framerate => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz")).collect(),
+        SettingsRow::Framerate => REFRESH_RATES.iter().map(|hz| format!("{hz} Hz").into()).collect(),
         SettingsRow::Codec => video_caps()
             .codec_prefs()
             .iter()
-            .map(|&p| codec_label(p).to_string())
+            .map(|&p| codec_label(p).into())
             .collect(),
-        SettingsRow::Audio => audio_channel_options().iter().map(|(_, s)| (*s).to_string()).collect(),
+        SettingsRow::Audio => audio_channel_options().iter().map(|(_, s)| (*s).into()).collect(),
         SettingsRow::Gamepad => GAMEPAD_TYPES
             .iter()
             .map(|&t| {
                 if t == GamepadType::Auto {
-                    gamepad_auto_label(detected)
+                    gamepad_auto_label(detected).into()
                 } else {
-                    gamepad_label(t).to_string()
+                    gamepad_label(t).into()
                 }
             })
             .collect(),
@@ -503,6 +512,7 @@ pub fn dropdown_options(row: SettingsRow, detected: Option<GamepadType>) -> Vec<
 /// path needs only the count, and `dropdown_options` allocates a `String` per entry.
 pub fn dropdown_option_count(row: SettingsRow) -> usize {
     match row {
+        SettingsRow::Theme => crate::ui::theme::PRESETS.len(),
         SettingsRow::VideoBackend => VIDEO_BACKENDS.len(),
         SettingsRow::Resolution => RESOLUTIONS.len(),
         SettingsRow::Framerate => REFRESH_RATES.len(),
@@ -516,6 +526,10 @@ pub fn dropdown_option_count(row: SettingsRow) -> usize {
 /// Current dropdown index for a row's setting.
 pub fn dropdown_current_index(settings: &Settings, row: SettingsRow) -> usize {
     match row {
+        SettingsRow::Theme => crate::ui::theme::PRESETS
+            .iter()
+            .position(|t| t.choice == settings.theme)
+            .unwrap_or(0),
         SettingsRow::Resolution => RESOLUTIONS
             .iter()
             .position(|(w, h, _, _)| *w == settings.width && *h == settings.height)
@@ -558,6 +572,11 @@ pub fn apply_dropdown_choice(
         return;
     }
     match row {
+        SettingsRow::Theme => {
+            if let Some(t) = crate::ui::theme::PRESETS.get(choice_index) {
+                settings.theme = t.choice;
+            }
+        }
         SettingsRow::Resolution => {
             if let Some((w, h, _, _)) = RESOLUTIONS.get(choice_index) {
                 settings.width = *w;
@@ -647,6 +666,7 @@ pub fn adjust_setting(settings: &mut Settings, row: SettingsRow, forward: bool, 
         // is which.
         SettingsRow::Resolution
         | SettingsRow::Framerate
+        | SettingsRow::Theme
         | SettingsRow::VideoBackend
         | SettingsRow::Codec
         | SettingsRow::Audio

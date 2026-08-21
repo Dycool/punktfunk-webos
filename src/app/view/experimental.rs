@@ -16,8 +16,8 @@ use anyhow::Result;
 pub const TITLE: &str = "Experimental";
 pub const SUBTITLE: &str = "Unstable, off by default.";
 
-/// The software-audio override, and Game mode. All off by default. `rooted` is the root-probe
-/// verdict, `None` while it is still running.
+/// The software-audio override and Game mode. `rooted` is the root-probe verdict, `None`
+/// while it is still running.
 pub fn rows(settings: &Settings, rooted: Option<bool>) -> Vec<FocusRow> {
     // Opt-in, not the default: the audio-enabled load is rejected on at least some webOS 5+ sets
     // and takes the video plane down with it (black picture, sound fine — see

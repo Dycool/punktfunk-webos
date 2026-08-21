@@ -320,6 +320,32 @@ pub enum VideoBackend {
     Smp,
 }
 
+/// Which look the menus draw in, picked on the Settings screen — the persisted name of a
+/// `ui::theme` preset, and the only part of a theme that belongs to the domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeChoice {
+    #[default]
+    Default,
+    DefaultGlossy,
+}
+
+/// Anything but a name this build knows deserializes to [`ThemeChoice::default`].
+///
+/// Hand-written rather than derived: a derived enum rejects an unknown string, and since
+/// `Settings` is loaded with one `from_value` that error would discard the *whole* document
+/// — every real setting lost to a cosmetic field written by a build that had one more look.
+impl<'de> Deserialize<'de> for ThemeChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Through `Value` so any JSON shape at all lands here rather than failing to parse.
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(match v.as_str() {
+            Some("default_glossy") => Self::DefaultGlossy,
+            _ => Self::Default,
+        })
+    }
+}
+
 /// Codec preference selectable in Settings — a *preference*, not a demand. The host
 /// resolves the session codec from the client's advertised set via its own precedence
 /// ladder (HEVC > H.264), honouring the preference only when its encoder can
@@ -497,6 +523,9 @@ pub struct Settings {
     /// no working Red button then has no other way to left-click. Off also means no added
     /// wait on the release.
     pub cursor_gestures: bool,
+    /// Which look the menus draw in — see [`ThemeChoice`]. Cosmetic and purely local, so it
+    /// applies the moment it is picked rather than on the next launch.
+    pub theme: ThemeChoice,
 }
 
 impl Default for Settings {
@@ -522,6 +551,7 @@ impl Default for Settings {
             game_mode: false,
             ndl_audio_offload: false,
             cursor_gestures: false,
+            theme: ThemeChoice::default(),
         }
     }
 }

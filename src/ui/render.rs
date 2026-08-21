@@ -113,6 +113,21 @@ impl Color {
     pub const fn RGB(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 255 }
     }
+
+    /// `self` moved `t/255` of the way toward `other`, keeping `self`'s alpha — a shade
+    /// derived from two palette entries rather than a third hex typed beside them.
+    #[must_use]
+    pub const fn mix(self, other: Self, t: u8) -> Self {
+        const fn lerp(a: u8, b: u8, t: u8) -> u8 {
+            ((a as u16 * (255 - t as u16) + b as u16 * t as u16) / 255) as u8
+        }
+        Self {
+            r: lerp(self.r, other.r, t),
+            g: lerp(self.g, other.g, t),
+            b: lerp(self.b, other.b, t),
+            a: self.a,
+        }
+    }
 }
 
 /// One cached tile's identity: an opaque number the *app* assigns.
@@ -150,6 +165,86 @@ pub enum DrawCmd {
         rect: Rect,
         color: Color,
     },
+    /// Frosted glass — see [`FrostPane`].
+    /// Boxed: a pane is far larger than any other variant's payload, and `DrawCmd` is stored
+    /// by value in a per-frame `Vec` that the stream path fills without ever frosting.
+    Frost(Box<FrostPane>),
+}
+
+/// Which corners of a [`FrostPane`] are rounded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Corners {
+    All,
+    /// Bottom two only — a panel whose top edge is a straight cut across whatever it sits on
+    /// (a card's title strip, the submenu grown out of it).
+    Bottom,
+}
+
+/// The shape a [`FrostPane`]'s blur is cut to: a rounded rect at `radius`, on `corners`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FrostMask {
+    pub radius: i32,
+    pub corners: Corners,
+}
+
+/// One frosted-glass pane: blur whatever this frame has already composed under it, cut the
+/// blur to a rounded shape, and draw it. What a translucent surface is drawn *over* — the
+/// tile that follows supplies the tint, the border and the text.
+///
+/// The blur source is everything earlier in the draw list, so a pane only ever sees the
+/// layers beneath it.
+///
+/// One depth per frame: the compositor captures the frame once, at the *first* pane, and every
+/// pane in that frame samples that capture. Two panes at the same depth are therefore fine (the
+/// two cards of a modal cross-fade), but a pane stacked on top of another one's surface — a
+/// dropdown popup over a modal card — would blur what is under the *card*, not the card. Those
+/// surfaces take the glass fill without a frost; giving them one means capturing per pane.
+///
+/// The corollary the callers have to keep: **nothing that tints the whole screen may be pushed
+/// ahead of a pane.** A modal's scrim emitted before its own pane lands in the capture, so the
+/// same modal blurs a dimmed screen in the frames where its pane is the first one and an
+/// undimmed screen where some earlier pane already fixed the capture — visibly two different
+/// materials. Push the pane, then the scrim, then the tile: a uniform composite commutes with
+/// a blur, so the scrim on its way past dims every pane identically.
+#[derive(Clone, Copy, Debug)]
+pub struct FrostPane {
+    /// The shape's *unscaled* size, and the resolution its mask and blur scratch are built
+    /// at. Separate from the on-screen rects so a card's focus zoom — which changes `at`
+    /// every frame — rebuilds neither.
+    pub shape: Size,
+    /// Where the whole of `shape` lands on screen this frame, zoom included.
+    pub at: Rect,
+    /// The part of `at` actually drawn: a wipe's revealed window, or all of `at`.
+    pub dst: Rect,
+    /// The shape the blur is cut to, in `shape`'s units.
+    pub mask: FrostMask,
+    /// How wide the blur should be, in screen pixels of spread. The compositor picks the
+    /// nearest thing its chain can give without the pane collapsing to a flat wash, so two
+    /// panes that name the same figure blur alike however differently they are sized — which
+    /// is what keeps a card's title strip and the submenu grown out of it looking like one
+    /// surface.
+    pub blur: u32,
+    pub alpha: u8,
+    /// The flat colour to fill the same shape with on a renderer that cannot blur (no render
+    /// targets, or no composed blend mode). `None` draws nothing there — for a pane that only
+    /// makes sense as a blur, and whose absence is already handled by whatever is under it.
+    pub fallback: Option<Color>,
+}
+
+impl FrostPane {
+    /// A pane drawn whole, unscaled and unclipped, at `mask` — every case but the card
+    /// strip's wipe.
+    pub fn whole(dst: Rect, mask: FrostMask, blur: u32, alpha: u8, fallback: Option<Color>) -> Self {
+        Self {
+            shape: Size::new(dst.width(), dst.height()),
+            at: dst,
+            dst,
+            mask,
+            blur,
+            alpha,
+            fallback,
+        }
+    }
 }
 
 pub type DrawList = Vec<DrawCmd>;
