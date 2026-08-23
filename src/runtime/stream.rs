@@ -199,9 +199,15 @@ pub(super) fn run_inner() -> Result<()> {
         let audio = match connected.audio_channels() {
             None => None,
             Some(channels) => {
-                match crate::platform::webos::audio::AudioPlayer::new(&sdl_audio, channels, connected.sync_cells())
-                    .and_then(|(player, feed)| Ok((player, connected.spawn_audio_feed(feed)?)))
-                {
+                match crate::platform::webos::audio::AudioPlayer::new(
+                    &sdl_audio,
+                    channels,
+                    connected.audio_buffer_cell(),
+                )
+                .and_then(|(player, sink)| {
+                    let stage = crate::session::audio::AudioStage::new(std::sync::Arc::new(sink), channels)?;
+                    Ok((player, connected.spawn_audio_feed(stage)?))
+                }) {
                     Ok(pair) => Some(pair),
                     Err(e) => {
                         // Same no-crash policy as the connect above, plus the video teardown a
@@ -221,16 +227,6 @@ pub(super) fn run_inner() -> Result<()> {
                 }
             }
         };
-        if let Some((player, _)) = &audio {
-            // Logged, not just commented: "audio sounds late" and "early" are the same user
-            // report, and only knowing whether anything steered separates them.
-            tracing::info!(
-                "SDL audio driver: {}, spec: {:?}, A/V sync: measuring only",
-                sdl_audio.current_audio_driver(),
-                player.spec(),
-            );
-        }
-
         // Experimental: Game picture/sound mode, app-plane stand-in for HDMI ALLM. Best-effort;
         // reverted on stream exit. See `game_mode`.
         let restore_tv_modes = if settings.game_mode {
@@ -798,11 +794,22 @@ pub(super) fn run_inner() -> Result<()> {
                     // of its own — NDL owns both — so the two figures are omitted there rather
                     // than printed as a pair of zeroes that look like a stalled plane.
                     let layout = connected.audio_layout();
-                    if connected.audio_offloaded {
-                        lines.push(format!("Opus HW {layout} · NDL"));
+                    if connected.audio_route.on_ndl_plane() {
+                        // `lead` is how far the plane's stamps run ahead of NDL's player clock —
+                        // the one figure this route does publish, and the one that matters most:
+                        // NDL paces the PICTURE on that depth, so a lead sagging towards zero
+                        // reads as video stutter, not as an audio fault (see `PLANE_LEAD_MS`).
+                        lines.push(format!(
+                            "{} {layout} · NDL · lead {} ms",
+                            connected.audio_route.overlay_tag(),
+                            connected.stats().audio_plane_lead_ms.load(Ordering::Relaxed),
+                        ));
                     } else {
-                        let (buf_ms, av_ms) = connected.audio_stats();
-                        lines.push(format!("Opus SW {layout} · buf {buf_ms} ms · A/V {av_ms:+} ms"));
+                        lines.push(format!(
+                            "{} {layout} · buf {} ms",
+                            connected.audio_route.overlay_tag(),
+                            connected.audio_buffer_ms()
+                        ));
                     }
                     if let Some(line) = cpu_mem_line {
                         lines.push(line);

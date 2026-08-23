@@ -6,7 +6,7 @@ use crate::core::caps::video_caps;
 use crate::core::event::MenuEvent;
 use crate::core::model::{BITRATE_AUTOMATIC, BITRATE_MAX_KBPS, BITRATE_MIN_KBPS, BITRATE_STEP_KBPS};
 use crate::services::store::{
-    CodecPref, GamepadType, LogLevelOverride, OverrideField, Settings, SettingsOverride, VideoBackend,
+    AudioRoutePref, CodecPref, GamepadType, LogLevelOverride, OverrideField, Settings, SettingsOverride, VideoBackend,
 };
 use crate::ui::focus::Dir;
 use crate::ui::widgets::{FocusRow, RowSubtext};
@@ -80,9 +80,8 @@ pub enum SettingsRow {
     /// Which look the menus draw in — see `ui::theme::PRESETS`. Cosmetic and device-wide, so
     /// it is on the global list only, and applies the moment it is picked.
     Theme,
-    /// Not a setting — a link to `Screen::Experimental` (unstable toggles: NDL audio offload,
-    /// and Game mode on rooted sets). Grouped off the main list so an untested option isn't
-    /// one keystroke away.
+    /// Not a setting — a link to `Screen::Experimental` (Game mode on rooted sets). Grouped off
+    /// the main list so an untested option isn't one keystroke away.
     Experimental,
     /// Not a setting — a link to `Screen::Diagnostics` (log level + stats overlay). A debug
     /// aid, not something a normal user needs to find quickly.
@@ -148,13 +147,20 @@ pub const CURSOR_ROWS: [SettingsRow; 2] = [SettingsRow::CursorCapture, SettingsR
 /// [`SettingsRow`]: these are device-wide toggles that no per-game override reaches.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ExpRow {
-    HwAudio,
     /// Locked whenever [`exp_row_lock`] returns a reason. Always listed, locked rather than
     /// hidden when it can't be used.
     GameMode,
+    /// Which audio route a session builds — see `store::AudioRoutePref`. The one dropdown on
+    /// this screen. Experimental because two of its three picks are hardware paths that no
+    /// runtime probe can verify; locked to the software route where there is no NDL plane.
+    AudioProcessing,
 }
 
-pub const EXP_ROWS: [ExpRow; 2] = [ExpRow::HwAudio, ExpRow::GameMode];
+pub const EXP_ROWS: [ExpRow; 2] = [ExpRow::GameMode, ExpRow::AudioProcessing];
+
+/// Display position of [`ExpRow::AudioProcessing`] — the row a dropdown can hang off, which is
+/// what `DropdownState::row` names.
+pub const EXP_ROW_AUDIO: usize = 1;
 
 /// Diagnostics modal row indices (see `app::view::diagnostics::rows`). Log level keeps
 /// index 0 so its dropdown's `(Screen, row)` tile key stays stable.
@@ -202,8 +208,13 @@ pub(crate) enum RowLock {
     NoHdr,
     /// One decodable codec, so `codec_prefs` collapses to a single entry.
     OneCodec,
-    /// The backend is capped at stereo, leaving one channel count.
+    /// The active backend decodes one channel count (NDL v1), so no route could offer more.
     StereoOnly,
+    /// The *selected audio processing* carries stereo only (`AudioRoutePref::max_channels`) —
+    /// i.e. audio offload, whose plane decodes nothing wider. Named as a route lock rather than
+    /// [`Self::StereoOnly`] because, unlike the TV's Sound Out or the backend, this limit follows
+    /// from a setting the user owns and the caption can say where to change it.
+    RouteStereoOnly,
     /// Nothing is plugged into the TV, so there is no controller to describe to the host.
     NoGamepad,
 }
@@ -216,6 +227,9 @@ pub(crate) enum ExpRowLock {
     RootUnknown,
     /// Not a rooted TV, so Game mode has no way to reach `settingsservice`.
     NotRooted,
+    /// No NDL audio plane on this backend (webOS 4 and below, or SMP), so the software route is
+    /// the whole list — see `store::AudioRoutePref::available`.
+    SoftwareOnly,
 }
 
 /// `rooted` is the root-probe verdict, `None` while it is still running.
@@ -223,8 +237,39 @@ pub(crate) fn exp_row_lock(row: ExpRow, rooted: Option<bool>) -> Option<ExpRowLo
     match (row, rooted) {
         (ExpRow::GameMode, None) => Some(ExpRowLock::RootUnknown),
         (ExpRow::GameMode, Some(false)) => Some(ExpRowLock::NotRooted),
-        (ExpRow::GameMode, Some(true)) | (ExpRow::HwAudio, _) => None,
+        (ExpRow::AudioProcessing, _) if audio_routes().len() < 2 => Some(ExpRowLock::SoftwareOnly),
+        (ExpRow::GameMode, Some(true)) | (ExpRow::AudioProcessing, _) => None,
     }
+}
+
+/// The audio routes offered here, in display order (see `store::AudioRoutePref::available`).
+pub(crate) fn audio_routes() -> &'static [AudioRoutePref] {
+    AudioRoutePref::available(video_caps())
+}
+
+/// Dropdown labels for [`ExpRow::AudioProcessing`] — the screen's only dropdown, so there is no
+/// per-row table here the way `dropdown_options` is one.
+pub(crate) fn audio_route_options() -> Vec<Label> {
+    audio_routes().iter().map(|&r| audio_route_label(r).into()).collect()
+}
+
+pub(crate) fn audio_route_current_index(settings: &Settings) -> usize {
+    audio_routes()
+        .iter()
+        .position(|&r| r == settings.audio_route)
+        .unwrap_or(0)
+}
+
+/// Applies an audio-route pick. The layout preference is left alone — it is narrowed per session
+/// by `session::connect`'s `Negotiated::clamp`, not rewritten here — but a route that carries one
+/// layout locks the Audio row (`RowLock::RouteStereoOnly`), so the two are set in the order that
+/// row's caption names.
+pub(crate) fn apply_audio_route(settings: &mut Settings, choice_index: usize) {
+    let Some(&route) = audio_routes().get(choice_index) else {
+        return;
+    };
+    settings.audio_route = route;
+    settings.clamp_to_caps();
 }
 
 /// `detected` is the attached pad per `gamepad::detect_type` — `None` with nothing attached
@@ -235,7 +280,10 @@ pub(crate) fn row_lock(row: SettingsRow, settings: &Settings, detected: Option<G
         SettingsRow::Hdr if !caps.hdr => Some(RowLock::NoHdr),
         SettingsRow::Hdr if settings.codec == CodecPref::H264 => Some(RowLock::HdrNeedsHevc),
         SettingsRow::Codec if caps.codec_prefs().len() < 2 => Some(RowLock::OneCodec),
-        SettingsRow::Audio if audio_channel_options().len() < 2 => Some(RowLock::StereoOnly),
+        // Device before route: where the client itself decodes stereo only, no audio-processing
+        // pick could widen it, and naming one would send the user somewhere that cannot help.
+        SettingsRow::Audio if channel_options_up_to(caps.max_channels).len() < 2 => Some(RowLock::StereoOnly),
+        SettingsRow::Audio if audio_channel_options(settings).len() < 2 => Some(RowLock::RouteStereoOnly),
         SettingsRow::Gamepad if detected.is_none() => Some(RowLock::NoGamepad),
         _ => None,
     }
@@ -440,15 +488,50 @@ pub fn gamepad_auto_label(detected: Option<GamepadType>) -> String {
 /// Every channel count this client can label; what is *offered* is [`audio_channel_options`].
 const AUDIO_CHANNELS: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1 surround"), (8, "7.1 surround")];
 
-/// The channel counts offered, filtered to what the active backend can present.
+/// The channel counts offered: what this client can decode, capped by what the selected route can
+/// put on a speaker (`AudioRoutePref::max_channels`).
+///
+/// Filtered by the route because that ceiling is static — the Opus plane carries nothing above
+/// stereo — so offering a width the route would only make the handshake clamp is a pick that does
+/// nothing. NOT filtered by the TV's current Sound Out: that one changes
+/// under a running app and is applied per session instead (`session::connect`'s
+/// `Negotiated::clamp`).
+///
+/// The stored preference is left alone by all of this — see [`audio_row_channels`].
 ///
 /// A prefix of [`AUDIO_CHANNELS`] rather than a fresh `Vec`, because the list is ascending and
 /// the filter is a ceiling — and because the callers that only want the count ask on every
 /// settings-geometry query, which is several times a frame.
-pub fn audio_channel_options() -> &'static [(u8, &'static str)] {
-    let max = video_caps().max_channels;
+pub fn audio_channel_options(settings: &Settings) -> &'static [(u8, &'static str)] {
+    channel_options_up_to(settings.audio_route.max_channels(video_caps()))
+}
+
+/// The prefix of [`AUDIO_CHANNELS`] a `max`-channel ceiling leaves — the shared filter, so the
+/// device ceiling and the route ceiling are read the same way.
+fn channel_options_up_to(max: u8) -> &'static [(u8, &'static str)] {
     let offered = AUDIO_CHANNELS.iter().take_while(|(c, _)| *c <= max).count();
     &AUDIO_CHANNELS[..offered]
+}
+
+/// The layout this row shows, and the one the handshake will ask for: the stored preference held
+/// down to what the route carries.
+///
+/// The preference itself is never rewritten (`Settings::clamp_to_caps` only applies the
+/// decoder-wide ceiling), so a 5.1 pick narrowed to stereo by the offload route comes back whole
+/// on the software one.
+pub(crate) fn audio_row_channels(settings: &Settings) -> u8 {
+    settings
+        .audio_channels
+        .min(settings.audio_route.max_channels(video_caps()))
+}
+
+/// Dropdown label for a route. Names the decode step and the sink behind it — the pick is a
+/// hardware path, and this screen's audience is the one that wants the API named.
+pub(crate) fn audio_route_label(route: AudioRoutePref) -> &'static str {
+    match route {
+        AudioRoutePref::Software => "Software (SDL)",
+        AudioRoutePref::NdlOpus => "Offload (NDL)",
+    }
 }
 
 pub(crate) fn audio_label(channels: u8) -> String {
@@ -479,7 +562,7 @@ fn video_backend_label(backend: VideoBackend) -> &'static str {
 pub type Label = std::borrow::Cow<'static, str>;
 
 /// Dropdown labels for a row.
-pub fn dropdown_options(row: SettingsRow, detected: Option<GamepadType>) -> Vec<Label> {
+pub fn dropdown_options(row: SettingsRow, settings: &Settings, detected: Option<GamepadType>) -> Vec<Label> {
     match row {
         SettingsRow::Theme => crate::ui::theme::PRESETS.iter().map(|t| t.name.into()).collect(),
         SettingsRow::VideoBackend => VIDEO_BACKENDS.iter().map(|&b| video_backend_label(b).into()).collect(),
@@ -493,7 +576,10 @@ pub fn dropdown_options(row: SettingsRow, detected: Option<GamepadType>) -> Vec<
             .iter()
             .map(|&p| codec_label(p).into())
             .collect(),
-        SettingsRow::Audio => audio_channel_options().iter().map(|(_, s)| (*s).into()).collect(),
+        SettingsRow::Audio => audio_channel_options(settings)
+            .iter()
+            .map(|(_, s)| (*s).into())
+            .collect(),
         SettingsRow::Gamepad => GAMEPAD_TYPES
             .iter()
             .map(|&t| {
@@ -510,14 +596,14 @@ pub fn dropdown_options(row: SettingsRow, detected: Option<GamepadType>) -> Vec<
 
 /// How many options a dropdown row offers, without building the label list — the compose
 /// path needs only the count, and `dropdown_options` allocates a `String` per entry.
-pub fn dropdown_option_count(row: SettingsRow) -> usize {
+pub fn dropdown_option_count(row: SettingsRow, settings: &Settings) -> usize {
     match row {
         SettingsRow::Theme => crate::ui::theme::PRESETS.len(),
         SettingsRow::VideoBackend => VIDEO_BACKENDS.len(),
         SettingsRow::Resolution => RESOLUTIONS.len(),
         SettingsRow::Framerate => REFRESH_RATES.len(),
         SettingsRow::Codec => video_caps().codec_prefs().len(),
-        SettingsRow::Audio => audio_channel_options().len(),
+        SettingsRow::Audio => audio_channel_options(settings).len(),
         SettingsRow::Gamepad => GAMEPAD_TYPES.len(),
         _ => 0,
     }
@@ -547,9 +633,9 @@ pub fn dropdown_current_index(settings: &Settings, row: SettingsRow) -> usize {
             .iter()
             .position(|&p| p == settings.codec)
             .unwrap_or(0),
-        SettingsRow::Audio => audio_channel_options()
+        SettingsRow::Audio => audio_channel_options(settings)
             .iter()
-            .position(|(c, _)| *c == settings.audio_channels)
+            .position(|(c, _)| *c == audio_row_channels(settings))
             .unwrap_or(0),
         SettingsRow::Gamepad => GAMEPAD_TYPES
             .iter()
@@ -608,7 +694,7 @@ pub fn apply_dropdown_choice(
             }
         }
         SettingsRow::Audio => {
-            if let Some((channels, _)) = audio_channel_options().get(choice_index) {
+            if let Some((channels, _)) = audio_channel_options(settings).get(choice_index) {
                 settings.audio_channels = *channels;
             }
         }
@@ -676,7 +762,7 @@ pub fn adjust_setting(settings: &mut Settings, row: SettingsRow, forward: bool, 
         | SettingsRow::Diagnostics
         | SettingsRow::About
         | SettingsRow::Reset => {
-            let len = dropdown_option_count(row);
+            let len = dropdown_option_count(row, settings);
             if len == 0 {
                 return false;
             }
@@ -825,7 +911,7 @@ mod tests {
     #[test]
     fn the_channel_table_is_ascending_so_the_offered_list_is_a_prefix() {
         assert!(AUDIO_CHANNELS.windows(2).all(|w| w[0].0 < w[1].0));
-        let offered = audio_channel_options();
+        let offered = audio_channel_options(&Settings::default());
         assert_eq!(offered, &AUDIO_CHANNELS[..offered.len()]);
     }
 
@@ -834,6 +920,5 @@ mod tests {
         assert!(exp_row_lock(ExpRow::GameMode, None).is_some());
         assert!(exp_row_lock(ExpRow::GameMode, Some(false)).is_some());
         assert!(exp_row_lock(ExpRow::GameMode, Some(true)).is_none());
-        assert!(exp_row_lock(ExpRow::HwAudio, None).is_none());
     }
 }

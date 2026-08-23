@@ -36,7 +36,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-pub use v2::{NdlAudioConfig, NdlVideo, NotLoadedYet};
+use super::device::{self, NdlGeneration};
+
+pub use v2::NdlVideo;
 
 /// `NDL_VIDEO_TYPE` values this client can request (matches the codec the host's
 /// `Welcome` resolved — see `punktfunk_core::quic::CODEC_*`).
@@ -320,23 +322,49 @@ fn ensure_init(app_id: &str, api2: bool) -> Result<()> {
     }
     let fns = ffi::common()?;
     let c_app_id = CString::new(app_id).unwrap_or_default();
-    // SAFETY: `c_app_id` is valid for the duration of this call.
-    let ret = unsafe {
-        if api2 {
-            (fns.init_v2)(c_app_id.as_ptr())
-        } else {
-            (fns.init_v1)(c_app_id.as_ptr(), None)
-        }
-    };
-    if ret != 0 {
+    if let Err(e) = fns.init(&c_app_id, api2) {
         INIT_DONE.store(false, Ordering::SeqCst);
-        bail!("NDL_DirectMediaInit failed: ret={ret} error={}", ffi::last_error());
+        return Err(e);
     }
     Ok(())
 }
 
 /// The app id NDL is initialised with. Overridable for dev builds installed under another id —
 /// NDL keys its session on the caller's app id, so a mismatch fails the load.
+/// Widest layout the TV's audio output will actually pass **right now**, or `None` where it
+/// cannot be asked.
+///
+/// It answers whether Sound Out is configured for multi-channel, which the user can change under
+/// a running app. Read once per session by `session::connect` and used to size the wire request,
+/// so channels the TV would only fold down are never encoded, sent or decoded. Never a menu gate —
+/// the answer would be stale by the time it was drawn.
+///
+/// `None` on NDL v1 (nothing to ask) and whenever the query fails, both of which mean "don't
+/// narrow" — the static capability ceiling has already applied by then.
+pub fn audio_output_width() -> Option<u8> {
+    if device::ndl_generation() != NdlGeneration::V2 {
+        return None;
+    }
+    // The query answers nothing before `NDL_DirectMediaInit`, and this runs a moment before the
+    // load would have called it anyway — process-global and idempotent, so it is the same init.
+    if let Err(e) = ensure_init(&app_id(), true) {
+        tracing::warn!("NDL init for the audio-output query: {e:#}");
+        return None;
+    }
+    let status = ffi::multichannel_pcm_status();
+    let width = match status {
+        ffi::MultiChannelPcm::Supported => Some(6),
+        ffi::MultiChannelPcm::Unknown => None,
+        // Capable or not, stereo is what leaves the set.
+        _ => Some(2),
+    };
+    match width {
+        Some(w) => tracing::info!("NDL audio output: {status:?} — passes up to {w} channel(s)"),
+        None => tracing::warn!("NDL audio output: {status:?} — not narrowing the request"),
+    }
+    width
+}
+
 pub fn app_id() -> String {
     std::env::var("APPID").unwrap_or_else(|_| "io.dyptan.punktfunk.webos".into())
 }
@@ -349,9 +377,6 @@ pub fn quit() {
     // Same symbol on both generations, so no branch needed — and the table must have resolved
     // for `INIT_DONE` to have been set.
     if let Ok(fns) = ffi::common() {
-        // SAFETY: no arguments.
-        unsafe {
-            (fns.quit)();
-        }
+        fns.quit();
     }
 }

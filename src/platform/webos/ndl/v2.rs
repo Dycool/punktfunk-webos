@@ -4,12 +4,14 @@
 //!
 //! Never calls `NDL_DirectVideoSetArea` — stutters above 1080p, and v2 sizes its own
 //! punch-through plane (v1 can't; see [`super::v1`]).
-use std::ffi::{c_int, c_longlong, c_uint, c_void};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::ffi::c_uint;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
+
+use crate::core::media::{AudioFormat, AudioPlane, AudioSink, MediaClock, NotReady, Samples, VideoSink, VideoSinkCaps};
 
 use super::{arm_load, ensure_init, ensure_not_poisoned, ffi, settle_before_retry, wait_load_completed};
 use super::{lock_ffi, mark_frame_fed_logged, NdlCodec, LOAD_COMPLETED};
@@ -24,7 +26,7 @@ use super::{lock_ffi, mark_frame_fed_logged, NdlCodec, LOAD_COMPLETED};
 /// the wait alone already spends the grace, so the first feed goes straight through.
 ///
 /// **A backstop, not a live path.** `load()` already waits `LOAD_COMPLETE_TIMEOUT` (longer than
-/// this), so the first `ensure_loaded` always feeds and [`NotLoadedYet`] is never constructed.
+/// this), so the first `ensure_loaded` always feeds and [`NotReady`] is never constructed.
 /// Kept because it is what would make an early return from that wait safe.
 const FEED_ANYWAY_AFTER: Duration = Duration::from_millis(1_000);
 
@@ -39,6 +41,31 @@ const PRIME_PACKET_MS: i64 = 5;
 /// How far ahead of wall-clock the prime's stamps may run, in packets — a burst big enough to
 /// configure a decoder, and the bound on how far its `last_audio_pts_ms` ceiling overshoots.
 const PRIME_LEAD: i64 = 8;
+
+/// Lead the REAL stream's stamps carry over the player clock, i.e. the audio queue depth NDL is
+/// left holding — [`PRIME_LEAD`] packets, the same depth the metronome maintains while it is the
+/// only feed.
+///
+/// **This is not a sync tweak, it is what keeps the picture paced.** NDL regulates the video plane
+/// against its audio renderer, and the renderer's clock only advances smoothly while it has data
+/// queued ahead of it. Fed straight off the wire the real stream stamps at ≈ the player clock (a
+/// packet arrives *after* the frame it was captured with, and the PTS trim pulled the shared offset
+/// another ~36 ms earlier), so the renderer runs at the edge of underrun and the picture stutters
+/// on network jitter — the exact failure the clock plane was introduced to fix, back again the
+/// moment real audio displaced the metronome. Adding a constant here restores the depth without
+/// interleaving silence, which would raise the ceiling real packets then floor onto (see
+/// [`NdlVideo::play_audio`] — that is a permanent session mute, not a stutter).
+///
+/// **The SDL path does the same thing, in its own currency** — `platform::webos::audio` primes and
+/// holds a 25 ms ring ahead of the speaker for exactly this reason: a renderer needs data queued
+/// ahead of it. NDL takes no depth argument, so the only way to ask it for one is a stamp in the
+/// future, which is this. Note what neither path does: correct the resulting lip sync. The A/V
+/// offset is measured and published, never steered on.
+///
+/// The cost is lip sync: sound lands this far behind the picture. The PTS trim already moved the
+/// picture ~36 ms earlier, so it roughly cancels — walk the value down on device against
+/// `plane_lead` in the video heartbeat, which is the only place the depth is observable.
+const PLANE_LEAD_MS: i64 = PRIME_LEAD * PRIME_PACKET_MS;
 
 /// Gap between prime bursts. Polled through, not slept through — the callback lands mid-gap,
 /// and this is launch-path time, i.e. black screen.
@@ -56,46 +83,24 @@ const NO_OFFSET_WARN_PACKETS: u32 = 200;
 /// encodes silence into the same continuous 5 ms datagrams. Only a dead host capture gaps this wide.
 const REAL_FEED_GRACE_MS: i64 = 300;
 
-/// [`NdlVideo::play`] refusing a frame because `LOADCOMPLETED` hasn't landed. A distinct type
-/// because the caller must NOT respond to it the way it responds to a decode error: the usual
-/// answer is `NDL_DirectVideoFlushRenderBuffer`, and issuing that against a pipeline NDL has not
-/// finished loading takes the session's audio out for good (see `session::sink`).
-#[derive(Debug)]
-pub struct NotLoadedYet;
-
-impl std::fmt::Display for NotLoadedYet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("NDL pipeline not loaded yet — holding")
+/// The audio plane every V2 load asks for: Opus, stereo, 48 kHz.
+///
+/// **Every accepted V2 load asks for a plane** — NDL only paces the picture against a fed audio
+/// plane (docs/NOTES.md § "NDL's audio plane"). The offload route puts the wire's own Opus on it;
+/// every other session runs [`NdlVideo::run_clock_plane`]'s metronome instead, and the silent
+/// frame's TOC declares stereo either way, so the config is the same one.
+fn plane_config() -> ffi::AudioUnion {
+    ffi::AudioOpusInfo {
+        kind: 3, // NDL_AUDIO_TYPE_OPUS
+        unknown1: 0,
+        channels: 2,
+        unknown2: 0,
+        // kHz, not Hz — NDL's own unit, and what ss4s passes (`info->sampleRate / 1000.0`).
+        sample_rate: 48.0,
+        stream_header: std::ptr::null(),
+        _padding: [0; 4],
     }
-}
-
-impl std::error::Error for NotLoadedYet {}
-
-/// [`NdlVideo::pts_offset_ns`] before the video plane has published one. Not 0 — a genuine
-/// offset of 0 ns is possible, and "unset" must be distinguishable from it.
-const NO_PTS_OFFSET: i64 = i64::MIN;
-
-/// Opus audio config for NDL. Stereo only (no multistream/surround support).
-#[derive(Clone, Copy)]
-pub struct NdlAudioConfig {
-    pub channels: i32,
-    /// kHz, not Hz — NDL's own unit.
-    pub sample_rate: f64,
-}
-
-impl NdlAudioConfig {
-    fn to_union(self) -> ffi::AudioUnion {
-        ffi::AudioOpusInfo {
-            kind: 3, // NDL_AUDIO_TYPE_OPUS
-            unknown1: 0,
-            channels: self.channels as c_int,
-            unknown2: 0,
-            sample_rate: self.sample_rate,
-            stream_header: std::ptr::null(),
-            _padding: [0; 4],
-        }
-        .to_union()
-    }
+    .to_union()
 }
 
 /// One loaded NDL v2 video decode session. Dropping unloads it (not `NDL_DirectMediaQuit`).
@@ -107,13 +112,18 @@ pub struct NdlVideo {
     /// `wait_load_completed` blocked. Only [`FEED_ANYWAY_AFTER`] is measured from it; the PTS
     /// domain stays on `load_instant`.
     load_requested: Instant,
-    /// Whether the load asked for — and confirmed — an audio plane. What RIDES that plane (the
-    /// real Opus stream, or [`Self::run_clock_plane`]'s metronome) is the caller's choice.
-    has_audio_plane: bool,
-    /// Host-PTS → NDL-player-clock offset in ns, republished by the video plane on every fed
-    /// frame (`session::sink`) and read by [`Self::play_audio`] so both planes land in ONE
-    /// timeline. [`NO_PTS_OFFSET`] until the first frame is fed.
-    pts_offset_ns: AtomicI64,
+    /// Whether this load got an audio plane. False on a video-only load, i.e. one whose
+    /// audio-enabled attempt was rejected — and with it goes the picture's pacing reference.
+    audio: bool,
+    /// The session's shared host-PTS → player-clock mapping, attached by the video stage before
+    /// anything is fed (`core::media::SessionClock`). Both planes stamp through it, which is the
+    /// whole reason it is one object rather than two agreeing copies.
+    clock: std::sync::OnceLock<std::sync::Arc<crate::core::media::SessionClock>>,
+    /// Mapping epoch the audio thread has already derived its skew for — see
+    /// [`Self::derive_audio_skew`]. Re-derivation runs on the audio thread's own next packet
+    /// rather than on the video thread that latched, which keeps `lock_ffi` out of the picture's
+    /// way on every re-anchor.
+    skew_epoch: AtomicU64,
     /// Highest audio stamp fed so far (ms), so [`Self::play_audio`] can never hand NDL a
     /// timestamp going backwards. Never reset — the ceiling has to survive a re-latch, which is
     /// exactly the case that would otherwise rewind it.
@@ -161,7 +171,7 @@ pub struct NdlVideo {
 impl NdlVideo {
     /// Load NDL video stream. Calls `NDL_DirectMediaInit` on first use.
     /// Audio request is a probe: fails silently on unsupported models, retries video-only.
-    pub fn load(app_id: &str, width: i32, height: i32, codec: NdlCodec, audio: Option<NdlAudioConfig>) -> Result<Self> {
+    pub fn load(app_id: &str, width: i32, height: i32, codec: NdlCodec, audio: bool) -> Result<Self> {
         ensure_not_poisoned()?;
         let fns = ffi::v2()?;
         ensure_init(app_id, true)?;
@@ -171,7 +181,7 @@ impl NdlVideo {
             kind: codec.ndl_type(),
             unknown1: 0,
         };
-        if let Some(audio) = audio {
+        if audio {
             // An audio-enabled load must PROVE itself with `LOADCOMPLETED`; a video-only one may
             // proceed unconfirmed (below). `NDL_DirectMediaLoad` returning 0 is only "request
             // accepted" — an Opus config the pipeline rejects fails asynchronously, then accepts
@@ -183,40 +193,34 @@ impl NdlVideo {
             // at the end of the match: a snapshot taken after it would miss that
             // `UNLOADCOMPLETED` and wait out the settle for a callback already spent.
             let unloads_before = super::unload_count();
-            match Self::try_load(fns, video, audio.to_union(), true) {
+            match Self::try_load(fns, video, true) {
                 Ok(loaded) if loaded.load_confirmed.load(Ordering::Relaxed) => return Ok(loaded),
                 Ok(_) => tracing::warn!("NDL audio-enabled load failed (no LOADCOMPLETED) — retrying video-only"),
                 Err(e) => tracing::warn!("NDL audio-enabled load failed ({e:#}) — retrying video-only"),
             }
-            // SAFETY: no arguments; best-effort cleanup of the rejected load.
-            let _ = unsafe { (fns.unload)() };
+            // Best-effort cleanup of the rejected load.
+            fns.unload();
             // The rejected load's callbacks are indistinguishable from the retry's, so let them
             // land BEFORE arming below rather than racing them.
             settle_before_retry(unloads_before);
         }
-        Self::try_load(fns, video, ffi::AudioUnion::SILENT, false)
+        Self::try_load(fns, video, false)
     }
 
     /// One `NDL_DirectMediaLoad` attempt, waited out to `LOADCOMPLETED` — priming the audio plane
     /// through the wait when the load asked for one (see [`Self::prime_audio`]).
-    fn try_load(
-        fns: &'static ffi::V2,
-        video: ffi::VideoInfo,
-        audio: ffi::AudioUnion,
-        with_audio: bool,
-    ) -> Result<Self> {
-        let mut info = ffi::DataInfo { video, audio };
+    fn try_load(fns: &'static ffi::V2, video: ffi::VideoInfo, audio: bool) -> Result<Self> {
+        let mut info = ffi::DataInfo {
+            video,
+            audio: if audio { plane_config() } else { ffi::AudioUnion::SILENT },
+        };
         arm_load();
         let load_requested = Instant::now();
-        // SAFETY: `info` is valid for the duration of this call.
-        let ret = unsafe { (fns.load)(&mut info, Some(super::on_load_state)) };
-        if ret != 0 {
-            bail!("NDL_DirectMediaLoad failed: ret={ret} error={}", ffi::last_error());
-        }
+        fns.load(&mut info, Some(super::on_load_state))?;
         // `ret == 0` is "request accepted", not "pipeline ready" — the first feed still needs
         // LOADCOMPLETED, and an audio-enabled load will not report it until its audio plane has
         // seen a packet, which is what the prime supplies.
-        let (primed_pts_ms, confirmed) = if with_audio {
+        let (primed_pts_ms, confirmed) = if audio {
             Self::prime_audio(fns)
         } else {
             (0, wait_load_completed())
@@ -225,8 +229,9 @@ impl NdlVideo {
             fns,
             load_instant: Instant::now(),
             load_requested,
-            has_audio_plane: with_audio,
-            pts_offset_ns: AtomicI64::new(NO_PTS_OFFSET),
+            audio,
+            clock: std::sync::OnceLock::new(),
+            skew_epoch: AtomicU64::new(0),
             last_audio_pts_ms: AtomicI64::new(primed_pts_ms),
             audio_skew_ms: AtomicI64::new(0),
             dropped_no_offset: AtomicU32::new(0),
@@ -253,6 +258,7 @@ impl NdlVideo {
     /// which mutes the session permanently (see [`Self::play_audio`]). Flooring costs a few early
     /// packets their exact stamp; the alternative is no audio at all.
     fn prime_audio(fns: &'static ffi::V2) -> (i64, bool) {
+        let silence = &OPUS_SILENCE[..];
         let start = Instant::now();
         let mut pts_ms = 0;
         while !LOAD_COMPLETED.fired() {
@@ -270,19 +276,8 @@ impl NdlVideo {
             {
                 let _ffi = lock_ffi();
                 while pts_ms < target_ms {
-                    // SAFETY: NDL reads `size` bytes synchronously and does not retain the pointer.
-                    let ret = unsafe {
-                        (fns.audio_play)(
-                            OPUS_SILENCE.as_ptr() as *mut c_void,
-                            OPUS_SILENCE.len() as c_uint,
-                            pts_ms as c_longlong,
-                        )
-                    };
-                    if ret != 0 {
-                        tracing::warn!(
-                            "NDL audio prime rejected at {pts_ms}ms: ret={ret} error={}",
-                            ffi::last_error()
-                        );
+                    if let Err(e) = fns.audio_play(silence, pts_ms) {
+                        tracing::warn!("NDL audio prime rejected at {pts_ms}ms: {e:#}");
                         return (pts_ms, LOAD_COMPLETED.fired());
                     }
                     pts_ms += PRIME_PACKET_MS;
@@ -301,51 +296,26 @@ impl NdlVideo {
     /// only paces the picture against a fed audio plane — see [`Self::run_clock_plane`]. False means
     /// the audio-enabled load was rejected and `load()` fell back to video-only.
     pub fn has_audio_plane(&self) -> bool {
-        self.has_audio_plane
-    }
-
-    /// Latch the video plane's host-PTS → player-clock offset so [`play_audio`](Self::play_audio)
-    /// can stamp audio in the same timeline. Called per fed frame from `session::sink`, but takes
-    /// **only the first** value after each [`clear_pts_offset`](Self::clear_pts_offset).
-    ///
-    /// Latched, not republished per frame: the offset is a mapping between two clocks, and it is
-    /// stable only while the video plane's own anchor is. Re-deriving it every frame lets any jump
-    /// in the video timeline — a receive-backlog flush jumping to live drops frames, so host PTS
-    /// leaps forward while the player clock does not — drag the audio stamp *backwards* by the
-    /// size of the jump. NDL takes that as a rewind and stops playing audio for the rest of the
-    /// session (observed on CX: audio worked in a session with no flush, gone in one with).
-    /// `clear_pts_offset` at the sink's anchor resets is what re-derives it.
-    ///
-    /// `base_ns` is the same frame's mapped stamp, i.e. where the resumed audio will land: this
-    /// edge is also where [`Self::derive_audio_skew`] runs, so the audio thread's steady state
-    /// stays a single relaxed load.
-    pub(crate) fn latch_pts_offset(&self, offset_ns: i64, base_ns: u64) {
-        // The steady state is "already latched", and this runs per fed frame — keep the exclusive
-        // access off the video thread's hot path once the offset is set.
-        if self.pts_offset_ns.load(Ordering::Relaxed) != NO_PTS_OFFSET {
-            return;
-        }
-        if self
-            .pts_offset_ns
-            .compare_exchange(NO_PTS_OFFSET, offset_ns, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.derive_audio_skew((base_ns / 1_000_000) as i64);
-        }
+        self.audio
     }
 
     /// Place the run that starts at `base_ms` one packet above the audio ceiling, so the resumed
     /// stream advances instead of flooring onto it — see [`Self::play_audio`].
     ///
-    /// Under `lock_ffi` because the clock plane raises that ceiling from its own thread; the CAS
-    /// above makes this the once-per-latch path, not the per-frame one, so the video thread pays
-    /// for the guard only on a re-anchor.
+    /// The run's own first stamp is `base_ms + PLANE_LEAD_MS`, not `base_ms`, so the lead is
+    /// discounted here — charging skew for a gap the lead already closes would stack the two and
+    /// push audio a second lead behind the picture on every re-latch.
+    ///
+    /// Under `lock_ffi` because the clock plane raises that ceiling from its own thread. Called
+    /// from the audio thread on the first packet of a new mapping epoch, so the video thread never
+    /// pays for this guard at all.
     fn derive_audio_skew(&self, base_ms: i64) {
         let skew = {
             let _ffi = lock_ffi();
             // Never negative: a run already above the ceiling needs no help, and pulling it DOWN
             // to meet one is the rewind NDL mutes on.
-            let skew = (self.last_audio_pts_ms.load(Ordering::Relaxed) + PRIME_PACKET_MS - base_ms).max(0);
+            let skew =
+                (self.last_audio_pts_ms.load(Ordering::Relaxed) + PRIME_PACKET_MS - (base_ms + PLANE_LEAD_MS)).max(0);
             self.audio_skew_ms.store(skew, Ordering::Relaxed);
             skew
         };
@@ -359,16 +329,12 @@ impl NdlVideo {
         }
     }
 
-    /// Drop the latched offset — the two timelines just decoupled (the sink reset its anchor
-    /// after a freeze-until-reanchor hold).
-    /// [`play_audio`](Self::play_audio) holds packets until the video plane latches a fresh one,
-    /// which is also where the skew that carries them is re-derived.
-    pub(crate) fn clear_pts_offset(&self) {
-        self.pts_offset_ns.store(NO_PTS_OFFSET, Ordering::Relaxed);
-    }
-
-    /// Feed one Opus packet to NDL (only when the real stream rides the plane). `host_pts_ns` is
-    /// the packet's own host capture timestamp, NOT arrival time.
+    /// Feed one Opus packet to NDL's audio plane, for the TV's own decoder to render. Called only
+    /// on the offload route, where the real stream rides the plane. `host_pts_ns` is the packet's own host capture
+    /// timestamp, NOT arrival time.
+    ///
+    /// Every stamp carries [`PLANE_LEAD_MS`] on top of the mapped host time, so NDL always holds
+    /// that much audio ahead of its renderer — read that constant before touching this arithmetic.
     ///
     /// **Both planes must be stamped in one time base** — NDL runs its own A/V synchronisation
     /// against these values, and regulating a video plane on host-capture cadence against an audio
@@ -393,7 +359,8 @@ impl NdlVideo {
     /// as the guard for what it cannot see — an out-of-order packet, or a burst landing between
     /// the latch and the run's first packet — and is also what publishes the ceiling itself.
     pub fn play_audio(&self, packet: &[u8], host_pts_ns: u64) -> Result<()> {
-        if self.pts_offset_ns.load(Ordering::Relaxed) == NO_PTS_OFFSET {
+        // Fast path: no latched timeline means nothing to stamp against, and the packet is dropped.
+        let Some((clock, probe_ns)) = self.clock.get().and_then(|c| Some((c, c.map_host_ns(host_pts_ns)?))) else {
             let dropped = self.dropped_no_offset.fetch_add(1, Ordering::Relaxed) + 1;
             // Reported on the way through, not only on the packet that ends the gap: a gap that
             // never ends is exactly the failure worth seeing, and that path logs nothing at all.
@@ -405,34 +372,26 @@ impl NdlVideo {
                 );
             }
             return Ok(());
-        }
-        // Map, skew and floor under the guard, never before it: `lock_ffi` is the audio plane's
-        // only feed path, so this is what serialises against `burst_silence` — outside it a packet
-        // can read a ceiling the filler has already moved past and hand NDL a stale stamp, i.e. the
-        // rewind this whole path exists to avoid. The offset is re-read here for the same reason:
-        // the check above is only a fast path, and a clear/re-latch landing between the two would
-        // pair the OLD offset with the NEW skew — a stamp the size of the video plane's jump above
-        // the ceiling, onto which every later packet then floors.
-        let ret = {
-            let _ffi = lock_ffi();
-            let offset_ns = self.pts_offset_ns.load(Ordering::Relaxed);
-            if offset_ns == NO_PTS_OFFSET {
-                return Ok(());
-            }
-            let raw_ms = ((host_pts_ns as i64).saturating_add(offset_ns).max(0) / 1_000_000)
-                .saturating_add(self.audio_skew_ms.load(Ordering::Relaxed));
-            let pts_ms = self.last_audio_pts_ms.fetch_max(raw_ms, Ordering::Relaxed).max(raw_ms);
-            // SAFETY: NDL reads `size` bytes synchronously and does not retain the pointer.
-            unsafe {
-                (self.fns.audio_play)(
-                    packet.as_ptr() as *mut c_void,
-                    packet.len() as c_uint,
-                    pts_ms as c_longlong,
-                )
-            }
         };
-        if ret != 0 {
-            bail!("NDL_DirectAudioPlay failed: ret={ret} error={}", ffi::last_error());
+        // A mapping this thread hasn't stamped against yet needs its skew re-derived first — the
+        // run has to land ABOVE the ceiling the previous one (or the metronome) left behind.
+        // Outside `lock_ffi`, which `derive_audio_skew` takes for itself.
+        let epoch = clock.epoch();
+        if self.skew_epoch.swap(epoch, Ordering::Relaxed) != epoch {
+            self.derive_audio_skew((probe_ns / 1_000_000) as i64);
+        }
+        {
+            let _ffi = lock_ffi();
+            // Re-read under the guard: the check above is only a fast path, and a clear/re-latch
+            // landing between the two would pair a stale mapping with the new skew.
+            let Some(base_ns) = clock.map_host_ns(host_pts_ns) else {
+                return Ok(());
+            };
+            let raw_ms = ((base_ns / 1_000_000) as i64)
+                .saturating_add(self.audio_skew_ms.load(Ordering::Relaxed))
+                .saturating_add(PLANE_LEAD_MS);
+            let pts_ms = self.last_audio_pts_ms.fetch_max(raw_ms, Ordering::Relaxed).max(raw_ms);
+            self.fns.audio_play(packet, pts_ms)?;
         }
         // Player clock, not the packet's domain: the reader asks "how long since a packet ARRIVED".
         self.last_real_feed_ms
@@ -458,24 +417,17 @@ impl NdlVideo {
     /// audio plane's only feed path, so no real packet can land mid-burst and read a stale ceiling
     /// — it either precedes this and is picked up by the floor, or follows the final publish.
     fn burst_silence(&self, from_ms: i64, target_ms: i64) -> Result<i64> {
+        let silence = &OPUS_SILENCE[..];
         let _ffi = lock_ffi();
         let mut pts_ms = from_ms.max(self.last_audio_pts_ms.load(Ordering::Relaxed));
         while pts_ms < target_ms {
             pts_ms += PRIME_PACKET_MS;
-            // SAFETY: NDL reads `size` bytes synchronously and does not retain the pointer.
-            let ret = unsafe {
-                (self.fns.audio_play)(
-                    OPUS_SILENCE.as_ptr() as *mut c_void,
-                    OPUS_SILENCE.len() as c_uint,
-                    pts_ms as c_longlong,
-                )
-            };
-            if ret != 0 {
+            if let Err(e) = self.fns.audio_play(silence, pts_ms) {
                 // Publish before unwinding: this burst has already handed NDL stamps above the old
                 // ceiling, and leaving it stale lets the next real packet floor below them — a
                 // rewind, which mutes the session for good.
                 self.last_audio_pts_ms.fetch_max(pts_ms, Ordering::Relaxed);
-                bail!("NDL_DirectAudioPlay failed: ret={ret} error={}", ffi::last_error());
+                return Err(e);
             }
         }
         self.last_audio_pts_ms.fetch_max(pts_ms, Ordering::Relaxed);
@@ -535,6 +487,14 @@ impl NdlVideo {
         tracing::info!("NDL clock plane ending at {pts_ms}ms");
     }
 
+    /// How far the audio plane's stamps currently run ahead of the player clock, in ms — the queue
+    /// depth NDL paces the picture on ([`PLANE_LEAD_MS`]), and the only observable proxy for it.
+    /// Reads the ceiling, so it reports whichever feed last raised it. Sagging towards zero under
+    /// real audio is the stutter signature.
+    pub fn audio_plane_lead_ms(&self) -> i64 {
+        self.last_audio_pts_ms.load(Ordering::Relaxed) - (self.elapsed_ns() / 1_000_000) as i64
+    }
+
     /// Nanoseconds since `load()` (NDL PTS domain). The sink anchors the host PTS onto this
     /// (`session::timeline::HostPtsAnchor`) — NDL has no PTS clock of its own.
     pub(crate) fn elapsed_ns(&self) -> u64 {
@@ -557,7 +517,7 @@ impl NdlVideo {
             // `LOAD_COMPLETE_TIMEOUT` by the time a frame gets here.
             tracing::warn!("NDL: still no LOADCOMPLETED {elapsed:?} after the load — feeding anyway");
         } else {
-            return Err(NotLoadedYet.into());
+            return Err(NotReady.into());
         }
         self.load_confirmed.store(true, Ordering::Relaxed);
         Ok(())
@@ -599,15 +559,7 @@ impl NdlVideo {
 
     fn set_hdr_info(&self, info: ffi::HdrInfo) -> Result<()> {
         let _ffi = lock_ffi();
-        // SAFETY: passed by value; no pointers or aliasing.
-        let ret = unsafe { (self.fns.set_hdr_info)(info) };
-        if ret != 0 {
-            bail!(
-                "NDL_DirectVideoSetHDRInfo failed: ret={ret} error={}",
-                ffi::last_error()
-            );
-        }
-        Ok(())
+        self.fns.set_hdr_info(info)
     }
 
     /// Feed one access unit at `pts_ns` (ns since `load()`), truncated to ms for NDL.
@@ -615,15 +567,10 @@ impl NdlVideo {
     /// so video and offloaded audio share one timeline.
     pub fn play(&self, au: &[u8], pts_ns: u64) -> Result<()> {
         self.ensure_loaded()?;
-        let pts_ms = (pts_ns / 1_000_000) as c_longlong;
+        let pts_ms = (pts_ns / 1_000_000) as i64;
         let first_frame = {
             let _ffi = lock_ffi();
-            // SAFETY: NDL reads `size` bytes from `buffer` synchronously and does not
-            // retain the pointer.
-            let ret = unsafe { (self.fns.video_play)(au.as_ptr() as *mut c_void, au.len() as c_uint, pts_ms) };
-            if ret != 0 {
-                bail!("NDL_DirectVideoPlay failed: ret={ret} error={}", ffi::last_error());
-            }
+            self.fns.video_play(au, pts_ms)?;
             mark_frame_fed_logged("NDL", self.load_instant)
         };
         // Outside the FFI guard — `replay_pending_hdr` takes it again, and it isn't reentrant.
@@ -689,31 +636,20 @@ impl NdlVideo {
     /// Buffered-but-undisplayed frames in NDL (None if the query fails).
     /// Rising length = decoder behind; flat near-zero with stutter = upstream problem.
     pub fn render_buffer_length(&self) -> Option<i32> {
-        let mut length: c_int = 0;
         let _ffi = lock_ffi();
-        // SAFETY: `length` is a valid, writable `c_int` for the duration of the call.
-        let ret = unsafe { (self.fns.get_render_buffer_length)(&mut length) };
-        (ret == 0).then_some(length)
+        self.fns.render_buffer_length()
     }
 
     pub fn flush(&self) -> Result<()> {
         // Never against a pipeline that hasn't reported LOADCOMPLETED: the flush silently kills
-        // the session's audio plane for the rest of the load (see [`NotLoadedYet`]), and nothing
+        // the session's audio plane for the rest of the load (see [`NotReady`]), and nothing
         // has been fed yet, so there is no render buffer to discard either. The sink's loss path
         // flushes before it ever calls `play`, so the guard has to live here.
         if !self.load_confirmed.load(Ordering::Relaxed) && !LOAD_COMPLETED.fired() {
             return Ok(());
         }
         let _ffi = lock_ffi();
-        // SAFETY: no arguments.
-        let ret = unsafe { (self.fns.flush_render_buffer)() };
-        if ret != 0 {
-            bail!(
-                "NDL_DirectVideoFlushRenderBuffer failed: ret={ret} error={}",
-                ffi::last_error()
-            );
-        }
-        Ok(())
+        self.fns.flush_render_buffer()
     }
 }
 
@@ -721,7 +657,97 @@ impl Drop for NdlVideo {
     fn drop(&mut self) {
         // Re-arm so `playing()` stops reporting the load being torn down here.
         arm_load();
-        // SAFETY: best-effort teardown; error ignored (Drop can't propagate a Result).
-        let _ = unsafe { (self.fns.unload)() };
+        self.fns.unload();
+    }
+}
+
+impl MediaClock for NdlVideo {
+    fn now_ns(&self) -> u64 {
+        self.elapsed_ns()
+    }
+}
+
+impl AudioSink for NdlVideo {
+    fn name(&self) -> &'static str {
+        "NDL Opus plane"
+    }
+
+    /// What the load asked for, and what every silence burst here already speaks — see
+    /// [`plane_config`].
+    fn format(&self) -> AudioFormat {
+        AudioFormat::Opus { channels: 2 }
+    }
+
+    fn feed(&self, samples: Samples<'_>, host_pts_ns: u64) -> Result<()> {
+        let Samples::Opus(packet) = samples else {
+            // The plane decodes; decoded samples are the SDL device's shape and never reach here.
+            bail!("NDL audio plane takes Opus packets only");
+        };
+        self.play_audio(packet, host_pts_ns)
+    }
+
+    fn depth_ms(&self) -> Option<i64> {
+        Some(self.audio_plane_lead_ms())
+    }
+}
+
+impl AudioPlane for NdlVideo {
+    fn attach_clock(&self, clock: std::sync::Arc<crate::core::media::SessionClock>) {
+        let _ = self.clock.set(clock);
+    }
+
+    fn lead_ms(&self) -> i64 {
+        self.audio_plane_lead_ms()
+    }
+
+    fn run_keepalive(&self, stop: &std::sync::atomic::AtomicBool, yields_to_real: bool) {
+        self.run_clock_plane(stop, yields_to_real);
+    }
+}
+
+/// Implemented for the `Arc`, not for `NdlVideo`: the audio plane is the same handle as the video
+/// one (NDL has no per-plane context), and the plane's threads must keep the load alive — the
+/// process-global unload in `Drop` cannot run while one of them is still inside an FFI call.
+impl VideoSink for std::sync::Arc<NdlVideo> {
+    fn name(&self) -> &'static str {
+        "NDL v2"
+    }
+
+    fn caps(&self) -> VideoSinkCaps {
+        VideoSinkCaps {
+            pts: true,
+            partial_au: true,
+            flush: true,
+            render_queue: true,
+        }
+    }
+
+    fn feed(&self, au: &[u8], pts_ns: u64) -> Result<()> {
+        self.play(au, pts_ns)
+    }
+
+    fn flush(&self) -> Result<()> {
+        NdlVideo::flush(self)
+    }
+
+    fn queue_depth(&self) -> Option<u32> {
+        self.render_buffer_length().and_then(|d| u32::try_from(d).ok())
+    }
+
+    fn set_color(
+        &self,
+        meta: Option<&punktfunk_core::quic::HdrMeta>,
+        color: punktfunk_core::quic::ColorInfo,
+    ) -> Result<()> {
+        self.set_color_info(meta, color)
+    }
+
+    fn clock(&self) -> Option<&dyn MediaClock> {
+        Some(self.as_ref())
+    }
+
+    fn audio_plane(&self) -> Option<std::sync::Arc<dyn AudioPlane>> {
+        self.has_audio_plane()
+            .then(|| Self::clone(self) as std::sync::Arc<dyn AudioPlane>)
     }
 }

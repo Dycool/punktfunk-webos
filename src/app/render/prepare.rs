@@ -11,10 +11,10 @@ use anyhow::Result;
 use crate::app::hosts::HostEntry;
 use crate::app::nav::ScreenKey;
 use crate::app::render::ctx::RenderCtx;
-use crate::app::screens::is_scroll_list;
 use crate::app::render::key::{ModalFocusKey, ModalShellKey, ScrollContentKey};
 use crate::app::render::tile;
 use crate::app::render::SnapshotBody;
+use crate::app::screens::is_scroll_list;
 use crate::app::screens::rowbuttons::RowButton;
 use crate::app::{
     menu, view, App, HomeFocus, PairingFocus, Screen, ABOUT_WINDOW_BUDGET, ABOUT_WINDOW_MARGIN, SCROLL_INDICATOR_TILE_W,
@@ -249,8 +249,8 @@ impl App {
                 show_logs: self.settings_ui.settings.show_logs,
             }),
             Screen::Experimental => Some(ModalShellKey::Experimental {
-                ndl_audio_offload: self.settings_ui.settings.ndl_audio_offload,
                 game_mode: self.settings_ui.settings.game_mode,
+                audio_route: self.settings_ui.settings.audio_route,
                 rooted: self.hosts.rooted,
             }),
             Screen::CursorSettings(_) => Some(ModalShellKey::CursorSettings {
@@ -344,8 +344,8 @@ impl App {
             )),
             Screen::Experimental => Some(ModalFocusKey::ExperimentalRow(
                 self.nav.cursor(ScreenKey::Experimental),
-                self.settings_ui.settings.ndl_audio_offload,
                 self.settings_ui.settings.game_mode,
+                self.settings_ui.settings.audio_route,
                 self.hosts.rooted,
             )),
             Screen::CursorSettings(_) => Some(ModalFocusKey::CursorSettingsRow(
@@ -522,8 +522,8 @@ impl App {
                         }
                     }),
                     // Every plain list modal: same tile, same geometry, built from whichever
-                    // rows the screen lists. Only Diagnostics can have a dropdown open, and
-                    // only the host menu has a ⋯ to light.
+                    // rows the screen lists. Only Diagnostics and Experimental can have a
+                    // dropdown open, and only the host menu has a ⋯ to light.
                     Screen::HostMenu
                     | Screen::WakeSettings
                     | Screen::Diagnostics
@@ -585,7 +585,9 @@ impl App {
             let options = self.dropdown_options(dd.row);
             // The overlay hangs inside whichever viewport its list is drawn in.
             let content_w = match self.nav.screen {
-                Screen::Diagnostics => self.modal_list_content(screen_w, screen_h, fonts).width(),
+                Screen::Diagnostics | Screen::Experimental => {
+                    self.modal_list_content(screen_w, screen_h, fonts).width()
+                }
                 _ => view::settings::layout(self.settings_scope(), screen_w, screen_h)
                     .1
                     .width(),

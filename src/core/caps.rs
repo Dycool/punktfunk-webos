@@ -22,8 +22,13 @@ pub struct VideoCaps {
     pub h265: bool,
     /// HDR (10-bit + mastering metadata). Implies [`Self::h265`].
     pub hdr: bool,
-    /// Highest audio channel count worth requesting from the host.
+    /// Highest audio channel count this client can decode and present through the SOFTWARE
+    /// route — the decoder-wide ceiling.
     pub max_channels: u8,
+    /// Whether an NDL audio plane exists at all here. Only NDL `DirectMedia` v2 has one: v1 has
+    /// no audio type, and SMP is a different pipeline entirely. False leaves
+    /// `AudioRoutePref::Software` as the only route (`AudioRoutePref::available`).
+    pub audio_plane: bool,
 }
 
 impl VideoCaps {
@@ -34,6 +39,7 @@ impl VideoCaps {
         h265: true,
         hdr: true,
         max_channels: 8,
+        audio_plane: true,
     };
 
     /// NDL `DirectMedia` v1 on webOS 3.5-4.x. Stereo because its audio path is unused and
@@ -42,6 +48,7 @@ impl VideoCaps {
         h265: false,
         hdr: false,
         max_channels: 2,
+        audio_plane: false,
     };
 
     /// The codec preferences worth offering here, in display order — the one place the codec set
@@ -83,9 +90,15 @@ pub fn set_backend(backend: VideoBackend) {
 }
 
 /// The active caps: the NDL baseline, widened to [`VideoCaps::FULL`] while SMP is the pick.
+///
+/// SMP widens video but not audio: it is its own pipeline and has no NDL plane to feed, so the
+/// plane routes stay unavailable under it however capable the decoder is.
 pub fn video_caps() -> VideoCaps {
     if SMP_ACTIVE.load(Ordering::Relaxed) {
-        VideoCaps::FULL
+        VideoCaps {
+            audio_plane: false,
+            ..VideoCaps::FULL
+        }
     } else {
         NDL_BASELINE.get().copied().unwrap_or(VideoCaps::FULL)
     }

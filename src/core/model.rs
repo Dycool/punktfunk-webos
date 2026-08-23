@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::caps::VideoCaps;
+
 /// Stream connection target.
 pub struct ConnectTarget {
     pub host: String,
@@ -551,6 +553,72 @@ pub enum CodecPref {
     Hevc,
 }
 
+/// Where a session's audio is decoded and played — the two routes this client can build,
+/// selectable in Settings and swappable without touching the pipeline.
+///
+/// The routes trade the same way: everything below [`Self::Software`] is a shorter path onto the
+/// panel's own clock, and gives up what this client can steer in exchange. Which is actually
+/// smoother is hardware-specific (`docs/NOTES.md` § "NDL's audio plane"), hence a setting rather
+/// than a fixed choice.
+///
+/// Not every route carries every layout, and nothing is ever folded down: what the selected route
+/// can put on a speaker is what the handshake asks the host to encode (`AudioRoutePref::max_channels`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioRoutePref {
+    /// Software Opus decode → the TV's SDL audio device, with NDL's silent clock plane keeping
+    /// the picture paced. The longest path, every layout, and the only one whose pacing is proven
+    /// on hardware — so, the default.
+    #[default]
+    Software,
+    /// The wire's Opus, decoded by the TV on its audio plane. No local decode at all. Stereo
+    /// only — NDL's Opus struct has no multistream mapping field — and some sets accept the load
+    /// and then play nothing, which no runtime probe detects.
+    NdlOpus,
+}
+
+impl AudioRoutePref {
+    /// Whether the real stream rides NDL's audio plane — i.e. no SDL device is opened, and the
+    /// clock plane is a standing filler rather than the only feed.
+    pub fn on_ndl_plane(self) -> bool {
+        self != Self::Software
+    }
+
+    /// How the stats overlay names this route. Which decoder ran leads the line: the paths fail
+    /// differently, and reading the numbers without knowing which produced them has already cost
+    /// real debugging time.
+    pub fn overlay_tag(self) -> &'static str {
+        match self {
+            Self::Software => "Opus SW",
+            Self::NdlOpus => "Opus HW",
+        }
+    }
+
+    /// Widest layout this route can put on a speaker, and therefore the ceiling on what the
+    /// handshake asks the host to encode. Per route, never global: NDL's plane and the SDL device
+    /// have different ceilings, and clamping every session by the narrower one cost users 5.1 on
+    /// a route that plays it.
+    pub fn max_channels(self, caps: VideoCaps) -> u8 {
+        match self {
+            // SDL opens whatever the negotiated layout is; nothing folds.
+            Self::Software => caps.max_channels,
+            Self::NdlOpus => caps.max_channels.min(2),
+        }
+    }
+
+    /// The routes this device can actually build, in display order — software first, it being
+    /// the default and the only one that needs no plane. The offload route needs NDL v2's audio
+    /// type (`VideoCaps::audio_plane`); on webOS 4 and below, and under SMP, there is no plane
+    /// to ride and software is the whole list.
+    pub fn available(caps: VideoCaps) -> &'static [Self] {
+        if caps.audio_plane {
+            &[Self::Software, Self::NdlOpus]
+        } else {
+            &[Self::Software]
+        }
+    }
+}
+
 /// Which controller the host should present to the game, selectable in Settings.
 ///
 /// This is the *virtual* pad the host builds, not what the user is holding — the host
@@ -696,17 +764,13 @@ pub struct Settings {
     /// stream start (SDR "game" / HDR "hdrGame" per the negotiated colour path) and reverted
     /// on stream exit.
     pub game_mode: bool,
-    /// Whether the real Opus stream rides NDL's audio plane (hardware decode) instead of the
-    /// software decoder. Takes effect on the next stream.
+    /// Where this session's audio is decoded and played — see [`AudioRoutePref`]. Takes effect on
+    /// the next stream, and caps the channel layouts the Audio row offers.
     ///
-    /// **This does not decide whether the plane exists** — every accepted V2 load has one, since
-    /// NDL only paces the picture against a fed plane. Off, it carries `run_clock_plane`'s silent
-    /// metronome and software decode serves the speakers.
-    ///
-    /// Off by default: the audio-enabled load is rejected on some webOS 5+ sets, and a set that
-    /// accepts it can still play nothing, which no runtime probe detects. 5.1/7.1 stay on the
-    /// software decoder regardless — NDL's Opus struct has no multistream mapping field.
-    pub ndl_audio_offload: bool,
+    /// **No route decides whether NDL's audio plane exists** — every accepted V2 load has one,
+    /// since NDL only paces the picture against a fed plane. The routes differ in what RIDES it:
+    /// `run_clock_plane`'s silent metronome, or the host's Opus.
+    pub audio_route: AudioRoutePref,
     /// Resolve the Magic Remote's OK button into left click / right click / drag by how long
     /// it's held (see `platform::webos::mouse::RemoteButtons`). Off by default — with it
     /// off, OK stays the plain immediate left click it has always been, since a remote with
@@ -739,7 +803,7 @@ impl Default for Settings {
             gamepad_type: GamepadType::Auto,
             cursor_capture: true,
             game_mode: false,
-            ndl_audio_offload: false,
+            audio_route: AudioRoutePref::default(),
             cursor_gestures: false,
             theme: ThemeChoice::default(),
         }
@@ -798,9 +862,20 @@ impl Settings {
             note!("settings: HDR needs HEVC — an explicit H.264 pick turns it off");
             self.hdr_enabled = false;
         }
+        if !AudioRoutePref::available(caps).contains(&self.audio_route) {
+            note!(
+                "settings: {:?} audio needs NDL's audio plane, which this backend has none of — using Software",
+                self.audio_route,
+            );
+            self.audio_route = AudioRoutePref::Software;
+        }
+        // The decoder-wide ceiling, and nothing else. `audio_channels` is a PREFERENCE — "5.1
+        // where it can play" — which the route's own limit and the TV's current Sound Out narrow
+        // per session, not in the document (see `session::connect`'s `Negotiated::clamp`).
+        // Rewriting it from either would lose the preference the moment a receiver was unplugged.
         if self.audio_channels > caps.max_channels {
             note!(
-                "settings: {} audio channels exceeds this backend's {} — clamping",
+                "settings: {} audio channels is more than this client can decode ({}) — clamping",
                 self.audio_channels,
                 caps.max_channels,
             );

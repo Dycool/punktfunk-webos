@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use punktfunk_core::input::InputEvent;
 
-use crate::platform::webos::audio::AudioFeed;
+use crate::session::audio::AudioStage;
 use crate::session::{self, Connected, StreamStats};
 
 /// The input path, cloned for a thread that sends off the main loop (the HID-mouse reader).
@@ -49,9 +49,9 @@ impl Connected {
     }
 
     /// Channels to open the SDL audio device with, or `None` when the session needs no local
-    /// device (NDL audio offload took the stream).
+    /// device (the stream rides NDL's audio plane — see `core::model::AudioRoutePref`).
     pub(crate) fn audio_channels(&self) -> Option<u8> {
-        if self.audio_offloaded {
+        if self.audio_route.on_ndl_plane() {
             None
         } else {
             Some(self.client.audio_channels)
@@ -73,25 +73,22 @@ impl Connected {
     }
 
     /// The cells the A/V sync loop trades through — handed to the audio player at construction.
-    pub(crate) fn sync_cells(&self) -> crate::platform::webos::audio::SyncCells {
-        crate::platform::webos::audio::SyncCells {
-            clock_offset: self.client.clock_offset_shared(),
-            video_e2e: self.client.video_e2e_shared(),
-            av_offset_ms: self.client.audio_av_offset_shared(),
-            buffer_ms: self.client.audio_buffer_ms_shared(),
-        }
+    /// Where the fallback ring publishes its depth for the stats overlay. Owned by
+    /// `NativeClient` because the overlay reads it from there.
+    pub(crate) fn audio_buffer_cell(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        self.client.audio_buffer_ms_shared()
     }
 
-    /// Audio's two HUD figures: ring depth in ms, and the smoothed A/V offset in ms (positive =
-    /// audio playing behind the picture). Both are `0` until the sync loop has evidence.
-    pub(crate) fn audio_stats(&self) -> (u32, i64) {
-        (self.client.audio_buffer_ms(), self.client.audio_av_offset_ms())
+    /// The fallback ring's depth in ms, for the HUD. Always `0` on the NDL routes — NDL owns the
+    /// depth there and reports none.
+    pub(crate) fn audio_buffer_ms(&self) -> u32 {
+        self.client.audio_buffer_ms()
     }
 
     /// Starts the audio decode/feed thread. It exits on the session's stop flag, or when the
     /// transport's audio plane closes.
-    pub(crate) fn spawn_audio_feed(&self, feed: AudioFeed) -> anyhow::Result<std::thread::JoinHandle<()>> {
-        session::spawn_audio_feed(self.client.clone(), feed, self.stop.clone())
+    pub(crate) fn spawn_audio_feed(&self, stage: AudioStage) -> anyhow::Result<std::thread::JoinHandle<()>> {
+        session::spawn_audio_feed(self.client.clone(), stage, self.stop.clone())
     }
 
     /// Signals the audio feed thread to stop and joins it, bounded. Sets the session's stop flag,

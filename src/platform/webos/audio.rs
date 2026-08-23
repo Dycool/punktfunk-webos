@@ -1,317 +1,231 @@
-//! SDL2 callback playback of punktfunk's Opus audio packets. Decode only (Opus →
-//! PCM) happens here — NDL is video-only (see ndl.rs docs), so this is a completely
-//! separate path from the video decode/punch-through plane.
+//! The TV's own audio device, and the sink wrapper the pipeline drives it through.
 //!
-//! **Two threads, one ring.** [`AudioFeed`] decodes on a dedicated thread and posts interleaved
-//! f32 chunks down a bounded channel; [`RingCallback`] drains that channel into a ring it owns
-//! outright and serves SDL's audio callback from it. Nothing locks, and nothing allocates in
-//! steady state (drained chunk `Vec`s go back through a recycle channel for the feed to refill).
-//! Same shape as `pf-client-core`'s `PipeWire` ring, for the same reasons.
+//! One of two routes (`core::model::AudioRoutePref`) and the longer of them: software Opus
+//! decode (`session::audio`) into a ring, drained by SDL's audio callback, through whatever
+//! `PulseAudio` adds behind it. It is also the only one whose pacing behaviour is proven on this
+//! hardware, hence the default — the offload route is shorter, but the TV's own decoder is behind
+//! the plane and some sets accept its load and then play nothing.
 //!
-//! This replaced an `sdl2::audio::AudioQueue` pushed from the main loop. Two defects went with it:
-//! the drain shared a thread with the UI's software rasterizer (`docs/NOTES.md` already named the
-//! 500 ms stats-overlay raster as an underrun source on a 2-core panel), and `AudioQueue` offers
-//! only `queue_audio`/`size`/`clear` — no partial drop — so the shared de-jitter policy's
-//! crossfaded 5 ms shed was literally inexpressible against it. Its coarse corrections were a
-//! whole-queue `clear()` (~100 ms of silence) and an uncrossfaded 5 ms discard.
+//! The ring is served by `punktfunk_core::audio::JitterPolicy`, the same de-jitter state machine
+//! the Linux, Windows, Android and Apple rings run. That is deliberate and was re-decided once:
+//! the policy was removed on this branch for latency, and the numbers did not support it — the
+//! preset's base target is 25 ms and the fixed prime that replaced it was also 25 ms, so no floor
+//! was ever saved, while the adaptive floor and the crossfaded shed were lost. What the policy buys
+//! that a fixed prime cannot:
+//!
+//! * **An adaptive floor.** The target grows only on a set that actually underruns, instead of
+//!   every set pre-paying for the worst one — and a set that needs more than 25 ms now gets it
+//!   rather than re-priming into the same dropout forever.
+//! * **A crossfaded shed.** Drift (host capture clock vs. this DAC) is walked back to target one
+//!   5 ms frame at a time, faded. The alternative this replaces is an uncrossfaded 65 ms drop,
+//!   which is an audible click.
+//! * **Near-miss growth, hollow de-priming and a faded hard trim**, all of which core gained after
+//!   this client last used it.
+//!
+//! The A/V sync loop is deliberately NOT wired: `set_sync_target` is never called, which core
+//! documents as reproducing unsynchronised behaviour exactly. It never steered anything here — it
+//! was gated behind an `$HOME/av-trim-ms.conf` that had to be measured on hardware first — and the
+//! video reference this platform can build is biased low by NDL's unobservable decode+panel term.
+//! See `docs/NOTES.md` § "A/V sync".
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
 use anyhow::Result;
-use punktfunk_core::audio::{
-    crossfade_drop, layout_for, AudioGapTracker, AudioSyncCell, AvSync, AvSyncObservation, JitterPolicy, JitterTuning,
-};
+use punktfunk_core::audio::{crossfade_drop, JitterPolicy, JitterTuning};
 
-/// 48 kHz, 5 ms frames — punktfunk's fixed audio framing (see punktfunk-core's
-/// audio.rs doc comments and its `multistream_layout_roundtrips_with_channel_identity`
-/// test, the canonical reference for both ends of this wire format).
-const SAMPLE_RATE: u32 = 48_000;
-const SAMPLES_PER_FRAME: usize = 240;
-/// Max channels punktfunk ever negotiates (7.1) — sizes the scratch decode buffer.
-const MAX_CHANNELS: usize = 8;
+use crate::core::media::{AudioFormat, AudioSink, Samples};
+use crate::session::audio::SAMPLE_RATE;
 
-/// Device buffer: 512 frames (10.67 ms) keeps slack vs callback cadence. Deliberately NOT lowered
-/// further now that a real jitter policy owns the depth: a smaller quantum on a 2-3 core TV `SoC`
-/// buys more wakeups and more missed callbacks, not less latency. [`WEBOS_TUNING`]'s base target is
-/// sized to clear this quantum — see its note on the device floor.
+/// Device buffer: 512 frames (10.67 ms). Deliberately not smaller — a smaller quantum on a 2-3
+/// core TV `SoC` buys more wakeups and more missed callbacks, not less latency (docs/NOTES.md).
 const DEVICE_BUFFER_FRAMES: u16 = 512;
 
-/// Chunks in flight between the decode thread and the audio callback. 64 × 5 ms = 320 ms of slack,
-/// matching `pf-client-core`; the ring, not this channel, is what bounds latency.
+/// Chunks in flight between the decode thread and the callback. 5 ms each.
 const CHUNK_QUEUE: usize = 64;
 
-/// The de-jitter preset for this platform. Not one of core's four (`PIPEWIRE`, `WASAPI`,
-/// `COREAUDIO`, `AAUDIO`) — those are named for audio stacks, and this ring is shaped by the
-/// device it runs on: a 2-3 core TV `SoC` whose UI rasterizes in software on the same silicon, over
-/// a TV Wi-Fi radio `docs/NOTES.md` measures at a ~245 Mbps ceiling with 10-29 s black-hole stalls
-/// on new flows.
+/// De-jitter tuning: core's Android preset, unmodified.
 ///
-/// Seeded from `JitterTuning::AAUDIO`, whose rationale is the closest match — we own the buffer,
-/// and Wi-Fi power-save bunching arrives as underruns, i.e. crackle. Held locally rather than
-/// upstreamed as a fifth preset until on-glass numbers justify specific values; the fields are
-/// public and the struct is not `#[non_exhaustive]`, so this costs core nothing.
+/// It is the right one on the merits rather than by convenience — `AAudio` hands the client a raw
+/// callback and makes it own the buffer, and Wi-Fi power-save bunching lands as underruns, which is
+/// exactly this TV's situation on a radio `docs/NOTES.md` measures with 10-29 s black-hole stalls
+/// on new flows. It is also, field for field, what this client's own local preset used to be
+/// (`base 25 / max 90 / headroom 40 / cap 120`), with the old `deprime_after: 5` **callbacks** now
+/// expressed as `deprime_ms: 60` — core moved that fuse to milliseconds precisely because a
+/// callback count means a different span of time on every device. So there is nothing left for a
+/// local copy to say, and a preset that tracks upstream is one fewer thing to re-tune by hand.
 ///
-/// Two invariants checked by hand against these numbers, both of which the parent programme
+/// Two invariants worth re-checking if it is ever forked, both of which the parent programme
 /// shipped broken once:
-///   * **The smooth shed fires strictly below the hard trim**, or drift correction is dead code and
-///     every correction is the audible drop it was meant to replace. `shed_excess_ms()` is
-///     `max(headroom/2, 2 × FRAME_MS)` = 20 ms, so the shed point is target+20 = 45 ms against a
-///     trim point of `min(target+40, 120)` = 65 ms. 45 < 65.
-///   * **The base target clears the device floor.** `effective_target` floors at `want + FRAME_MS`;
-///     at [`DEVICE_BUFFER_FRAMES`] that is 10.67 + 5 = 15.7 ms, under the 25 ms base — so the ring
-///     cannot oscillate prime → dropout → re-prime.
-///
-/// `deprime_ms` is a starvation window in MILLISECONDS of audio, not the count of consecutive short
-/// reads it used to be. The count was the bug: a callback is not a unit of time, so the same number
-/// meant a different fuse on every platform — 20 ms on iOS's 5 ms quantum against 44 ms on a Mac's
-/// 11 ms, and upstream measured 120 audible gaps per 10 minutes at the short end versus 1-3 at the
-/// long one. This device is not one of the badly bitten: at [`DEVICE_BUFFER_FRAMES`] the quantum is
-/// 10.67 ms, so the old `5` was already a ~53 ms fuse. 60 ms is therefore close to what this ring
-/// was doing, and is the value upstream picked for both Wi-Fi-transport presets — which is the
-/// right company for a TV. A `MIN_DEPRIME_CALLBACKS` floor inside core keeps real hysteresis on a
-/// large-quantum device, so this cannot de-prime on a single short read.
-const WEBOS_TUNING: JitterTuning = JitterTuning {
-    base_target_ms: 25,
-    max_target_ms: 90,
-    headroom_ms: 40,
-    hard_cap_ms: 120,
-    deprime_ms: 60,
-};
+/// * The smooth shed must fire strictly below the hard trim, or drift correction is dead code.
+///   `shed_excess_ms()` is `max(headroom/2, 2 × FRAME_MS)` = 20 ms, so the shed point is
+///   target+20 = 45 ms against a trim at `min(target+40, 120)` = 65 ms. 45 < 65. ✓
+/// * The base target must clear the device floor. `effective_target` floors at `want + FRAME_MS`;
+///   at [`DEVICE_BUFFER_FRAMES`] that is 10.67 + 5 = 15.7 ms, under the 25 ms base — so the ring
+///   cannot oscillate prime → dropout → re-prime. ✓
+const TUNING: JitterTuning = JitterTuning::AAUDIO;
 
-/// The cells the A/V sync loop trades through, all owned by `NativeClient`: the video plane and
-/// the clock handshake write the first two, this module writes the last two, and the stats overlay
-/// reads them. They live there rather than here because neither plane owns the other — the video
-/// sink cannot see the speaker, and the audio ring cannot see the glass.
-pub struct SyncCells {
-    /// Host-minus-client clock skew, live (re-synced mid-stream).
-    pub clock_offset: Arc<AtomicI64>,
-    /// The video plane's end-to-end latency in ns; `0` = nothing on the glass yet. Written by
-    /// `session::sink`.
-    pub video_e2e: Arc<AtomicU64>,
-    /// Smoothed A/V offset in ms, positive = audio playing LATE. Published for the HUD.
-    pub av_offset_ms: Arc<AtomicI64>,
-    /// Decoded audio queued ahead of the speaker, in ms. Published for the HUD.
-    pub buffer_ms: Arc<AtomicU32>,
-}
-
-/// The playback device. Holding it alive is the whole job — the ring drains on SDL's own audio
-/// thread from construction until this is dropped.
+/// The playback device. Holding it alive is the whole job — the ring drains on SDL's own
+/// audio thread from construction until this is dropped. See the module docs for when it is used
+/// at all.
 pub struct AudioPlayer {
+    /// Never read: this is a pure RAII guard. SDL drains the ring on its own audio thread from
+    /// `open_playback` until the device is dropped, so holding it IS the playback.
+    #[allow(dead_code)]
     device: sdl2::audio::AudioDevice<RingCallback>,
 }
 
 impl AudioPlayer {
-    /// Opens the device and returns it alongside the [`AudioFeed`] that fills it. `channels` is
-    /// host-resolved (the client MUST build its decoder from this, never from its own request).
+    /// Opens the device and returns it alongside the [`SdlAudioSink`] that fills it. `channels` is
+    /// host-resolved (the pipeline MUST build its decoder from this, never from its own request).
+    /// `buffer_ms` is where the ring publishes its depth for the stats overlay.
     ///
     /// The two halves are returned separately because they belong on different threads: the device
-    /// stays wherever SDL was initialised, and the feed moves to the decode thread.
-    pub fn new(sdl_audio: &sdl2::AudioSubsystem, channels: u8, cells: SyncCells) -> Result<(Self, AudioFeed)> {
-        let layout = layout_for(channels, false);
-        let decoder = opus::MSDecoder::new(SAMPLE_RATE, layout.streams, layout.coupled, layout.mapping)
-            .map_err(|e| anyhow::anyhow!("opus MSDecoder::new: {e}"))?;
+    /// stays wherever SDL was initialised, and the sink moves to the audio thread.
+    pub fn new(
+        sdl_audio: &sdl2::AudioSubsystem,
+        channels: u8,
+        buffer_ms: Arc<AtomicU32>,
+    ) -> Result<(Self, SdlAudioSink)> {
         let spec = sdl2::audio::AudioSpecDesired {
             freq: Some(SAMPLE_RATE as i32),
-            channels: Some(layout.channels),
+            channels: Some(channels),
             samples: Some(DEVICE_BUFFER_FRAMES),
         };
+        let depth_cell = buffer_ms.clone();
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(CHUNK_QUEUE);
         let (recycle_tx, recycle_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(CHUNK_QUEUE);
-        let sync: Arc<AudioSyncCell> = Arc::default();
-        let sync_cb = sync.clone();
-        // Interleaved samples sitting in the chunk channel — decoded, not yet in the ring. Part of
-        // what a packet queued now must wait behind, so it belongs in the A/V measurement; see
-        // `AudioFeed::observe_av`. Balanced by construction: added once on a successful send,
-        // subtracted once on receipt.
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let in_flight_cb = in_flight.clone();
         let device = sdl_audio
-            .open_playback(None, &spec, |obtained| {
-                // Build the policy from what the device ACTUALLY negotiated, not what was asked
-                // for: the policy's depths are denominated in interleaved samples, so a channel
-                // count that differs here would silently scale every threshold.
-                RingCallback {
-                    rx: pcm_rx,
-                    recycle: recycle_tx,
-                    ring: VecDeque::new(),
-                    policy: JitterPolicy::new(WEBOS_TUNING, obtained.channels),
-                    sync: sync_cb,
-                    in_flight: in_flight_cb,
-                    underruns: 0,
-                    sheds: 0,
-                    callbacks: 0,
-                }
+            .open_playback(None, &spec, |obtained| RingCallback {
+                rx: pcm_rx,
+                recycle: recycle_tx,
+                ring: VecDeque::new(),
+                // Built from what the device actually negotiated, not what was asked for: the
+                // policy denominates every depth in interleaved samples, so a channel count that
+                // disagrees with the ring's stride would scale every target silently.
+                policy: JitterPolicy::new(TUNING, obtained.channels),
+                per_ms: (SAMPLE_RATE as usize / 1000) * obtained.channels as usize,
+                buffer_ms,
+                underruns: 0,
+                sheds: 0,
+                trims: 0,
+                dropped_ms: 0,
+                callbacks: 0,
             })
             .map_err(|e| anyhow::anyhow!("SDL open_playback: {e}"))?;
         let obtained = *device.spec();
-        if obtained.channels != layout.channels || obtained.freq != SAMPLE_RATE as i32 {
+        // The device quantum is the other half of this route's latency, and SDL is free to
+        // negotiate something other than what was asked for — a larger one also silently raises the
+        // policy's effective target, which is floored at `one callback + 5 ms`. Unlogged, there was
+        // no way to tell from a session log where the software route's buffering actually went.
+        tracing::info!(
+            "SDL audio device: {} driver, {}ch @{}Hz, {} frame(s) per callback ({:.1}ms), format {:?}",
+            sdl_audio.current_audio_driver(),
+            obtained.channels,
+            obtained.freq,
+            obtained.samples,
+            f64::from(obtained.samples) * 1000.0 / f64::from(obtained.freq.max(1)),
+            obtained.format,
+        );
+        if obtained.channels != channels || obtained.freq != SAMPLE_RATE as i32 {
             // Not fatal — SDL converts — but it means the decoder and the device disagree about
             // the frame shape, which is worth seeing in a log before it is heard.
             tracing::warn!(
                 "audio device negotiated {}ch @{}Hz, stream is {}ch @{}Hz",
                 obtained.channels,
                 obtained.freq,
-                layout.channels,
+                channels,
                 SAMPLE_RATE,
             );
         }
         device.resume();
-        let channels = layout.channels as usize;
         Ok((
             Self { device },
-            AudioFeed {
+            SdlAudioSink {
                 pcm_tx,
-                recycle_rx,
-                decoder,
+                recycle_rx: std::sync::Mutex::new(recycle_rx),
                 channels,
-                per_ms: (SAMPLE_RATE / 1000) as usize * channels,
-                gaps: AudioGapTracker::new(),
-                av: AvSync::new(layout.channels),
-                cells,
-                sync,
-                in_flight,
+                buffer_ms: depth_cell,
             },
         ))
     }
-
-    /// The device's actually-negotiated spec — may differ from what was requested if
-    /// the device doesn't support it exactly.
-    pub fn spec(&self) -> &sdl2::audio::AudioSpec {
-        self.device.spec()
-    }
 }
 
-/// The decode half: Opus → PCM, loss concealment, the A/V measurement, and the hand-off to the
-/// ring. Lives on its own thread (`session::pump`'s audio feed).
-pub struct AudioFeed {
+/// The feed half of the device, as the pipeline sees it: hand it f32 samples in punktfunk's own
+/// channel order and they reach SDL's callback with no conversion anywhere.
+///
+/// Timestamps are ignored — this device has no timeline to land on, it plays what it is given in
+/// the order it arrives. That is the whole difference between this route and the two that ride
+/// NDL's plane, and the reason the pipeline stamps every route the same way regardless.
+pub struct SdlAudioSink {
     pcm_tx: SyncSender<Vec<f32>>,
-    /// Drained chunk `Vec`s coming back from the callback for reuse — the pool half of the chunk
-    /// channel, so steady-state playback stops allocating (~200 chunks/s otherwise).
-    recycle_rx: Receiver<Vec<f32>>,
-    decoder: opus::MSDecoder,
-    channels: usize,
-    /// Interleaved samples per millisecond at the negotiated layout (48 × channels).
-    per_ms: usize,
-    /// Detects packets lost on the wire so they can be concealed rather than skipped.
-    gaps: AudioGapTracker,
-    /// A/V synchronisation, **measure-only for now** — see [`AudioFeed::observe_av`].
-    av: AvSync,
-    cells: SyncCells,
-    /// Depth out of the callback.
-    sync: Arc<AudioSyncCell>,
-    /// Decoded samples handed off but not yet in the ring — see its construction site.
-    in_flight: Arc<AtomicUsize>,
+    /// Drained chunk `Vec`s coming back from the callback for reuse, so steady-state playback
+    /// stops allocating (~200 chunks/s otherwise). Behind a `Mutex` only because `AudioSink` is
+    /// shared: one thread feeds it, and the lock is never contended.
+    recycle_rx: std::sync::Mutex<Receiver<Vec<f32>>>,
+    channels: u8,
+    /// Where the ring publishes its depth, so [`AudioSink::depth_ms`] can read it back.
+    buffer_ms: Arc<AtomicU32>,
 }
 
-impl AudioFeed {
-    /// Decodes one Opus packet (concealing anything lost immediately before it) and hands the PCM
-    /// to the ring. Returns the peak sample — a diagnostic that separates "the host is sending
-    /// silence" from "the speaker is not working".
-    pub fn play(&mut self, seq: u32, pts_ns: u64, opus_payload: &[u8]) -> Result<f32> {
-        self.observe_av(pts_ns, self.sync.depth(), self.in_flight.load(Ordering::Relaxed));
+impl AudioSink for SdlAudioSink {
+    fn name(&self) -> &'static str {
+        "SDL device"
+    }
 
-        // Conceal whatever went missing immediately before this packet. libopus PLC (decode with
-        // empty input) interpolates a frame; the alternative is a hard gap, i.e. a click.
-        for _ in 0..self.gaps.missing_before(seq) {
-            let mut pcm = [0f32; SAMPLES_PER_FRAME * MAX_CHANNELS];
-            // One frame, not the whole scratch buffer: with no packet to describe it, libopus
-            // takes `out.len() / channels` as the frame size and rejects one that isn't legal —
-            // 5.1 gives 1920/6 = 320. A decode WITH a packet tolerates the oversized buffer,
-            // which is why only concealment failed.
-            let out = &mut pcm[..SAMPLES_PER_FRAME * self.channels];
-            let n = self
-                .decoder
-                .decode_float(&[], out, false)
-                .map_err(|e| anyhow::anyhow!("opus PLC decode: {e}"))?;
-            self.push(&pcm[..n * self.channels]);
+    fn format(&self) -> AudioFormat {
+        AudioFormat::PcmF32 {
+            channels: self.channels,
+            sample_rate: SAMPLE_RATE,
         }
-
-        let mut pcm = [0f32; SAMPLES_PER_FRAME * MAX_CHANNELS];
-        let samples_per_channel = self
-            .decoder
-            .decode_float(opus_payload, &mut pcm, false)
-            .map_err(|e| anyhow::anyhow!("opus decode_float: {e}"))?;
-        let decoded = &pcm[..samples_per_channel * self.channels];
-        let peak = decoded.iter().fold(0f32, |m, &s| m.max(s.abs()));
-        self.push(decoded);
-        Ok(peak)
     }
 
     /// Hands one decoded chunk to the ring, reusing a pooled `Vec` where one is available.
     ///
-    /// A full channel drops the chunk rather than blocking: this runs on the decode thread, and
-    /// blocking it would back pressure into the transport. A wedged callback is already a fault
-    /// the ring's own underrun path reports.
-    fn push(&mut self, pcm: &[f32]) {
-        let mut buf = self.recycle_rx.try_recv().unwrap_or_default();
+    /// A full channel drops the chunk rather than blocking: this runs on the audio thread, and
+    /// blocking it would back-pressure into the transport.
+    fn feed(&self, samples: Samples<'_>, _host_pts_ns: u64) -> Result<()> {
+        let Samples::F32(pcm) = samples else {
+            anyhow::bail!("SDL device takes f32 samples only");
+        };
+        let mut buf = self
+            .recycle_rx
+            .lock()
+            .map_or_else(|_| Vec::new(), |rx| rx.try_recv().unwrap_or_default());
         buf.clear();
         buf.extend_from_slice(pcm);
-        let n = buf.len();
-        // Counted only on a successful send, so a dropped chunk cannot strand samples in the
-        // in-flight tally forever.
-        if self.pcm_tx.try_send(buf).is_ok() {
-            self.in_flight.fetch_add(n, Ordering::Relaxed);
-        }
+        let _ = self.pcm_tx.try_send(buf);
+        Ok(())
     }
 
-    /// Fold one packet into the A/V offset measurement, and publish both the offset and the ring
-    /// depth for the stats overlay.
-    ///
-    /// **Measure-only, deliberately: nothing steers.** The offset and the ring depth are
-    /// published — they are the instrument, and a latency report with no instrument behind it is
-    /// what this whole programme exists to end — but no target is ever posted back to
-    /// [`JitterPolicy`], so `AvSync::desired_depth` goes uncalled.
-    ///
-    /// The blocker is the video reference: `session::sink::video_e2e_ns` omits a term NDL never
-    /// reports, which biases this offset high by that whole term — its docs carry the arithmetic
-    /// and what arming the loop would take.
-    ///
-    /// **Two depths, and they are not interchangeable.** `ring_depth` is what the audio callback
-    /// owns and the only thing [`JitterPolicy`] can actually move. `in_flight` is decoded PCM
-    /// already handed off but still in the chunk channel — invisible to the policy, but just as
-    /// real to a listener, since it must play before anything queued now does. The *measurement*
-    /// uses the sum (that is the packet's true wait); the *correction* is expressed against the
-    /// ring alone, because the policy interprets its target in ring samples. Handing the sum to
-    /// `desired_depth` would inflate every target by the channel's contents.
-    fn observe_av(&mut self, pts_ns: u64, ring_depth: usize, in_flight: usize) {
-        let buffered_ahead = ring_depth + in_flight;
-        // Published unconditionally — the depth is worth seeing whether or not the loop is acting,
-        // and it is what makes an "audio is late" report triageable at all.
-        self.cells
-            .buffer_ms
-            .store((buffered_ahead / self.per_ms.max(1)) as u32, Ordering::Relaxed);
-        let video_e2e = self.cells.video_e2e.load(Ordering::Relaxed);
-        self.av.observe(AvSyncObservation {
-            pts_ns,
-            now_local_ns: punktfunk_core::client::now_realtime_ns(),
-            clock_offset_ns: self.cells.clock_offset.load(Ordering::Relaxed),
-            buffered_ahead,
-            // 0 = nothing on the glass yet; with no reference there is nothing to measure against.
-            video_e2e_ns: (video_e2e > 0).then_some(video_e2e),
-        });
-        self.cells
-            .av_offset_ms
-            .store(i64::from(self.av.offset_ms()), Ordering::Relaxed);
+    fn depth_ms(&self) -> Option<i64> {
+        Some(i64::from(self.buffer_ms.load(Ordering::Relaxed)))
     }
 }
 
-/// The playback half, owned by SDL's audio thread. Drains the chunk channel into a ring it owns
-/// outright, then serves the callback from it under the shared de-jitter policy.
+/// The playback half, owned by SDL's audio thread: drain the channel into a ring, and serve it
+/// under [`TUNING`]'s de-jitter policy. Every decision about priming, drift and de-priming belongs
+/// to [`JitterPolicy`] — see the module docs for why this is core's state machine and not a local
+/// one.
 struct RingCallback {
     rx: Receiver<Vec<f32>>,
     recycle: SyncSender<Vec<f32>>,
     ring: VecDeque<f32>,
-    /// Prime depth in MILLISECONDS, an underrun-driven adaptive floor, and a crossfaded 5 ms drift
-    /// shed so latency returns to target instead of ratcheting. See [`WEBOS_TUNING`].
+    /// The shared de-jitter state machine. Allocation- and syscall-free by contract, which is what
+    /// makes it safe to run inside a realtime audio callback.
     policy: JitterPolicy,
-    /// Depth out to the decode thread, target in.
-    sync: Arc<AudioSyncCell>,
-    /// Samples still in the chunk channel; decremented as they are drained into the ring.
-    in_flight: Arc<AtomicUsize>,
+    /// Interleaved samples per millisecond, for the counters below.
+    per_ms: usize,
+    buffer_ms: Arc<AtomicU32>,
     underruns: u64,
+    /// Smooth drift sheds — the policy working. Counted apart from [`Self::trims`] because they
+    /// mean opposite things: sheds are drift being corrected inaudibly, trims are the link
+    /// outrunning the headroom.
     sheds: u64,
+    trims: u64,
+    /// Total audio discarded by either correction.
+    dropped_ms: u64,
     callbacks: u64,
 }
 
@@ -320,55 +234,78 @@ impl sdl2::audio::AudioCallback for RingCallback {
 
     fn callback(&mut self, out: &mut [f32]) {
         while let Ok(mut chunk) = self.rx.try_recv() {
-            self.in_flight.fetch_sub(chunk.len(), Ordering::Relaxed);
             self.ring.extend(chunk.iter().copied());
             // Return the drained Vec to the pool; a full/closed pool just drops it.
             chunk.clear();
             let _ = self.recycle.try_send(chunk);
         }
 
-        // `out` is interleaved samples for this callback — exactly the `want` the policy is
-        // denominated in.
-        let want = out.len();
-        // Take whatever depth the decode thread's sync loop last asked for, and publish where the
-        // ring actually is so it can measure the result. `None` (nothing armed, or inside the
-        // deadband) reproduces the un-synced behaviour exactly.
-        self.policy.set_sync_target(self.sync.target());
-        self.sync.publish_depth(self.ring.len());
-        let step = self.policy.step(self.ring.len(), want);
+        let step = self.policy.step(self.ring.len(), out.len());
         if step.drop_front > 0 {
-            self.sheds += 1;
+            // Faded on BOTH paths. The hard trim used to splice raw on the reasoning that a ring
+            // which blew its ceiling is already a discontinuity — but that describes the arrivals,
+            // not the samples either side of the seam, and the trim is the drop that actually
+            // fires in the field.
             crossfade_drop(&mut self.ring, step.drop_front, step.crossfade);
+            self.dropped_ms += (step.drop_front / self.per_ms.max(1)) as u64;
+            if step.hard_trim {
+                self.trims += 1;
+            } else {
+                self.sheds += 1;
+            }
+        }
+        // The SMOOTHED depth, not the instantaneous one: the raw figure swings by a whole device
+        // quantum every callback, and this is what drift correction actually reacts to.
+        self.buffer_ms.store(self.policy.avg_depth_ms(), Ordering::Relaxed);
+
+        // Priming, or re-priming after a sustained drain. Serving a ring shallower than one
+        // callback only produces a run of half-empty callbacks, i.e. continuous crackle instead of
+        // one gap. `note_read` is skipped deliberately — core ignores un-primed reads, and a
+        // deliberate silence is not an underrun.
+        if step.silence {
+            out.fill(0.0);
+            self.log_periodically();
+            return;
         }
 
-        let mut ran_short = false;
-        for slot in out.iter_mut() {
-            *slot = if step.silence {
-                0.0
-            } else {
-                self.ring.pop_front().unwrap_or_else(|| {
-                    ran_short = true;
-                    0.0
-                })
-            };
+        // Two `copy_from_slice`s at most (the ring wraps once), rather than one `pop_front` per
+        // sample: this runs on SDL's audio thread against a hard deadline.
+        let served = out.len().min(self.ring.len());
+        let (head, tail) = self.ring.as_slices();
+        let from_head = served.min(head.len());
+        out[..from_head].copy_from_slice(&head[..from_head]);
+        out[from_head..served].copy_from_slice(&tail[..served - from_head]);
+        self.ring.drain(..served);
+        let ran_short = served < out.len();
+        if ran_short {
+            out[served..].fill(0.0);
+            self.underruns += 1;
         }
-        // No-op while un-primed (the policy ignores it), so a deliberate priming silence is never
-        // miscounted as an underrun.
+        // Drives both the de-prime hysteresis and the adaptive floor, so it must be reported for
+        // every read the policy authorised — including the ones that went fine.
         self.policy.note_read(ran_short);
-        self.underruns += u64::from(ran_short);
+        self.log_periodically();
+    }
+}
+
+impl RingCallback {
+    /// ~10 s at this device quantum. `target_ms` is the adaptive floor's current answer — the one
+    /// figure that says whether this set needed more slack than the preset's base, and the
+    /// evidence for whether the policy is earning its place here.
+    fn log_periodically(&mut self) {
         self.callbacks += 1;
-        // ~10 s at this device quantum. The exact cadence does not matter; that the plane stops
-        // being invisible does — before this, the only audio signal in a log was a per-packet
-        // "underrun" line from the feed side, which said the queue was empty without saying how
-        // deep it was supposed to be.
-        if self.callbacks % 1_000 == 0 {
-            tracing::debug!(
-                buffer_ms = self.policy.avg_depth_ms(),
-                target_ms = self.policy.target_ms(),
-                underruns = self.underruns,
-                drift_sheds = self.sheds,
-                "audio playback"
-            );
+        if self.callbacks % 1_000 != 0 {
+            return;
         }
+        tracing::debug!(
+            buffer_ms = self.policy.avg_depth_ms(),
+            target_ms = self.policy.target_ms(),
+            primed = self.policy.is_primed(),
+            underruns = self.underruns,
+            sheds = self.sheds,
+            trims = self.trims,
+            dropped_ms = self.dropped_ms,
+            "audio playback (SDL device)"
+        );
     }
 }

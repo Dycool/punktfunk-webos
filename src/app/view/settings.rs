@@ -5,7 +5,7 @@ use crate::app::menu::SettingsScope;
 use crate::app::view::scrolllist;
 use crate::core::model;
 use crate::core::VERSION;
-use crate::services::store::{GamepadType, Settings, VideoBackend};
+use crate::services::store::{AudioRoutePref, GamepadType, Settings, VideoBackend};
 use crate::ui;
 use crate::ui::render::Rect;
 use crate::ui::widgets::FocusRow;
@@ -26,21 +26,29 @@ pub(crate) const TITLE: &str = "Settings";
 fn lock_caption(lock: menu::RowLock, webos_major: Option<u32>) -> String {
     // Where the Video backend row exists, the limit is the *pick*, not the TV, and SMP lifts it —
     // so the caption points at the fix instead of at a version number the user can't change.
+    // The set itself, for a limit no backend pick can lift. `source` names the *fixable* one.
+    let device = || match webos_major {
+        Some(major) => format!("webOS {major}"),
+        None => "this TV".to_string(),
+    };
     let source = || {
         if crate::core::caps::smp_selectable() {
             "the NDL backend — try SMP".to_string()
         } else {
-            match webos_major {
-                Some(major) => format!("webOS {major}"),
-                None => "this TV".to_string(),
-            }
+            device()
         }
     };
     match lock {
         menu::RowLock::HdrNeedsHevc => "HDR is not supported by H.264".to_string(),
         menu::RowLock::NoHdr => format!("HDR is not supported by {}", source()),
         menu::RowLock::OneCodec => format!("H.264 is the only codec supported by {}", source()),
-        menu::RowLock::StereoOnly => format!("Stereo is the only audio supported by {}", source()),
+        menu::RowLock::StereoOnly => format!("Stereo is the only layout supported by {}", source()),
+        // Names the pick AND where it lives: a caption that only said "stereo only" would leave
+        // the user with nowhere to go.
+        menu::RowLock::RouteStereoOnly => format!(
+            "{} audio processing decodes stereo only — change it under Experimental",
+            menu::audio_route_label(AudioRoutePref::NdlOpus),
+        ),
         menu::RowLock::NoGamepad => "Connect a controller to your TV".to_string(),
     }
 }
@@ -110,7 +118,7 @@ pub(crate) fn rows(
         menu::SettingsRow::Audio => FocusRow::dropdown(
             crate::app::view::icons::ICON_SIGNAL,
             "Audio",
-            menu::audio_label(settings.audio_channels),
+            menu::audio_label(menu::audio_row_channels(settings)),
         ),
         menu::SettingsRow::Gamepad => FocusRow::dropdown(
             crate::app::view::icons::ICON_GAMEPAD,
