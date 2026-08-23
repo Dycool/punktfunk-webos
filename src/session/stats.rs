@@ -16,6 +16,12 @@ pub struct StreamStats {
     pub feed_us: AtomicU32,
     /// NDL render-buffer backlog or -1 if unavailable.
     pub render_backlog: AtomicI32,
+    /// The live mapping's measured jitter (mean absolute deviation of `ready − pts`), in µs, and
+    /// the frames it stamped too late to pace — see `session::timeline::PacingHealth`. Published on
+    /// the heartbeat's cadence under both mappings, so a stutter report can be read against them
+    /// whichever one produced it.
+    pub pacing_jitter_us: AtomicU32,
+    pub pacing_late: AtomicU64,
     /// Audio-plane queue depth in ms (`NdlVideo::audio_plane_lead_ms`). A video figure as much as
     /// an audio one — NDL paces the picture on this — and can legitimately be negative, so there
     /// is no sentinel: the overlay prints it only on a route that has a plane.

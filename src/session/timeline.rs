@@ -1,5 +1,9 @@
-//! Timeline plumbing for the video pump: the panel-reconciled frame interval and the
-//! host-PTS → player-clock anchor NDL needs (it has no PTS clock of its own).
+//! Timeline plumbing for the video pump: the panel-reconciled frame interval, and the
+//! host-PTS → player-clock mapping NDL needs (it has no PTS clock of its own).
+//!
+//! Two mappings, picked by [`Pacing`]: the cadence loop ([`CadencePacer`], the default) and the
+//! fixed anchor ([`HostPtsAnchor`], the Experimental escape hatch). Exactly one is live per
+//! session — see [`Pacing`] for why they are not both folded.
 
 use crate::platform::webos::sdl_webos;
 
@@ -28,6 +32,222 @@ pub fn reconciled_frame_interval_ns(stream_hz: u32) -> u64 {
         None => stream_hz,
     };
     1_000_000_000 / u64::from(hz.max(1))
+}
+
+/// Frames the cadence loop folds before the audio plane may latch its mapping
+/// ([`CadencePacer::ready_for_audio`]). Half a second at 60 Hz — long enough for the offset
+/// estimate to leave its cold-start sample behind, short enough that offloaded audio is not
+/// audibly missing at session start. The trim path's own gate is [`TRIM_SETTLE_NS`], which is a
+/// different quantity and cannot be shared: that one waits for trimming to STOP, and this loop
+/// never stops moving.
+const PACER_AUDIO_LATCH_FRAMES: u64 = 30;
+
+/// Plays frames out on the host's own cadence instead of on their arrival instant, by stamping
+/// them from [`punktfunk_core::phase::CadenceClock`] rather than from a fixed anchor.
+///
+/// **Why this is a different shape from [`HostPtsAnchor`], not a tweak to it.** The anchor is a
+/// constant taken from frame 0 plus a one-off trim: it has no rate term (two free-running crystals
+/// produce a ramp, so the session's real lead walks away over minutes with nothing to pull it
+/// back), and its jitter margin is whatever [`TRIM_KEEP_NS`] happens to be — 4 ms, chosen for
+/// latency, and below the arrival spread of an ordinary link. Every frame arriving later than that
+/// margin is stamped in the player clock's past, which NDL answers by presenting it at feed
+/// cadence: the judder. `CadenceClock` is a type-2 loop over the same quantity (`ready − pts`) and
+/// sizes its cushion from the measured mean absolute deviation, capped at one frame interval.
+///
+/// **It smooths the OFFSET, never the timestamps** — that is core's invariant, tested there by
+/// `preserves_source_cadence`, and it is the property that makes this honest: a game genuinely
+/// rendering at an irregular rate still looks exactly as irregular as it is. What is removed is
+/// the transport's contribution, not the source's.
+///
+/// **The default**, because the cushion it pays is measured rather than chosen: on a link with
+/// nothing wrong it collapses to its 0.5 ms floor and costs essentially nothing, and it only grows
+/// where there is real jitter to cover. `Settings::direct_playback` (Experimental) is the way back
+/// to the anchor.
+pub struct CadencePacer {
+    clock: punktfunk_core::phase::CadenceClock,
+    /// The source's nominal interval, and the cushion's ceiling (see `CadenceClock::cushion_ns`)
+    /// — see [`Self::new`] for why it is not the panel's.
+    source_interval_ns: i64,
+    /// Last stamp handed out this run. NDL reads a stamp going backwards as a rewind and answers
+    /// by muting the session for good, and the cushion CAN shrink between frames, so the sequence
+    /// is clamped monotonic — exactly as [`HostPtsAnchor::map`] does, and reset with the run for
+    /// the same reason (a flush restarts the timeline).
+    last_base_ns: u64,
+    /// Frames folded since the last [`Self::reset`], for [`Self::ready_for_audio`]. Not read off
+    /// `CadenceHealth::frames`, which counts the whole session.
+    frames_this_run: u64,
+}
+
+impl CadencePacer {
+    /// `source_interval_ns` is the negotiated STREAM mode's frame interval — the cadence the host
+    /// produces — and never the panel's. It is the cushion's ceiling, so a panel period would let a
+    /// stream running faster than the panel be held for longer than its own cadence justifies.
+    pub fn new(source_interval_ns: u64) -> Self {
+        Self {
+            // `snapping`, not `free_running`: NDL presents on the panel's own grid, so the snap-up
+            // to the next latch already carries roughly half a refresh of implicit slack and the
+            // cushion does not have to cover the distribution alone.
+            clock: punktfunk_core::phase::CadenceClock::new(punktfunk_core::phase::CadenceTuning::snapping()),
+            source_interval_ns: i64::try_from(source_interval_ns).unwrap_or(i64::MAX),
+            last_base_ns: 0,
+            frames_this_run: 0,
+        }
+    }
+
+    /// Fold one frame and return its stamp in the player's clock domain. `player_clock_ns` is when
+    /// the frame became presentable, i.e. now — the loop is domain-agnostic, so the constant
+    /// between the host's capture clock and NDL's player clock is simply absorbed by the offset
+    /// estimate and there is no conversion anywhere in this path.
+    pub fn map(&mut self, host_pts_ns: u64, player_clock_ns: u64) -> u64 {
+        self.frames_this_run += 1;
+        let ready = i64::try_from(player_clock_ns).unwrap_or(i64::MAX);
+        let due = self.clock.due_ns(host_pts_ns, ready, self.source_interval_ns);
+        // A due time in the past is a late frame and core's contract is "present at the next
+        // opportunity" — which is what handing NDL a stamp at or behind its clock already means.
+        let base = u64::try_from(due).unwrap_or(0).max(self.last_base_ns);
+        self.last_base_ns = base;
+        base
+    }
+
+    /// Drop the run: the timeline jumped (a freeze-until-reanchor hold), so the offset estimate no
+    /// longer describes anything. The loop keeps its jitter estimate on purpose — that describes
+    /// the link, not the stream, and a cushion collapsing to its floor after every recovery would
+    /// spend the next few hundred frames presenting late.
+    pub fn reset(&mut self) {
+        self.clock.reset();
+        self.frames_this_run = 0;
+        // Cleared with the run, like the anchor's own: NDL has been flushed, so the stamps that
+        // came before it are no longer a floor this run has to clear.
+        self.last_base_ns = 0;
+    }
+
+    /// Whether the audio plane may latch this mapping — see [`PACER_AUDIO_LATCH_FRAMES`].
+    pub fn ready_for_audio(&self) -> bool {
+        self.frames_this_run >= PACER_AUDIO_LATCH_FRAMES
+    }
+
+    fn health(&self) -> punktfunk_core::phase::CadenceHealth {
+        self.clock.health()
+    }
+}
+
+/// What the live mapping has to say for itself, on the video heartbeat and the stats overlay.
+/// One shape for both mappings, so a report reads the same whichever is in use — a field a mapping
+/// has no notion of is simply `0`.
+#[derive(Clone, Copy, Default)]
+pub struct PacingHealth {
+    /// Measured jitter (mean absolute deviation of `ready − pts`), and what the cadence loop holds
+    /// to cover it. Both `0` under the anchor, which measures neither.
+    pub jitter_ns: i64,
+    pub cushion_ns: i64,
+    /// Frames whose stamp was already behind the player clock when fed: presented at feed cadence
+    /// rather than paced, which is the judder. **The one figure both mappings publish**, so it is
+    /// what a before/after comparison rests on.
+    pub late_stamps: u64,
+    /// Times the mapping gave up tracking and re-anchored.
+    pub reanchors: u64,
+    /// Standing lead the anchor has trimmed off this run, in ns. `0` under the cadence loop, which
+    /// has no trim — its offset estimate is the whole mechanism.
+    pub trimmed_ns: u64,
+}
+
+/// The host-PTS → player-clock mapping this session stamps with.
+///
+/// **Only the live one is folded.** Both are stateful over the whole run, so running the idle one
+/// in the shadows would cost a mapping that is never read and a second set of numbers describing a
+/// session nobody is watching. What makes the two comparable is [`PacingHealth::late_stamps`],
+/// computed from the stamp actually used and so present on both paths.
+pub struct Pacing {
+    mode: Mode,
+    /// Frames fed with a stamp already behind the player clock — see [`PacingHealth::late_stamps`].
+    /// Held here rather than in either mapping precisely because it must mean the same thing on
+    /// both.
+    late_stamps: u64,
+}
+
+enum Mode {
+    /// The default — see [`CadencePacer`].
+    Cadence(CadencePacer),
+    /// `Settings::direct_playback`: the fixed anchor plus its one-off trim, the mapping this client
+    /// shipped before the cadence loop. Kept as the escape hatch for a set where the loop
+    /// misbehaves, and as the lowest-latency answer for anyone who would rather have the judder
+    /// than the cushion.
+    Anchor(HostPtsAnchor),
+}
+
+impl Pacing {
+    /// `source_interval_ns` is the stream mode's own interval — see [`CadencePacer::new`]. The
+    /// anchor's ramp is sized against the same quantity: it pays trim debt off per FRAME, and a
+    /// frame is what the source, not the panel, delivers.
+    pub fn new(source_interval_ns: u64, direct: bool) -> Self {
+        Self {
+            mode: if direct {
+                Mode::Anchor(HostPtsAnchor::new(source_interval_ns))
+            } else {
+                Mode::Cadence(CadencePacer::new(source_interval_ns))
+            },
+            late_stamps: 0,
+        }
+    }
+
+    /// This frame's stamp in the player's clock domain, and the late-stamp bookkeeping with it.
+    pub fn map(&mut self, host_pts_ns: u64, player_clock_ns: u64) -> u64 {
+        let base = match &mut self.mode {
+            Mode::Cadence(p) => p.map(host_pts_ns, player_clock_ns),
+            Mode::Anchor(a) => a.map(host_pts_ns, player_clock_ns),
+        };
+        if base <= player_clock_ns {
+            self.late_stamps += 1;
+        }
+        base
+    }
+
+    /// Drop the run: the timeline jumped and nothing derived from it holds.
+    pub fn reset(&mut self) {
+        match &mut self.mode {
+            Mode::Cadence(p) => p.reset(),
+            Mode::Anchor(a) => a.reset(),
+        }
+    }
+
+    /// Whether the audio plane may latch this mapping. The two settle on different evidence and
+    /// cannot share a gate: the anchor waits for trimming to STOP, and the cadence loop never stops
+    /// moving, so it waits for enough frames instead.
+    pub fn ready_for_audio(&self) -> bool {
+        match &self.mode {
+            Mode::Cadence(p) => p.ready_for_audio(),
+            Mode::Anchor(a) => a.ready_for_audio(),
+        }
+    }
+
+    pub fn health(&self) -> PacingHealth {
+        let late_stamps = self.late_stamps;
+        match &self.mode {
+            Mode::Cadence(p) => {
+                let h = p.health();
+                PacingHealth {
+                    jitter_ns: h.jitter_ns,
+                    cushion_ns: h.cushion_ns,
+                    late_stamps,
+                    reanchors: h.reanchors,
+                    trimmed_ns: 0,
+                }
+            }
+            Mode::Anchor(a) => PacingHealth {
+                late_stamps,
+                trimmed_ns: a.trimmed_ns(),
+                ..PacingHealth::default()
+            },
+        }
+    }
+
+    /// Which mapping is live, for the log line and the overlay.
+    pub fn label(&self) -> &'static str {
+        match &self.mode {
+            Mode::Cadence(_) => "paced",
+            Mode::Anchor(_) => "direct",
+        }
+    }
 }
 
 /// Window the lead minimum is taken over (see [`HostPtsAnchor::observe_lead`]). Short enough
@@ -330,6 +550,32 @@ mod tests {
             let base = a.map(stuck, stuck + 5_000_000 + repeat);
             assert!(base >= last, "repeat {repeat}: {base} < {last}");
             last = base;
+        }
+    }
+
+    /// The cadence loop's cushion moves with the measured jitter, and a repeated host PTS gains
+    /// nothing to cover a shrinking one — either way the stamp would step BACKWARDS, which NDL
+    /// reads as a rewind and answers by muting the session for the rest of the run. Proven
+    /// non-vacuous by planting the defect (dropping the `.max(last_base_ns)` in
+    /// `CadencePacer::map`), which fails this.
+    #[test]
+    fn the_pacer_never_walks_a_stamp_backwards_within_a_run() {
+        let interval = 16_666_666u64;
+        let mut p = CadencePacer::new(interval);
+        let mut last = 0;
+        // A jittery opening (which builds a cushion), then a dead-calm tail (which shrinks it),
+        // with a repeated stamp thrown in where the shrink is fastest.
+        for i in 0..600u64 {
+            let host_pts = i * interval;
+            let jitter = if i < 200 { (i % 7) * 2_000_000 } else { 0 };
+            let base = p.map(host_pts, host_pts + 10_000_000 + jitter);
+            assert!(base >= last, "frame {i}: {base} < {last}");
+            last = base;
+            if i == 200 {
+                let repeat = p.map(host_pts, host_pts + 10_000_000);
+                assert!(repeat >= last, "repeat: {repeat} < {last}");
+                last = repeat;
+            }
         }
     }
 

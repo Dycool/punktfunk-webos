@@ -811,6 +811,18 @@ pub(super) fn run_inner() -> Result<()> {
                             connected.audio_buffer_ms()
                         ));
                     }
+                    // `late` is the judder, counted: frames NDL was handed too late to pace them.
+                    // `jitter` is what the cadence loop sizes its cushion from, and the anchor
+                    // measures none, so the direct mapping prints its name instead of a zero.
+                    let late = connected.stats().pacing_late.load(Ordering::Relaxed);
+                    lines.push(if connected.direct_playback {
+                        format!("Pace direct · late {late}")
+                    } else {
+                        format!(
+                            "Pace jitter {:.1} ms · late {late}",
+                            connected.stats().pacing_jitter_us.load(Ordering::Relaxed) as f32 / 1000.0,
+                        )
+                    });
                     if let Some(line) = cpu_mem_line {
                         lines.push(line);
                     }
