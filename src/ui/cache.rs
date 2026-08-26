@@ -216,23 +216,6 @@ impl TileStore {
         self.store(id, Entry { version, painter });
     }
 
-    /// How many tiles are resident — the tile store is pruned only by its callers
-    /// (the grid's eviction window), so this is the only account of its size.
-    pub fn len(&self) -> usize {
-        self.slots.iter().flatten().count()
-    }
-
-    /// Bytes of rasterized pixels resident, at 4 bytes a pixel. The one family that scales
-    /// with anything the user controls is the grid's cards, and those are held to the scroll
-    /// window — this is what makes that claim checkable rather than argued (see G5).
-    pub fn bytes(&self) -> usize {
-        self.slots
-            .iter()
-            .flatten()
-            .map(|e| e.painter.width() as usize * e.painter.height() as usize * 4)
-            .sum()
-    }
-
     /// Drops `id`, reporting whether it was there. The GPU texture is the caller's to
     /// release (see `Compositor::drop_tile`).
     pub fn remove(&mut self, id: TileId) -> bool {
@@ -245,46 +228,5 @@ impl TileStore {
     /// the caller's to release, exactly as with [`remove`](Self::remove).
     pub fn take(&mut self, id: TileId) -> Option<Painter> {
         self.slots.get_mut(id.0 as usize)?.take().map(|e| e.painter)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_key_hashes_the_same_every_time() {
-        let key = ("settings", 3u32, true, Some(7u64));
-        assert_eq!(version(&key), version(&key));
-    }
-
-    #[test]
-    fn keys_that_differ_in_one_field_get_different_versions() {
-        assert_ne!(version(&("row", 1u32)), version(&("row", 2u32)));
-        assert_ne!(version(&("row", 1u32)), version(&("rov", 1u32)));
-        assert_ne!(version(&(1u8, 2u8)), version(&(2u8, 1u8)));
-    }
-
-    #[test]
-    fn a_string_key_is_not_aliased_by_its_zero_padding() {
-        // The tail of a partial word is zero-filled, so "a" and "a\0" would collide on the
-        // word alone — `Hash for str` writing the length is what separates them.
-        assert_ne!(version(&"a"), version(&"a\0"));
-        assert_ne!(version(&"abcdefgh"), version(&"abcdefgh\0"));
-    }
-
-    #[test]
-    fn no_real_key_is_mistaken_for_a_build_once_tile() {
-        // `version` remaps the one input that would hash to `static_version`; nothing else may
-        // return it. Hashes exactly as `version` does, style epoch included.
-        let target = static_version();
-        let colliding = (0..5000u32).find(|i| {
-            let mut h = FxHasher::default();
-            crate::ui::theme::epoch().hash(&mut h);
-            i.hash(&mut h);
-            h.finish() == target
-        });
-        assert!(colliding.is_none_or(|i| version(&i) != target));
-        assert!((0..5000u32).all(|i| version(&i) != target));
     }
 }

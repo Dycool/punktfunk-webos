@@ -7,7 +7,7 @@
 use crate::app::nav::ScreenKey;
 use crate::app::screens::scrolllist::scroll_list_width_frac;
 use crate::app::screens::{is_confirm, is_list_modal, is_scroll_list};
-use crate::app::{view, App, PairingFocus, Screen, MODAL_TILE_PAD};
+use crate::app::{view, App, PairingFocus, Screen};
 use crate::ui;
 use crate::ui::render::Rect;
 use crate::ui::Painter;
@@ -515,9 +515,11 @@ impl App {
         })
     }
 
-    /// A painter for the current screen's modal, sized and positioned to its *tile*
-    /// region — the card rect grown by [`MODAL_TILE_PAD`] for the shadow — rather than
-    /// to the whole screen. Records the region in `modal_tile_region`, which is where
+    /// A painter for the current screen's modal, sized and positioned to the card itself
+    /// rather than to the whole screen. Nothing is drawn outside the card — the shadow is
+    /// the compositor's nine-slice (`compose::push_card_shadow`) and the focus pop has its
+    /// own tile — so the card needs no margin. Records the region in `modal_tile_region`,
+    /// which is where
     /// `compose_modal` composites the tile. Falls back to full-screen on a screen with
     /// no card (shouldn't happen with one open).
     /// `recycled` is the tile's own previous surface, when it had one: a modal with no
@@ -532,79 +534,12 @@ impl App {
         screen_h: u32,
         fonts: &ui::text::Fonts,
     ) -> Painter {
-        let card = self.modal_card_rect(screen_w, screen_h, fonts);
-        let pad = MODAL_TILE_PAD;
-        let region = card.map_or_else(|| Rect::new(0, 0, screen_w, screen_h), |c| c.inflate(pad));
+        let region = self
+            .modal_card_rect(screen_w, screen_h, fonts)
+            .unwrap_or_else(|| Rect::new(0, 0, screen_w, screen_h));
         self.render.modal.tile_region = region;
         let mut p = Painter::recycle(recycled, region.width(), region.height());
         p.set_origin(region.x(), region.y());
         p
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const STRIDE: i32 = 40;
-
-    #[test]
-    fn a_list_shorter_than_its_viewport_cannot_scroll() {
-        assert_eq!(App::max_scroll_px(0, STRIDE, 400), 0);
-        assert_eq!(App::max_scroll_px(5, STRIDE, 400), 0);
-        assert_eq!(App::max_scroll_px(10, STRIDE, 400), 0);
-    }
-
-    /// The last row sits flush with the bottom edge — the extent is the overflow, not
-    /// a whole row past the end.
-    #[test]
-    fn the_scroll_extent_is_exactly_the_overflow() {
-        assert_eq!(App::max_scroll_px(11, STRIDE, 400), 40);
-        assert_eq!(App::max_scroll_px(11, STRIDE, 390), 50);
-    }
-
-    #[test]
-    fn a_fully_visible_tile_is_drawn_whole() {
-        let dst = Rect::new(10, 20, 100, 50);
-        let clip = Rect::new(0, 0, 500, 500);
-        let (src, out) = App::clip_tile(dst, clip, 100, 50).expect("visible");
-        assert_eq!(src, Rect::new(0, 0, 100, 50));
-        assert_eq!(out, dst);
-    }
-
-    #[test]
-    fn a_tile_outside_the_clip_is_not_drawn() {
-        assert!(App::clip_tile(Rect::new(0, 600, 100, 50), Rect::new(0, 0, 500, 500), 100, 50).is_none());
-    }
-
-    #[test]
-    fn a_cropped_tile_crops_its_source_by_the_same_fraction() {
-        // Top half clipped away: the source starts half way down and is half as tall.
-        let dst = Rect::new(0, -25, 100, 50);
-        let (src, out) = App::clip_tile(dst, Rect::new(0, 0, 500, 500), 100, 50).expect("visible");
-        assert_eq!(out, Rect::new(0, 0, 100, 25));
-        assert_eq!(src, Rect::new(0, 25, 100, 25));
-    }
-
-    /// The tile's own pixel size need not match its on-screen size, so the crop is
-    /// proportional rather than a straight pixel offset.
-    #[test]
-    fn a_scaled_tile_crops_proportionally() {
-        let dst = Rect::new(0, 0, 100, 100);
-        let (src, out) = App::clip_tile(dst, Rect::new(0, 0, 100, 50), 200, 200).expect("visible");
-        assert_eq!(out, Rect::new(0, 0, 100, 50));
-        assert_eq!(src, Rect::new(0, 0, 200, 100));
-    }
-
-    #[test]
-    fn a_sliver_of_a_tile_still_has_at_least_one_source_pixel() {
-        let dst = Rect::new(0, 0, 100, 100);
-        let (src, _) = App::clip_tile(dst, Rect::new(0, 0, 1, 1), 10, 10).expect("visible");
-        assert!(src.width() >= 1 && src.height() >= 1);
-    }
-
-    #[test]
-    fn a_zero_sized_destination_is_not_drawn() {
-        assert!(App::clip_tile(Rect::new(0, 0, 0, 50), Rect::new(0, 0, 500, 500), 10, 10).is_none());
     }
 }

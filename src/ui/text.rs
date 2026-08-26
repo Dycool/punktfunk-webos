@@ -96,12 +96,6 @@ impl TextCache {
         }
     }
 
-    /// Resident entries. Read back by the frame report — this cache is the one that grows
-    /// with what the app has *said*, not with what it shows.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Hashes `(font, text, color)` into the key the cache stores under.
     ///
     /// Keying by the hash rather than by the tuple is what keeps the *hit* path free of both
@@ -309,6 +303,25 @@ pub fn fitting_font(raster: &dyn TextRaster, text: &str, max_w: u32) -> FontId {
 /// Assumes negligible word-to-word kerning at the space boundary, same as every other
 /// width-budget calculation in this UI already does.
 pub fn wrap_text(raster: &dyn TextRaster, font: FontId, text: &str, max_w: u32) -> Vec<String> {
+    // A line that already fits needs no per-word walk. The loop below would put every word on
+    // one line and push exactly this join, and the joined form is never wider than the text it
+    // came from — so a fitting original guarantees a fitting single line, and the two paths
+    // agree. `wrap_document` runs this over About's ~10,000-line licence wall, where it is the
+    // difference between one measurement per line and one per word.
+    if raster.measure(font, text).0 <= max_w {
+        // Built in one pass rather than `collect::<Vec<_>>().join(" ")`: the licence wall is
+        // ~10,000 lines, and the intermediate `Vec` buys nothing.
+        let mut joined = String::with_capacity(text.len());
+        for word in text.split_whitespace() {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            joined.push_str(word);
+        }
+        // Whitespace-only input wraps to nothing, same as falling through the loop with an
+        // empty `current`.
+        return if joined.is_empty() { Vec::new() } else { vec![joined] };
+    }
     let space_w = raster.measure(font, " ").0;
     let mut lines = Vec::new();
     let mut current = String::new();
