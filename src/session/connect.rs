@@ -13,9 +13,9 @@ use punktfunk_core::quic;
 
 use crate::core::caps::video_caps;
 use crate::platform::webos::device::{self, NdlGeneration};
+use crate::services::join::{join_with_timeout, SHUTDOWN_JOIN_TIMEOUT};
 use crate::services::store::{CodecPref, GamepadType};
-use crate::session::join::{join_with_timeout, SHUTDOWN_JOIN_TIMEOUT};
-use crate::session::pipeline::{cx_display_hdr, MediaPipeline};
+use crate::session::pipeline::MediaPipeline;
 use crate::session::StreamStats;
 
 pub struct Connected {
@@ -88,6 +88,8 @@ pub struct ConnectParams {
     pub audio_route: crate::services::store::AudioRoutePref,
     /// `Settings::direct_playback` — see `session::stage::SinkConfig`.
     pub direct_playback: bool,
+    /// The panel volume advertised to the host and used until host metadata arrives.
+    pub display_hdr: quic::HdrMeta,
 }
 
 /// One `quic::CODEC_*` bit, or 0 where the preference names no single codec.
@@ -179,7 +181,9 @@ impl Negotiated {
             // precedence ladder can never auto-pick a path this client can't present.
             video_codecs: codecs.iter().fold(0, |set, &pref| set | codec_bit(pref)),
             preferred_codec: codec_bit(codec_pref),
-            display_hdr: hdr.then(cx_display_hdr),
+            // Core may replace this through `PUNKTFUNK_CLIENT_PEAK_NITS`; the host echoes that
+            // effective volume on the metadata plane, so NDL converges after startup.
+            display_hdr: hdr.then_some(params.display_hdr),
             frame_parts: device::ndl_generation() == NdlGeneration::V2,
         }
     }

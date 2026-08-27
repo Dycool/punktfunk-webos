@@ -25,6 +25,10 @@ impl App {
             Screen::WakeSettings => view::wakesettings::rows(self.wake_settings_host().is_some_and(|h| h.wol_auto)),
             Screen::Diagnostics => view::diagnostics::rows(&self.settings_ui.settings),
             Screen::Experimental => view::experimental::rows(&self.settings_ui.settings, self.hosts.rooted),
+            Screen::HdrCalibration => {
+                let m = self.hdr_calibration_view()?;
+                view::hdrcalibration::rows(m.step, m.display)
+            }
             Screen::CursorSettings(_) => view::cursorsettings::rows(
                 self.settings_target(),
                 &self.editing_override(),
@@ -42,6 +46,7 @@ impl App {
             Screen::WakeSettings => view::wakesettings::ROW_COUNT,
             Screen::Diagnostics => crate::app::menu::DIAGNOSTICS_ROW_COUNT,
             Screen::Experimental => crate::app::menu::EXP_ROWS.len(),
+            Screen::HdrCalibration => view::hdrcalibration::ROW_COUNT,
             Screen::CursorSettings(_) => crate::app::menu::CURSOR_ROWS.len(),
             // Exhaustive for the same reason `list_modal_rows` is: this is the second half of
             // the family's table — the labels there, the count here — and a screen listed by
@@ -61,6 +66,7 @@ impl App {
             | Screen::Collections
             | Screen::RenameCollection
             | Screen::RemoveCollection
+            | Screen::ResetHdrCalibration
             | Screen::ResetGameSettings => 0,
         }
     }
@@ -126,11 +132,13 @@ impl App {
             | Screen::About
             | Screen::SpeedTest
             | Screen::WakeSettings
+            | Screen::HdrCalibration
             | Screen::CursorSettings(_)
             | Screen::SendLogs
             | Screen::Collections
             | Screen::RenameCollection
             | Screen::RemoveCollection
+            | Screen::ResetHdrCalibration
             | Screen::ResetGameSettings => Vec::new(),
         }
     }

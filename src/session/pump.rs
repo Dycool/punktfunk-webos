@@ -12,8 +12,8 @@ use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR};
 use punktfunk_core::PunktfunkError;
 
 use crate::platform::webos::device::boost_current_thread;
+use crate::services::join::{join_with_timeout, SHUTDOWN_JOIN_TIMEOUT};
 use crate::session::audio::AudioStage;
-use crate::session::join::{join_with_timeout, SHUTDOWN_JOIN_TIMEOUT};
 use crate::session::priority::{boost_hot_threads, spawn_vendor_decode_thread_renicer};
 use crate::session::stage::{SinkResult, VideoStage, WireFrame};
 use crate::session::StreamStats;
@@ -57,8 +57,8 @@ struct VideoPump {
     client: Arc<NativeClient>,
     stage: VideoStage,
     stats: Arc<StreamStats>,
-    /// Whether the host's per-content HDR metadata is worth draining — false on every session
-    /// where nothing would apply it (see `connect`'s `is_hdr`).
+    /// Whether the host's per-content HDR metadata is worth draining. False on every session
+    /// where nothing would apply it: an SDR or non-HEVC stream.
     is_hdr: bool,
     /// Core's cumulative drop count as of the last frame, to edge-detect new drops.
     last_dropped_seen: u64,
@@ -221,10 +221,13 @@ impl VideoPump {
         if !self.is_hdr {
             return;
         }
-        // Freshly *received* is not the same as changed: the host re-sends unchanged mastering
-        // metadata (three identical packets inside 10 ms on a CX), so the on-change filter has to
-        // run against the last value applied. The player does that.
-        let Ok(meta) = self.client.next_hdr_meta(Duration::ZERO) else {
+        // Collapse startup/keyframe repeats to the newest value. Applying an older queued value
+        // first can delay a genuine mastering change by several frames.
+        let mut latest = None;
+        while let Ok(meta) = self.client.next_hdr_meta(Duration::ZERO) {
+            latest = Some(meta);
+        }
+        let Some(meta) = latest else {
             return;
         };
         tracing::info!(

@@ -105,6 +105,7 @@ fn spawn_connect(
                 cursor_capture: settings.cursor_capture,
                 audio_route: settings.audio_route,
                 direct_playback: settings.direct_playback,
+                display_hdr: settings.hdr_display().hdr_meta(),
             })
             // Flagged before the handle is joined, so the loading screen can stop waiting
             // for a stream that is not coming — the error itself still travels by `Result`.

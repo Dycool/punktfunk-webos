@@ -213,10 +213,12 @@ impl App {
             | Screen::WakeSettings
             | Screen::Diagnostics
             | Screen::Experimental
+            | Screen::HdrCalibration
             | Screen::CursorSettings(_)
             | Screen::SendLogs
             | Screen::RenameCollection
             | Screen::RemoveCollection
+            | Screen::ResetHdrCalibration
             | Screen::ResetGameSettings => 1,
         }
     }
@@ -378,6 +380,7 @@ impl App {
             | Screen::SendLogs
             | Screen::SpeedTest
             | Screen::RemoveCollection
+            | Screen::ResetHdrCalibration
             | Screen::ResetGameSettings => self
                 .confirm_subtitle()
                 .zip(self.confirm_focused())
@@ -398,6 +401,7 @@ impl App {
             | Screen::WakeSettings
             | Screen::Diagnostics
             | Screen::Experimental
+            | Screen::HdrCalibration
             | Screen::CursorSettings(_) => self.list_modal_focus_rect(screen_w, screen_h, fonts),
             // No single focused widget: a text form is one always-active field, and About is
             // a scrolling document.
@@ -502,6 +506,7 @@ impl App {
             Screen::Diagnostics => f(&view::diagnostics::Modal {
                 settings: &self.settings_ui.settings,
             }),
+            Screen::HdrCalibration => f(&self.hdr_calibration_view()?),
             Screen::Experimental => f(&view::experimental::Modal {
                 settings: &self.settings_ui.settings,
                 rooted: self.hosts.rooted,
@@ -516,6 +521,10 @@ impl App {
             }),
             Screen::RemoveCollection => f(&view::confirm::Modal {
                 title: view::collections::REMOVE_TITLE,
+                confirm: confirm.as_ref()?,
+            }),
+            Screen::ResetHdrCalibration => f(&view::confirm::Modal {
+                title: view::hdrcalibration::RESET_TITLE,
                 confirm: confirm.as_ref()?,
             }),
             Screen::ResetGameSettings => f(&view::confirm::Modal {

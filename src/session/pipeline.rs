@@ -15,10 +15,10 @@ use crate::core::media::{AudioPlane, AudioSink, VideoSink};
 use crate::platform::webos::device::{self, NdlGeneration};
 use crate::platform::webos::ndl::v1::NdlV1Video;
 use crate::platform::webos::ndl::{NdlCodec, NdlVideo};
+use crate::services::join::{join_with_timeout, SHUTDOWN_JOIN_TIMEOUT};
 use crate::services::store::AudioRoutePref;
 use crate::session::audio::AudioStage;
 use crate::session::connect::ConnectParams;
-use crate::session::join::{join_with_timeout, SHUTDOWN_JOIN_TIMEOUT};
 use crate::session::pump::{spawn_audio_feed, video_pump};
 use crate::session::stage::{SinkConfig, VideoStage};
 use crate::session::StreamStats;
@@ -49,7 +49,7 @@ impl MediaPipeline {
         stop: &Arc<AtomicBool>,
         stats: &Arc<StreamStats>,
     ) -> Result<(Self, AudioRoutePref, bool)> {
-        let (player, is_hdr) = load_player(client)?;
+        let (player, is_hdr) = load_player(client, params.display_hdr)?;
         // Re-checked against the plane the load actually produced: a rejected audio-enabled load
         // leaves no plane to ride.
         let plane = player.audio_plane();
@@ -122,25 +122,11 @@ fn resolve_route(pref: AudioRoutePref, channels: u8, has_plane: bool) -> AudioRo
     }
 }
 
-/// Default HDR10 mastering metadata for the LG CX OLED panel.
-/// Sent in `Hello::display_hdr`; refined per-content by `next_hdr_meta`.
-pub(super) fn cx_display_hdr() -> quic::HdrMeta {
-    quic::HdrMeta {
-        // G, B, R order (ST.2086), 1/50000 chromaticity units — BT.2020 primaries.
-        display_primaries: [[8_500, 39_850], [6_550, 2_300], [35_400, 14_600]],
-        white_point: [15_635, 16_450], // D65
-        max_display_mastering_luminance: 800 * 10_000,
-        min_display_mastering_luminance: 5,
-        max_cll: 800,
-        max_fall: 150,
-    }
-}
-
 /// Opens the decoder for the negotiated stream and hands it the colorimetry.
 ///
 /// Returns the player and whether HDR mastering metadata is being applied — the answer the
 /// video pump needs to know whether to forward per-content metadata at all.
-fn load_player(client: &NativeClient) -> Result<(Box<dyn VideoSink>, bool)> {
+fn load_player(client: &NativeClient, panel: quic::HdrMeta) -> Result<(Box<dyn VideoSink>, bool)> {
     let resolved_mode = client.mode();
     let fps = resolved_mode.refresh_hz.max(1);
     let codec =
@@ -183,7 +169,7 @@ fn load_player(client: &NativeClient) -> Result<(Box<dyn VideoSink>, bool)> {
     // the worse outcome, and it cost a black 1440p120 stream on a CX). `client.color` is still
     // passed on every session: the SDR arm is a no-op only on NDL, and a backend that can take
     // colorimetry without the HDR side effect gets it.
-    if let Err(e) = player.set_color(is_hdr.then(cx_display_hdr).as_ref(), client.color) {
+    if let Err(e) = player.set_color(is_hdr.then_some(panel).as_ref(), client.color) {
         tracing::warn!("NDL colour metadata failed: {e:#}");
     }
     Ok((player, is_hdr))
@@ -260,21 +246,8 @@ fn spawn_plane_threads(
     // software route (the SDL device belongs to the runtime).
     let sink: Option<Arc<dyn AudioSink>> =
         (route != AudioRoutePref::Software).then(|| ndl.clone() as Arc<dyn AudioSink>);
-    let clock_thread = {
-        let stop = stop.clone();
-        std::thread::Builder::new()
-            .name("punktfunk-webos-clock".into())
-            .spawn(move || {
-                // The same boost the video pump and the audio drain take for themselves. This
-                // thread is a 20 ms metronome holding the depth NDL paces the PICTURE on, and at
-                // nice 0 it competes with the boosted decode threads on a 2-3 core SoC — the
-                // contention docs/NOTES.md measured at up to 28 ms for the evdev reader. A late
-                // top-up is a sagging plane, which is a stutter.
-                crate::platform::webos::device::boost_current_thread();
-                ndl.run_keepalive(&stop, route.on_ndl_plane());
-            })
-            .context("spawn clock plane thread")?
-    };
+    let clock_thread = crate::platform::webos::ndl::spawn_clock_plane(ndl, stop.clone(), route.on_ndl_plane())
+        .context("spawn clock plane thread")?;
     let Some(sink) = sink else {
         return Ok((None, Some(clock_thread)));
     };
