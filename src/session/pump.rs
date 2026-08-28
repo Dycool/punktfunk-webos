@@ -138,6 +138,16 @@ impl VideoPump {
                     tracing::warn!("request_keyframe: {e:#}");
                 }
             }
+            // Nothing above this loop can revive the decoder — the load is gone and the plane
+            // threads have exited with it — so the session ends and the runtime returns to the
+            // menu, where the next launch builds a fresh pipeline.
+            SinkResult::Dead => {
+                // Once, not per frame: the stream loop needs a poll or two to notice, and the
+                // stage answers `Dead` to every delivery in the meantime.
+                if !self.stats.decoder_dead.swap(true, Ordering::Relaxed) {
+                    tracing::error!("decoder failed for good — ending the session");
+                }
+            }
         }
     }
 
@@ -170,15 +180,13 @@ impl VideoPump {
         // on-device file sink is INFO-only (`logger::resolved_level`).
         if self.video_log.due() {
             // `late_stamp` is the judder, counted: frames NDL was handed too late to pace. The
-            // rest describes whichever mapping produced it (see `session::timeline::PacingHealth`).
+            // rest describes the loop that produced them (see `session::timeline::PacingHealth`).
             tracing::debug!(
-                "pacing: {} late_stamp={} jitter={:.1}ms cushion={:.1}ms reanchors={} trim={:.1}ms",
-                self.stage.pacing_label(),
+                "pacing: late_stamp={} jitter={:.1}ms cushion={:.1}ms reanchors={}",
                 pacing.late_stamps,
                 pacing.jitter_ns as f64 / 1e6,
                 pacing.cushion_ns as f64 / 1e6,
                 pacing.reanchors,
-                pacing.trimmed_ns as f64 / 1e6,
             );
             tracing::debug!(
                 "video: {} frames, parts={}, holding={}, dropped={}, backlog={}, plane_lead={}",

@@ -1,7 +1,7 @@
 //! The single place that talks to the video decoder.
 //!
 //! Everything between "an access unit arrived" and "NDL has been fed" lives here: host-PTS
-//! anchoring on the refresh-rate-reconciled frame interval, backpressure metering,
+//! mapping on the refresh-rate-reconciled frame interval, backpressure metering,
 //! freeze-until-reanchor, and keyframe-request throttling. The video pump keeps only the
 //! parts that are wire-shaped — pulling frames, and *how* a keyframe is asked for, which it
 //! answers to [`SinkResult::NeedKeyframe`] with `NativeClient::request_keyframe`.
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use punktfunk_core::quic;
 
-use crate::core::media::{AudioPlane, NotReady, SessionClock, VideoSink, VideoSinkCaps};
+use crate::core::media::{AudioPlane, NotReady, VideoSink, VideoSinkCaps};
 use crate::session::timeline::{ms, reconciled_frame_interval_ns, Pacing, PacingHealth};
 use crate::session::StreamStats;
 
@@ -73,6 +73,10 @@ pub enum SinkResult {
     Held,
     /// Skipped or failed, and the throttle allows asking the host for a keyframe now.
     NeedKeyframe,
+    /// The decoder is gone and no frame will present again on it — see
+    /// [`crate::core::media::VideoSink::is_dead`]. The pump ends the session on this rather than
+    /// re-anchoring, which is the response to lost FRAMES and does nothing for a lost PIPELINE.
+    Dead,
 }
 
 /// Everything the sink needs to know up front.
@@ -87,12 +91,6 @@ pub struct SinkConfig {
     /// Where [`video_e2e_ns`] is published for the audio plane
     /// (`NativeClient::video_e2e_shared`). `0` = nothing on the glass yet.
     pub video_e2e: Arc<AtomicU64>,
-    /// Stamp frames from the fixed anchor rather than the cadence loop
-    /// (`Settings::direct_playback`, Experimental). **The one gate on every latency-adding measure
-    /// on this path**, from the other side: the default pays a jitter-sized cushion of at most one
-    /// frame interval for a cadence that does not beat against the panel, and this gives that back
-    /// at the price of the judder — see `session::timeline::Pacing`.
-    pub direct_playback: bool,
 }
 
 /// Minimum spacing between [`SinkResult::NeedKeyframe`] results: the request travels on its own
@@ -107,15 +105,12 @@ pub struct VideoStage {
     sink: Box<dyn VideoSink>,
     /// What this backend can be asked to do — read instead of matching on which backend it is.
     caps: VideoSinkCaps,
-    /// The audio plane this load produced, if any — kept for its depth reading; everything the
-    /// stage publishes to it goes through [`Self::clock`].
+    /// The audio plane this load produced, if any — kept for its depth reading. The stage
+    /// publishes nothing to it: the plane stamps off the player clock on its own.
     audio_plane: Option<std::sync::Arc<dyn AudioPlane>>,
     /// Slice-progressive reassembly state — a pass-through on a backend that doesn't take parts
     /// (see [`AuParts`]).
     parts: AuParts,
-    /// The one host-PTS → sink-clock mapping this session's planes share. The stage owns it
-    /// because the video plane is what derives it, frame by frame.
-    clock: Arc<SessionClock>,
     stats: Arc<StreamStats>,
     cfg: SinkConfig,
     /// The panel's actual drain cadence, reconciled against the stream rate. NDL drains at panel
@@ -123,8 +118,7 @@ pub struct VideoStage {
     /// that conversion ([`video_e2e_ns`] and [`VideoStage::decode_us`]), so one depth cannot mean two
     /// different latencies.
     frame_interval_ns: u64,
-    /// NDL host-PTS→player-clock mapping — the cadence loop, or the anchor under
-    /// `Settings::direct_playback`. One object, so nothing in this file branches on which.
+    /// NDL host-PTS→player-clock mapping — see `session::timeline::Pacing`.
     pacing: Pacing,
     /// The stamp the access unit currently being fed was given, while it is still open. Every piece
     /// of one AU must carry the SAME timestamp (NDL finds AU boundaries by start code and has no
@@ -166,13 +160,8 @@ impl VideoStage {
         let frame_interval_ns = reconciled_frame_interval_ns(stream_hz);
         let audio_plane = sink.audio_plane();
         let caps = sink.caps();
-        let clock = Arc::new(SessionClock::default());
-        if let Some(plane) = &audio_plane {
-            plane.attach_clock(clock.clone());
-        }
         Self {
             parts: AuParts::default(),
-            clock,
             caps,
             sink,
             audio_plane,
@@ -185,7 +174,7 @@ impl VideoStage {
             // (`the_cadence_interval_comes_from_the_stream_mode_not_the_panel`): a 120 fps
             // stream on a 60 Hz panel would otherwise license twice the hold the source's own
             // cadence can justify.
-            pacing: Pacing::new(1_000_000_000 / u64::from(stream_hz), cfg.direct_playback),
+            pacing: Pacing::new(1_000_000_000 / u64::from(stream_hz)),
             au_base_ns: None,
             cfg,
             backlog_cached: None,
@@ -220,13 +209,12 @@ impl VideoStage {
     fn reset_timeline(&mut self) {
         self.pacing.reset();
         self.au_base_ns = None;
-        self.clock.clear();
     }
 
     /// This frame's stamp in the sink's own clock domain.
     ///
     /// A sink with a clock has no PTS clock of its own (NDL counts from its load),
-    /// so the host's capture PTS is mapped onto it ([`HostPtsAnchor`]) — which is also what keeps
+    /// so the host's capture PTS is mapped onto it (`session::timeline::Pacing`) — which is also what keeps
     /// video and any audio plane in ONE timeline. A sink without one presents in feed order and
     /// the stamp is discarded at the feed, so the host PTS passes through untouched.
     /// This AU's stamp: computed on the piece that opens it and repeated for the rest — see
@@ -285,8 +273,8 @@ impl VideoStage {
         if self.last_backlog_poll.is_none_or(|t| t.elapsed() >= BACKLOG_POLL) {
             self.last_backlog_poll = Some(Instant::now());
             self.backlog_cached = self.sink.queue_depth().map(u64::from);
-            // A freeze flushes NDL, so a depth polled while held is an emptied buffer, not this
-            // mode's settled lead. Learning from it would clamp the cushion back to the floor for
+            // A freeze stops the pipeline, so a depth polled while held is not this mode's
+            // settled lead. Learning from it would clamp the cushion back to the floor for
             // [`CUSHION_MIN_POLLS`] after every loss event — and at 60Hz one unaccounted frame is
             // 16.6ms, straight back over the ABR's decode-rise threshold. The cached depth itself
             // still updates: A/V sync wants the truth, only the learned cushion is held steady.
@@ -323,11 +311,6 @@ impl VideoStage {
     /// publishing it on both mappings is that `late_stamps` makes them comparable.
     pub fn pacing_health(&self) -> PacingHealth {
         self.pacing.health()
-    }
-
-    /// Which mapping is stamping this session (`paced` / `direct`).
-    pub fn pacing_label(&self) -> &'static str {
-        self.pacing.label()
     }
 
     /// Audio-plane queue depth in ms, or `None` on a session with no plane — see
@@ -402,6 +385,11 @@ impl VideoStage {
     }
 
     fn feed(&mut self, au: &[u8], pts_ns: u64, flags: FrameFlags) -> SinkResult {
+        // Checked before the gate, not inside it: a dead decoder also fails every `flush` the hold
+        // path takes, so the hold would spend `HOLD_GIVE_UP` re-deciding this per frame.
+        if self.sink.is_dead() {
+            return SinkResult::Dead;
+        }
         let request_keyframe = match self.gate(&flags) {
             HoldGate::Skip(result) => return result,
             HoldGate::Feed { request_keyframe } => request_keyframe,
@@ -445,16 +433,6 @@ impl VideoStage {
                 // Only a frame NDL actually accepted is on its way to the glass. A failed feed is
                 // followed by a flush and a hold, where the reference would be meaningless.
                 self.publish_video_e2e(submit_realtime_ns, pts_ns, backlog);
-                // Same reason, and it also doubles as the audio plane's start gate. `play_audio` has
-                // no `ensure_loaded` guard of its own, so latching off a REJECTED frame turns the
-                // audio thread loose on a pipeline NDL hasn't loaded yet — which costs the session
-                // its audio outright.
-                // Held back until the anchor's trim has settled: audio stamps ride this offset and
-                // can only move forward, so latching onto a mapping still being pulled earlier
-                // costs lip sync (see `HostPtsAnchor::ready_for_audio`).
-                if self.pacing.ready_for_audio() {
-                    self.clock.latch(base_ns as i64 - pts_ns as i64);
-                }
                 let decode_us = self
                     .cfg
                     .report_decode_latency
@@ -477,9 +455,17 @@ impl VideoStage {
         if flags.loss && !self.holding() {
             self.begin_hold();
             tracing::warn!("loss (frame {}) — freezing", flags.index);
-            if self.caps.flush {
-                let _ = self.sink.flush();
-            }
+            // NO FLUSH on the loss hold — this is the last structural difference from `ss4s`, which
+            // never flushes mid-stream (its only recovery is unload+load) and does not lose its
+            // Opus plane. Every flush here stops the pipeline: each one is followed by NDL
+            // reporting `PLAYING (0x1a)`, a transition it only makes from not-playing. A CX
+            // survived 32 of them in one storm with perfectly monotonic audio stamps at a constant
+            // 40 ms lead and still went permanently silent, so what kills the plane is the restart,
+            // not anything the feed says (see docs/NOTES.md § "NDL's audio plane").
+            //
+            // The decode-error path below still flushes: there the pipeline has actually errored
+            // and discarding its queue is the documented response. Loss is a network event — NDL's
+            // queue holds good frames that the hold is about to present anyway.
         }
         let Some(started) = self.hold_started else {
             return HoldGate::Feed {

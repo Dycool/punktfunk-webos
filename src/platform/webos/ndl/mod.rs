@@ -70,6 +70,11 @@ impl NdlCodec {
 const STATE_LOADCOMPLETED: c_int = 0x16;
 const STATE_UNLOADCOMPLETED: c_int = 0x17;
 const STATE_PLAYING: c_int = 0x1a;
+/// The one state measured to kill a load for good: seen on a CX as `0x12` with `errorCode 600`,
+/// after which every feed fails and NDL unloads itself (docs/NOTES.md § "A/V sync"). Only this
+/// one latches [`FATAL`] — the enum is sparse (0x18/0x19 are unmapped) and a benign notification
+/// treated as fatal would end a healthy session outright.
+const STATE_ERROR: c_int = 0x12;
 
 /// Bound, not a requirement: feeding an unloaded decoder is the first-frames-black cause,
 /// but a model that never delivers the callback must still stream.
@@ -138,6 +143,11 @@ static PLAYING: EventSeq = EventSeq::new();
 /// and a host that delivers its first frame seconds late (new-flow stall, startup capacity
 /// probe) would otherwise show as seconds of black.
 static FRAME_FED: EventSeq = EventSeq::new();
+/// Set by [`STATE_ERROR`] — in the field, `0x12` with `errorCode 600`, which NDL follows by failing
+/// every `play` until the pipeline unloads itself. Latched rather than pulsed: the load is gone,
+/// and there is no later callback that takes it back. Cleared only by [`arm_load`], which is to
+/// say by a NEW load.
+static FATAL: EventSeq = EventSeq::new();
 
 /// Records v2 load-state transitions so loads, feeds and the UI reveal can wait on them.
 extern "C" fn on_load_state(state: c_int, num: c_longlong, detail: *const c_char) {
@@ -162,7 +172,18 @@ extern "C" fn on_load_state(state: c_int, num: c_longlong, detail: *const c_char
             } else {
                 unsafe { CStr::from_ptr(detail) }.to_string_lossy().into_owned()
             };
-            tracing::warn!("NDL load state: unknown 0x{state:x} ({state}) num={num} {detail}");
+            if state == STATE_ERROR {
+                // Feeding on produces nothing but a `play` error per frame — see [`fatal`]. Logged
+                // once per load; NDL repeats the state while the pipeline tears itself down.
+                if FATAL.bump_first() {
+                    tracing::error!("NDL load state: fatal 0x{state:x} ({state}) num={num} {detail}");
+                }
+            } else {
+                // Unmapped, and not the state that has ever been seen to kill a load. Logged so a
+                // device trace can identify it, but NOT latched: ending a healthy session on a
+                // notification we simply don't have a name for is the worse failure.
+                tracing::warn!("NDL load state: unmapped 0x{state:x} ({state}) num={num} {detail}");
+            }
             return;
         }
     };
@@ -175,6 +196,15 @@ fn arm_load() {
     LOAD_COMPLETED.arm();
     PLAYING.arm();
     FRAME_FED.arm();
+    FATAL.arm();
+}
+
+/// Whether the current load has reported a fatal state — see [`FATAL`]. The session reads this to
+/// tell "NDL is gone" from "these frames failed", which are the same thing at the `play` call and
+/// want opposite responses: the second is a re-anchor, the first cannot be recovered from without
+/// a new load.
+pub fn fatal() -> bool {
+    FATAL.fired()
 }
 
 /// `PLAYING` for the current load. Diagnostics only — see [`PLAYING`].
