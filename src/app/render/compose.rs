@@ -4,14 +4,15 @@
 //! focus pop and every fade is a texture-copy parameter here, never a re-raster (see
 //! `platform::webos::compositor`). Split out of `app/mod.rs` alongside `prepare`.
 use std::ops::Range;
+use std::time::Instant;
 
 use crate::app::grid::GridLayout;
 use crate::app::render::tile;
 use crate::app::render::SnapshotBody;
 use crate::app::screens;
 use crate::app::{
-    hero, render_input, view, App, HomeFocus, Screen, CARD_GROWTH, CARD_POP, CARD_POP_SHRINK, LAUNCH_GROWTH,
-    SCROLL_INDICATOR_TILE_W, STATUS_BG_PAD,
+    hero, render_input, view, App, HomeFocus, Screen, CARD_GROWTH, LAUNCH_GROWTH, SCROLL_INDICATOR_TILE_W,
+    STATUS_BG_PAD,
 };
 use crate::ui;
 use crate::ui::cache::TileStore;
@@ -546,6 +547,8 @@ impl App {
         // and nothing else. A scale on the card's own alpha rather than a `Fill` over it — a
         // fill is a square rect and would square off the card's rounded corners.
         let unfixed = self.reordering_slots(layout);
+        // One clock read for the whole grid pass — every card's arrival is measured against it.
+        let now = Instant::now();
         let dimmed = 1.0 - f32::from(ui::theme::palette().scrim.a) / 255.0;
         for idx in visible {
             if Some(idx) == focused {
@@ -561,22 +564,27 @@ impl App {
                 continue; // not rasterized yet — outside the build window
             };
             let card = slot.id;
-            // A card that just landed is still zooming up to full size.
-            let pop = ui::animation::anim_frac(slot.pop, CARD_POP);
+            // A card that just landed is still fading (reveal) or zooming (later build) in.
+            let (pop, shrink) = tile::entrance_progress(slot.pop, now);
             let dim = if unfixed.as_ref().is_some_and(|s| s.contains(&idx)) {
                 dimmed
             } else {
                 1.0
             };
             let alpha = (255.0 * pop * dim) as u8;
+            // A fully transparent card — one the reveal wave has not reached — is two
+            // full-size blits and two alpha-mod changes that draw nothing.
+            if alpha == 0 {
+                continue;
+            }
             cmds.push(DrawCmd::Tex {
                 tile: tile::CARD_SHADOW,
-                dst: ui::animation::pop_in_rect(r.inflate(pad), pop, CARD_POP_SHRINK),
+                dst: ui::animation::pop_in_rect(r.inflate(pad), pop, shrink),
                 alpha,
             });
             cmds.push(DrawCmd::Tex {
                 tile: card,
-                dst: ui::animation::pop_in_rect(r, pop, CARD_POP_SHRINK),
+                dst: ui::animation::pop_in_rect(r, pop, shrink),
                 alpha,
             });
         }
@@ -611,7 +619,7 @@ impl App {
                 // an in-collection swap with nowhere to go is what does (see
                 // `App::swap_card_in_collection`).
                 let r = self.press_dip(Screen::Home).rect(card_rect(idx));
-                self.compose_focused_card(tiles, cmds, pin_id, r, pad);
+                self.compose_focused_card(tiles, cmds, pin_id, r, pad, now);
             }
         }
     }
@@ -631,7 +639,15 @@ impl App {
     /// focus pop and title strip (or the submenu panel a hold grew out of it), plus the pin
     /// badge. `r` is its unscaled rect — everything here scales about the card's own centre, so
     /// the pops can't fight over position.
-    fn compose_focused_card(&self, tiles: &TileStore, cmds: &mut Vec<DrawCmd>, pin_id: &str, r: Rect, pad: i32) {
+    fn compose_focused_card(
+        &self,
+        tiles: &TileStore,
+        cmds: &mut Vec<DrawCmd>,
+        pin_id: &str,
+        r: Rect,
+        pad: i32,
+        now: Instant,
+    ) {
         // The focus pop: the GPU scales the (unfocused) card tile up
         // around its center as the pop progresses, with the shared glow
         // tile fading in behind it at the same scale.
@@ -640,8 +656,8 @@ impl App {
             return; // not rasterized yet
         };
         let card = slot.id;
-        let pop = ui::animation::anim_frac(slot.pop, CARD_POP);
-        let popped = |base: Rect| ui::animation::pop_in_rect(base, pop, CARD_POP_SHRINK);
+        let (pop, shrink) = tile::entrance_progress(slot.pop, now);
+        let popped = |base: Rect| ui::animation::pop_in_rect(base, pop, shrink);
         // The card's total scale, for anything composited on top of it that has to
         // fold in the same transform about the card's centre rather than its own.
         // Shared with the pointer path (`card_menu_rows_rect`), so a click can't land
@@ -892,10 +908,11 @@ impl App {
         let available_w = screen_w.saturating_sub(ui::widgets::SIDEBAR_W);
         let columns = view::home::grid_columns(available_w);
 
-        // A screen that draws over the video plane composes nothing behind its own card: the
-        // sidebar, the grid and the status block are graphics that would cover the very thing
-        // the user is looking at (see `screens::over_video`).
-        if !screens::over_video(self.nav.screen) {
+        // Over the video plane nothing composes behind the card: the sidebar, the grid and the
+        // status block are graphics that would cover the very thing the user is looking at.
+        // The launch backdrop's dissolve is the same case — the menu it faded from is behind
+        // the picture the wave is uncovering (see `App::over_video_layers`).
+        if !self.over_video_layers() {
             if !input.host_selected {
                 if let Some(p) = tiles.get(tile::NO_HOST) {
                     cmds.push(DrawCmd::Tex {
@@ -953,23 +970,28 @@ impl App {
         // ratio never changes) while a black scrim blends in over it, both driven
         // by the same clock — the card keeps zooming for the whole fade.
         if let (Some(t), Some(idx)) = (self.launch_anim, self.launch_anim_idx) {
-            let f = ui::animation::anim_frac(Some(t), hero::LAUNCH_FADE);
-            let layout = self.library.layout(columns);
-            let base = view::home::scrolled_card_rect(idx, grid_x, available_w, layout, self.render.grid.scroll);
-            if let Some(card) = self
-                .pin_id_at_grid_idx(idx, columns)
-                .and_then(|pin_id| self.render.grid.card_ids.get(pin_id))
-            {
-                cmds.push(DrawCmd::Tex {
-                    tile: card,
-                    dst: ui::animation::zoom_rect(base, f, LAUNCH_GROWTH),
-                    alpha: 0xff,
+            // Both of these are the fade *to* the loading screen. Once the backdrop is
+            // dissolving off it again there is live video behind them, which a zooming card
+            // and a full-screen black would cover back up.
+            if !self.over_video_layers() {
+                let f = ui::animation::anim_frac(Some(t), hero::LAUNCH_FADE);
+                let layout = self.library.layout(columns);
+                let base = view::home::scrolled_card_rect(idx, grid_x, available_w, layout, self.render.grid.scroll);
+                if let Some(card) = self
+                    .pin_id_at_grid_idx(idx, columns)
+                    .and_then(|pin_id| self.render.grid.card_ids.get(pin_id))
+                {
+                    cmds.push(DrawCmd::Tex {
+                        tile: card,
+                        dst: ui::animation::zoom_rect(base, f, LAUNCH_GROWTH),
+                        alpha: 0xff,
+                    });
+                }
+                cmds.push(DrawCmd::Fill {
+                    rect: Rect::new(0, 0, screen_w, screen_h),
+                    color: crate::ui::render::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
                 });
             }
-            cmds.push(DrawCmd::Fill {
-                rect: Rect::new(0, 0, screen_w, screen_h),
-                color: crate::ui::render::Color::RGBA(0, 0, 0, (255.0 * f) as u8),
-            });
             // With wide art for this game, the loading screen is that art instead of the
             // bare black: it fades in over the scrim above (so a hero arriving mid-
             // handshake still eases in rather than snapping), then drifts slowly left to
@@ -985,7 +1007,14 @@ impl App {
     /// rather than from a lit image.
     fn compose_hero(&self, screen_w: u32, screen_h: u32, cmds: &mut ui::render::DrawList) {
         let Some(hero) = self.render.hero.visible() else { return };
-        let f = self.render.hero.opacity();
+        // Leaving over live video, the wave in the mask below is the fade — the image itself
+        // holds whatever it faded in to, so the two are not fighting over one alpha.
+        let dissolving = self.render.hero.dissolving();
+        let f = if dissolving {
+            self.render.hero.fade_in()
+        } else {
+            self.render.hero.opacity()
+        };
         cmds.push(DrawCmd::TexF {
             tile: tile::HERO,
             dst: hero::hero_pan_dst(
@@ -997,9 +1026,25 @@ impl App {
             ),
             alpha: (255.0 * f) as u8,
         });
+        // Two motions at once on the way out: the scrim deepens to black over the whole
+        // image while the wave takes it away piece by piece.
+        let scrim = if dissolving {
+            self.render.hero.exit_scrim()
+        } else {
+            hero::HERO_SCRIM_ALPHA * f
+        };
         cmds.push(DrawCmd::Fill {
             rect: Rect::new(0, 0, screen_w, screen_h),
-            color: crate::ui::render::Color::RGBA(0, 0, 0, (hero::HERO_SCRIM_ALPHA * f) as u8),
+            color: crate::ui::render::Color::RGBA(0, 0, 0, scrim as u8),
         });
+        if dissolving {
+            // Both of the above taken away again, per pixel, as the wave passes: the scrim
+            // goes with the art it was dimming, and what is left is the picture on the video
+            // plane behind the graphics plane.
+            cmds.push(DrawCmd::Erase {
+                tile: tile::HERO_MASK,
+                dst: Rect::new(0, 0, screen_w, screen_h),
+            });
+        }
     }
 }

@@ -45,6 +45,13 @@ pub(crate) const CARD_GROWTH: f32 = 0.045;
 pub(crate) const LAUNCH_GROWTH: f32 = 3.5;
 pub(crate) const CARD_POP: Duration = Duration::from_millis(300);
 pub(crate) const CARD_POP_SHRINK: f32 = 0.14;
+/// The grid's first appearance after the spinner: one diagonal wave from the top-left corner,
+/// scale-free, so the whole screen reads as one surface arriving rather than as a field of
+/// individually popping cards. The launch backdrop leaves on the same motion (`app::hero`).
+pub(crate) const GRID_REVEAL_WAVE: ui::animation::Wave = ui::animation::Wave {
+    span: Duration::from_millis(380),
+    fade: Duration::from_millis(420),
+};
 pub(crate) const SCROLL_INDICATOR_HOLD: Duration = Duration::from_millis(700);
 pub(crate) const SCROLL_INDICATOR_FADE: Duration = Duration::from_millis(350);
 /// How long a Home status line stays up at full opacity before it fades out. The fade

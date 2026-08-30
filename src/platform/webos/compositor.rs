@@ -18,6 +18,27 @@ use crate::ui::render::{Color, Corners, DrawCmd, FrostMask, FrostPane, Rect, Til
 use crate::ui::theme::Glass;
 use crate::ui::Painter;
 
+/// Logged once per process: a renderer without custom blend modes cannot punch a hole in the
+/// graphics plane, and repeating that per frame would bury the log.
+static BLEND_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// The blend behind [`DrawCmd::Erase`]: `dst = dst * (1 - srcA)`, colour and alpha alike, so a
+/// mask subtracts what is already drawn instead of painting over it. Composed once and cached
+/// on the `Compositor`; whether the renderer accepts it is the setter's answer.
+fn erase_blend() -> sdl2::sys::SDL_BlendMode {
+    use sdl2::sys::{SDL_BlendFactor::*, SDL_BlendOperation::*};
+    unsafe {
+        sdl2::sys::SDL_ComposeCustomBlendMode(
+            SDL_BLENDFACTOR_ZERO,
+            SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            SDL_BLENDOPERATION_ADD,
+            SDL_BLENDFACTOR_ZERO,
+            SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            SDL_BLENDOPERATION_ADD,
+        )
+    }
+}
+
 fn to_sdl_rect(r: Rect) -> sdl2::rect::Rect {
     sdl2::rect::Rect::new(r.x(), r.y(), r.width(), r.height())
 }
@@ -69,6 +90,8 @@ pub struct Compositor {
     /// The composed premultiplied blend mode, probed once — `None` until probed, `Some(None)`
     /// if the renderer refused it.
     premultiplied: Option<Option<sdl2::sys::SDL_BlendMode>>,
+    /// The composed erase blend mode, once composed (see [`DrawCmd::Erase`]).
+    erase: Option<sdl2::sys::SDL_BlendMode>,
     /// Everything [`DrawCmd::Frost`] needs, built the first frame one appears. `None` until
     /// then — but a focused grid card frosts its own title strip, so in the menu that is the
     /// first frame with focus, and a screen's worth of render target is allocated for the rest
@@ -430,6 +453,7 @@ impl Compositor {
             pool: Vec::new(),
             staging: Vec::new(),
             premultiplied: None,
+            erase: None,
             frost: None,
             next_gen: 0,
         }
@@ -728,6 +752,7 @@ impl Compositor {
                 }
                 // Through the bits: the fractional destination is the whole point of this variant,
                 // so rounding it here would let a sub-pixel pan reuse a stale capture.
+                DrawCmd::Erase { tile, dst } => (5u8, tile, gen(tile), rect_key(*dst)).hash(&mut h),
                 DrawCmd::TexF { tile, dst, alpha } => (
                     2u8,
                     tile,
@@ -831,6 +856,32 @@ impl Compositor {
                     canvas
                         .copy(tex, Some(to_sdl_rect(*src)), Some(to_sdl_rect(*dst)))
                         .map_err(|e| anyhow::anyhow!("copy cropped {tile:?}: {e}"))?;
+                }
+                DrawCmd::Erase { tile, dst } => {
+                    // Resolved against the mask texture itself, not a probe: this arm runs on
+                    // the frame loop's ordinary path, which has no `TextureCreator` to make a
+                    // probe texture with — gating it on one is how this silently became a
+                    // fade to black.
+                    let mode = *self.erase.get_or_insert_with(erase_blend);
+                    let Some(tex) = self.faded_tile(tile, 0xff) else {
+                        continue;
+                    };
+                    let erasing = set_raw_blend_mode(tex, mode);
+                    canvas
+                        .copy(tex, None, Some(to_sdl_rect(*dst)))
+                        .map_err(|e| anyhow::anyhow!("erase {tile:?}: {e}"))?;
+                    if erasing {
+                        // Restored right after: every other command on this texture — and
+                        // every other texture — composites normally.
+                        set_raw_blend_mode(tex, sdl2::sys::SDL_BlendMode::SDL_BLENDMODE_BLEND);
+                    } else {
+                        // No custom blend on this renderer: the mask blends normally instead,
+                        // so the dissolve fades to its own black rather than to the plane.
+                        // Once per process — this runs every frame of every dissolve.
+                        BLEND_WARNED.call_once(|| {
+                            tracing::warn!("SDL custom blend unsupported — hero dissolve falls back to fading to black");
+                        });
+                    }
                 }
                 DrawCmd::TexF { tile, dst, alpha } => {
                     let Some(tex) = self.faded_tile(tile, *alpha) else {

@@ -145,9 +145,64 @@ pub fn anim_frac_smooth(anim: Option<Instant>, dur: Duration) -> f32 {
 }
 
 fn frac(anim: Option<Instant>, dur: Duration, curve: impl Fn(f32) -> f32) -> f32 {
+    // The clock is read only when there is an animation to measure — most calls, on most
+    // frames, are the `None` arm.
     match anim {
-        Some(t) => curve((t.elapsed().as_secs_f32() / dur.as_secs_f32()).min(1.0)),
+        Some(_) => frac_at(anim, dur, Instant::now(), curve),
         None => 1.0,
+    }
+}
+
+/// [`frac`] against a clock the caller already read. Per-element loops (the grid's visible
+/// cards) take one `Instant::now()` for the frame rather than one per element per curve.
+fn frac_at(anim: Option<Instant>, dur: Duration, now: Instant, curve: impl Fn(f32) -> f32) -> f32 {
+    match anim {
+        // Saturating: a clock armed in the future (the reveal wave's stagger) has not started.
+        Some(t) => curve((now.saturating_duration_since(t).as_secs_f32() / dur.as_secs_f32()).min(1.0)),
+        None => 1.0,
+    }
+}
+
+/// [`anim_frac`] on a caller-held clock. See [`frac_at`].
+pub fn anim_frac_at(anim: Option<Instant>, dur: Duration, now: Instant) -> f32 {
+    frac_at(anim, dur, now, ease)
+}
+
+/// [`anim_frac_smooth`] on a caller-held clock. See [`frac_at`].
+pub fn anim_frac_smooth_at(anim: Option<Instant>, dur: Duration, now: Instant) -> f32 {
+    frac_at(anim, dur, now, smoothstep)
+}
+
+/// A staggered fade across a surface: one curve, started up to `span` later depending on how
+/// far along the sweep the element sits. Whoever owns the surface decides what `progress`
+/// means — a card's diagonal position in the grid, a texel's position in an image — and the
+/// motion is the same either way, which is the point: the library's cards arrive on one of
+/// these and the launch backdrop leaves on one, in the same direction.
+///
+/// Smoothstep rather than the cubic ease-out the pops use: over a long fade `1-(1-t)³` is
+/// near-opaque a sixth of the way through, which lands as a pop.
+#[derive(Clone, Copy)]
+pub struct Wave {
+    /// How much later the far end of the sweep starts than the near end.
+    pub span: Duration,
+    /// One element's own fade, once its turn comes.
+    pub fade: Duration,
+}
+
+impl Wave {
+    /// How long the element at `progress` (0 at the corner the wave starts from, 1 at the
+    /// opposite one) waits before its own fade begins.
+    pub fn delay(self, progress: f32) -> Duration {
+        self.span.mul_f32(progress.clamp(0.0, 1.0))
+    }
+
+    /// That element's 0..=1 progress, `elapsed` seconds into the wave. Seconds rather than
+    /// two `Instant`s because the callers evaluate one wave at many points of a frame (a
+    /// mask's texels, a window of cards): plain `f32` throughout, no `Duration` arithmetic
+    /// per point.
+    pub fn frac_secs(self, elapsed: f32, progress: f32) -> f32 {
+        let started = elapsed - self.span.as_secs_f32() * progress.clamp(0.0, 1.0);
+        smoothstep((started / self.fade.as_secs_f32()).clamp(0.0, 1.0))
     }
 }
 

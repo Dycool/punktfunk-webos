@@ -43,6 +43,23 @@ pub const FIRST_FRAME_WAIT: Duration = Duration::from_secs(6);
 /// Only a backstop — `session::connect` has its own timeouts.
 pub const HERO_LOADING_MAX: Duration = Duration::from_secs(30);
 
+/// The backdrop's exit: the grid's reveal wave (`app::GRID_REVEAL_WAVE`) run the other way —
+/// same direction across the screen, same curve, fading out instead of in.
+///
+/// Split out of [`HERO_FADE`] rather than given its own numbers: the exit is what the hand-off
+/// waits on, so span plus fade has to be that duration, and two independent constants would
+/// only be a way for them to stop adding up.
+pub const HERO_DISSOLVE_WAVE: ui::animation::Wave = ui::animation::Wave {
+    span: Duration::from_millis(HERO_FADE.as_millis() as u64 * 2 / 5),
+    fade: Duration::from_millis(HERO_FADE.as_millis() as u64 * 3 / 5),
+};
+
+/// The dissolve mask's resolution. Tiny on purpose: it is stretched over the whole screen and
+/// bilinear filtering turns it into a continuous gradient, so the wave costs one small buffer
+/// per frame rather than a draw call per piece of the image.
+pub const HERO_MASK_W: u32 = 64;
+pub const HERO_MASK_H: u32 = 36;
+
 /// How much the hero is darkened once fully faded in, so it reads as a backdrop
 /// rather than as content.
 pub const HERO_SCRIM_ALPHA: f32 = 70.0;
@@ -109,6 +126,12 @@ pub(crate) struct Hero {
     since: Option<Instant>,
     /// When it started fading back out, i.e. when the stream became ready.
     fade_out: Option<Instant>,
+    /// [`Self::dissolve_mask`]'s buffer, kept across the frames of one dissolve.
+    mask: Vec<u8>,
+    /// Whether that fade-out began with a picture on the video plane behind it. Only then is
+    /// the exit a dissolve into live video; a failed connect (or a first frame that never
+    /// came) has nothing to dissolve into and leaves over the menu as it always did.
+    over_video: bool,
     /// When the wait for a decoded frame runs out, set the moment the connect finishes so the
     /// budget is bounded from there rather than from the launch. Handed to `runtime::stream`,
     /// whose reveal waits on the same signal and must not start the clock over.
@@ -195,10 +218,78 @@ impl Hero {
 
     /// This frame's opacity factor, 0..=1: the fade-in, less the fade-out once that starts.
     pub(crate) fn opacity(&self) -> f32 {
-        let out = self
-            .fade_out
-            .map_or(0.0, |t| ui::animation::anim_frac(Some(t), HERO_FADE));
-        ui::animation::anim_frac(self.since, HERO_FADE) * (1.0 - out)
+        self.fade_in() * (1.0 - self.fade_out_frac())
+    }
+
+    /// How far the hero has faded *in* — the factor every exit is scaled by, so a hero that
+    /// never finished arriving does not brighten on its way out.
+    pub(crate) fn fade_in(&self) -> f32 {
+        ui::animation::anim_frac(self.since, HERO_FADE)
+    }
+
+    /// How far the exit has run, 0..=1. The uniform part of leaving, which the dissolve's
+    /// wave rides on top of.
+    fn fade_out_frac(&self) -> f32 {
+        // Not `anim_frac(self.fade_out, ..)`: an absent clock there means "finished", and an
+        // exit that has not started is the opposite of finished.
+        self.exit_secs(Instant::now()).map_or(0.0, |secs| {
+            ui::animation::ease((secs / HERO_FADE.as_secs_f32()).min(1.0))
+        })
+    }
+
+    /// Seconds into the exit at `now`, or `None` if it has not started — the one reading of
+    /// that clock, for the two curves that run off it (this fade and the dissolve's wave).
+    fn exit_secs(&self, now: Instant) -> Option<f32> {
+        self.fade_out
+            .map(|t| now.saturating_duration_since(t).as_secs_f32())
+    }
+
+    /// Whether the exit is a dissolve into live video: the graphics plane is cleared
+    /// transparent under it and the hero leaves on a diagonal wave, so the picture is
+    /// uncovered gradually instead of the whole still cutting to it.
+    ///
+    /// Latched when the fade-out starts (see [`Self::faded_out`]), so it implies one is
+    /// running.
+    pub(crate) fn dissolving(&self) -> bool {
+        self.over_video
+    }
+
+    /// The dimming over the backdrop as it leaves: its usual scrim deepening to black across
+    /// [`HERO_FADE`]. The fade to dark the exit always had, now running underneath the wave —
+    /// the art darkens where the wave has not reached it yet, and is gone where it has.
+    pub(crate) fn exit_scrim(&self) -> f32 {
+        let out = self.fade_out_frac();
+        self.fade_in() * (HERO_SCRIM_ALPHA + (255.0 - HERO_SCRIM_ALPHA) * out)
+    }
+
+    /// This frame's dissolve mask: one byte of alpha per texel of a black
+    /// [`HERO_MASK_W`]x[`HERO_MASK_H`] image, in RGBA order.
+    ///
+    /// The wave runs on `(x + y)`, so it sweeps the diagonal from the top-left corner — the
+    /// direction the grid's cards arrive on — and every texel is on its own delayed
+    /// smoothstep. Evaluated once per *diagonal* rather than once per texel: the value is a
+    /// function of `x + y` alone, so a row of the image is 23 of them rather than 2304.
+    ///
+    /// The buffer is kept across frames and only its alpha bytes are written — the colour is
+    /// black for the life of the dissolve, and this runs every frame of it.
+    pub(crate) fn dissolve_mask(&mut self, now: Instant) -> (u32, u32, &[u8]) {
+        let px = (HERO_MASK_W * HERO_MASK_H) as usize * 4;
+        if self.mask.len() != px {
+            self.mask.clear();
+            self.mask.resize(px, 0);
+        }
+        let elapsed = self.exit_secs(now).unwrap_or(f32::MAX);
+        let last = (HERO_MASK_W + HERO_MASK_H - 2) as f32;
+        let mut diagonal = [0u8; (HERO_MASK_W + HERO_MASK_H - 1) as usize];
+        for (d, a) in diagonal.iter_mut().enumerate() {
+            *a = (HERO_DISSOLVE_WAVE.frac_secs(elapsed, d as f32 / last) * 255.0) as u8;
+        }
+        for y in 0..HERO_MASK_H {
+            for x in 0..HERO_MASK_W {
+                self.mask[((y * HERO_MASK_W + x) * 4 + 3) as usize] = diagonal[(x + y) as usize];
+            }
+        }
+        (HERO_MASK_W, HERO_MASK_H, &self.mask)
     }
 
     /// Whether an uploaded hero is on screen as the connecting backdrop. `since` is only ever
@@ -210,11 +301,11 @@ impl Hero {
     /// Whether the loading screen is finished, so the streaming loop can take the screen.
     /// Also what starts the fade-out, once everything else it waits on is satisfied.
     ///
-    /// `presenting` is a frame having reached the decoder — NOT NDL's `PLAYING`, which lands
-    /// during the load with nothing decoded. With a hero to pan, the screen waits for it so the
+    /// `presented` is the panel having a picture (`ndl::presented`) — NOT NDL's `PLAYING`,
+    /// which lands during the load with nothing decoded. With a hero to pan, the screen waits for it so the
     /// fade-out is the last thing before the plane is uncovered; with none, `runtime::stream` holds
     /// the finished launch frame instead, on the same [`FIRST_FRAME_WAIT`] budget.
-    pub(crate) fn handover_ready(&mut self, launch_elapsed: Duration, connect: Connect, presenting: bool) -> bool {
+    pub(crate) fn handover_ready(&mut self, launch_elapsed: Duration, connect: Connect, presented: bool) -> bool {
         if launch_elapsed < LAUNCH_FADE {
             return false;
         }
@@ -229,7 +320,7 @@ impl Hero {
         // the end of the fade. So does a handshake that lands and then decodes nothing.
         let settled = match connect {
             Connect::Failed => true,
-            Connect::Done => presenting || self.first_frame_expired(),
+            Connect::Done => presented || self.first_frame_expired(),
             Connect::Pending => false,
         };
         if !self.showing() {
@@ -242,7 +333,7 @@ impl Hero {
         // Held until the launch resolves, then for the hero's own minimum and fade-out, so the
         // backdrop leaves the same way whether it runs into live video or into the error on the
         // menu behind it — never a hero cut mid-fade.
-        settled && self.since.is_some_and(|t| t.elapsed() >= HERO_MIN_SHOW) && self.faded_out()
+        settled && self.since.is_some_and(|t| t.elapsed() >= HERO_MIN_SHOW) && self.faded_out(presented)
     }
 
     /// Starts the first-frame budget on the first call and reports whether it has run out.
@@ -259,9 +350,16 @@ impl Hero {
         self.first_frame_deadline
     }
 
-    /// Starts the fade-out (idempotent) and reports whether it has finished.
-    fn faded_out(&mut self) -> bool {
-        let since = *self.fade_out.get_or_insert_with(Instant::now);
+    /// Starts the fade-out (idempotent) and reports whether it has finished. `over_video` is
+    /// latched from the first call: what the exit dissolves into is decided when it begins.
+    fn faded_out(&mut self, over_video: bool) -> bool {
+        let since = match self.fade_out {
+            Some(t) => t,
+            None => {
+                self.over_video = over_video;
+                *self.fade_out.insert(Instant::now())
+            }
+        };
         since.elapsed() >= HERO_FADE
     }
 }
