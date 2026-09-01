@@ -13,9 +13,10 @@ struct LaunchParams {
     /// Forces `device::sdk_version`, so a modern TV can exercise the NDL v1 path
     /// (`task deploy WEBOS_SDK=...`).
     webos_sdk: Option<String>,
-    /// Dev/A-B override for slice-progressive AU delivery. `true`/`false` is accepted directly
-    /// from SAM JSON; absent keeps the production capability-based default.
-    frame_parts: Option<bool>,
+    /// Dev/A-B override for slice-progressive AU delivery. SAM/ares may hand launch params over as
+    /// either JSON booleans or strings, so keep this tolerant rather than making one differently
+    /// typed diagnostic field invalidate the entire argv[1] object.
+    frame_parts: Option<serde_json::Value>,
 }
 
 /// Cache launch params once; argv doesn't change over process lifetime.
@@ -60,5 +61,15 @@ pub fn webos_sdk_override() -> Option<&'static str> {
 /// NDL-generation capability gate untouched. This is deliberately not persisted: it is a probe,
 /// not a user setting, and changing it requires a fresh handshake because it changes wire delivery.
 pub fn frame_parts_override() -> Option<bool> {
-    launch_params().frame_parts
+    match launch_params().frame_parts.as_ref()? {
+        serde_json::Value::Bool(v) => Some(*v),
+        serde_json::Value::String(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        },
+        serde_json::Value::Number(v) if v.as_u64() == Some(1) => Some(true),
+        serde_json::Value::Number(v) if v.as_u64() == Some(0) => Some(false),
+        _ => None,
+    }
 }
