@@ -162,6 +162,14 @@ impl Negotiated {
         // caps are still advertised and the host resolves the codec, with application gated
         // on the *negotiated* codec being HEVC in `load_player`.
         let hdr = params.hdr_enabled && caps.hdr && codec_pref != CodecPref::H264;
+        let frame_parts_supported = device::ndl_generation() == NdlGeneration::V2;
+        let frame_parts_override = crate::logger::frame_parts_override();
+        let frame_parts = frame_parts_supported && frame_parts_override.unwrap_or(true);
+        if let Some(requested) = frame_parts_override {
+            tracing::info!(
+                "frame parts A/B override: requested={requested} supported={frame_parts_supported} effective={frame_parts}"
+            );
+        }
         Self {
             audio_channels,
             // VIDEO_CAP_CHACHA20: unconditional — armv7 has no hardware AES, so ChaCha20 is
@@ -179,7 +187,7 @@ impl Negotiated {
             // Core may replace this through `PUNKTFUNK_CLIENT_PEAK_NITS`; the host echoes that
             // effective volume on the metadata plane, so NDL converges after startup.
             display_hdr: hdr.then_some(params.display_hdr),
-            frame_parts: device::ndl_generation() == NdlGeneration::V2,
+            frame_parts,
         }
     }
 }
@@ -214,7 +222,7 @@ fn dial(params: &ConnectParams, negotiated: &Negotiated) -> Result<NativeClient>
         // Slice-progressive delivery: AU prefixes reach the decoder while the rest is still on the
         // wire, so a frame no longer waits for its own last datagram (`session::stage`'s `AuParts`).
         // On wherever it can be — NDL v2 only, per `Negotiated::clamp`: v1's feed has no timestamp
-        // to repeat across pieces.
+        // to repeat across pieces. The launch override above is an A/B probe only.
         negotiated.frame_parts,
         params.launch.clone(),
         // Device name for the host's pending-approval list. `None` keeps the host's
@@ -238,7 +246,7 @@ fn log_handshake(client: &NativeClient, negotiated: &Negotiated) {
     tracing::info!(
         "connected: codec={} (offered=0x{:02x} preferred=0x{:02x}) \
          compositor={:?} audio_ch={} color={:?} wire_budget_kbps={} \
-         decode_latency={} caps=0x{:02x} fp={fp_hex}",
+         decode_latency={} caps=0x{:02x} frame_parts={} fp={fp_hex}",
         client.codec,
         negotiated.video_codecs,
         negotiated.preferred_codec,
@@ -248,6 +256,7 @@ fn log_handshake(client: &NativeClient, negotiated: &Negotiated) {
         client.resolved_bitrate_kbps,
         client.wants_decode_latency(),
         negotiated.video_caps,
+        negotiated.frame_parts,
     );
 }
 
