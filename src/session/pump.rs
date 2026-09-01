@@ -52,10 +52,9 @@ impl Tick {
     }
 }
 
-/// Current client realtime in nanoseconds, in the same domain `clock_offset_shared()` maps to the
-/// host capture clock. Kept here instead of reusing the stage's submit-time helper because this is
-/// deliberately sampled BEFORE any NDL work: the whole point is to measure how old a frame already
-/// is when it leaves punktfunk-core.
+/// Current client realtime in nanoseconds, in the same domain core uses for `Frame::received_ns`
+/// and that `clock_offset_shared()` maps to the host capture clock. Sampled before any NDL work so
+/// both queue and age metrics stop exactly at the core→embedder hand-off.
 fn realtime_ns() -> Option<i128> {
     let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
     i128::try_from(since_epoch.as_nanos()).ok()
@@ -70,10 +69,11 @@ fn realtime_ns() -> Option<i128> {
 /// local delivery delta. That lets a 4K120 trace distinguish "host produced ~120, TV received in
 /// bursts" from "TV received clean ~120 but handed NDL late stamps" without a second machine.
 ///
-/// `pre_ndl_age` adds the missing standing-latency dimension: client realtime is translated into
-/// the host clock with core's live clock offset and compared directly with the host capture PTS.
-/// If that age grows while NDL backlog stays small, the debt is already in transport/FEC/queues;
-/// if it stays low while `late_stamp` rises, the fault is on the NDL/presentation side.
+/// Two standing-latency terms make the split explicit. `client_queue` is pull realtime minus
+/// core's `Frame::received_ns` reassembly-completion stamp: time spent AFTER core completed the AU
+/// but BEFORE this pump got it. `pre_ndl_age` translates pull realtime into the host clock and
+/// subtracts the capture PTS, so it includes network/reassembly plus that client queue. Together
+/// with NDL `backlog`, those three numbers localise where latency debt is accumulating.
 #[derive(Default)]
 struct CadenceWindow {
     last_host_pts_ns: Option<u64>,
@@ -89,6 +89,10 @@ struct CadenceWindow {
     max_arrival_gap_ns: u64,
     repeated_pts: u64,
     backwards_pts: u64,
+    client_queue_samples: u64,
+    client_queue_sum_ns: u64,
+    client_queue_min_ns: Option<u64>,
+    client_queue_max_ns: Option<u64>,
     pre_ndl_age_samples: u64,
     pre_ndl_age_sum_ns: i128,
     pre_ndl_age_min_ns: Option<i64>,
@@ -108,6 +112,10 @@ struct CadenceSnapshot {
     max_arrival_gap_ns: u64,
     repeated_pts: u64,
     backwards_pts: u64,
+    client_queue_samples: u64,
+    client_queue_sum_ns: u64,
+    client_queue_min_ns: Option<u64>,
+    client_queue_max_ns: Option<u64>,
     pre_ndl_age_samples: u64,
     pre_ndl_age_sum_ns: i128,
     pre_ndl_age_min_ns: Option<i64>,
@@ -120,6 +128,7 @@ impl CadenceWindow {
             return;
         }
         let now = Instant::now();
+        let pull_realtime_ns = realtime_ns();
         self.aus = self.aus.saturating_add(1);
 
         let arrival_delta = self.last_arrival.map(|previous| {
@@ -158,20 +167,37 @@ impl CadenceWindow {
             self.delivery_delta_max_ns = self.delivery_delta_max_ns.max(distortion);
         }
 
+        // Core v0.34 stamps `received_ns` when reassembly crosses the session boundary, before this
+        // consumer can wait in its bounded hand-off channel. `0` is the compatibility sentinel.
+        let client_queue_ns = if frame.received_ns == 0 {
+            None
+        } else {
+            pull_realtime_ns
+                .and_then(|pull_ns| pull_ns.checked_sub(i128::from(frame.received_ns)))
+                .and_then(|ns| u64::try_from(ns).ok())
+        };
+        if let Some(queue_ns) = client_queue_ns {
+            self.client_queue_samples = self.client_queue_samples.saturating_add(1);
+            self.client_queue_sum_ns = self.client_queue_sum_ns.saturating_add(queue_ns);
+            self.client_queue_min_ns = Some(self.client_queue_min_ns.map_or(queue_ns, |old| old.min(queue_ns)));
+            self.client_queue_max_ns = Some(self.client_queue_max_ns.map_or(queue_ns, |old| old.max(queue_ns)));
+        }
+
         // A zero offset is core's pre-sync/default value. Skip it rather than publish a giant
         // epoch-vs-PTS number that looks like real standing latency during session bring-up.
-        if clock_offset_ns != 0 {
-            if let Some(client_realtime_ns) = realtime_ns() {
-                let age_ns = client_realtime_ns
-                    .checked_add(i128::from(clock_offset_ns))
-                    .and_then(|host_now_ns| host_now_ns.checked_sub(i128::from(frame.pts_ns)));
-                if let Some(age_ns) = age_ns.and_then(|ns| i64::try_from(ns).ok()) {
-                    self.pre_ndl_age_samples = self.pre_ndl_age_samples.saturating_add(1);
-                    self.pre_ndl_age_sum_ns = self.pre_ndl_age_sum_ns.saturating_add(i128::from(age_ns));
-                    self.pre_ndl_age_min_ns = Some(self.pre_ndl_age_min_ns.map_or(age_ns, |old| old.min(age_ns)));
-                    self.pre_ndl_age_max_ns = Some(self.pre_ndl_age_max_ns.map_or(age_ns, |old| old.max(age_ns)));
-                }
-            }
+        let pre_ndl_age_ns = if clock_offset_ns == 0 {
+            None
+        } else {
+            pull_realtime_ns
+                .and_then(|client_ns| client_ns.checked_add(i128::from(clock_offset_ns)))
+                .and_then(|host_now_ns| host_now_ns.checked_sub(i128::from(frame.pts_ns)))
+                .and_then(|ns| i64::try_from(ns).ok())
+        };
+        if let Some(age_ns) = pre_ndl_age_ns {
+            self.pre_ndl_age_samples = self.pre_ndl_age_samples.saturating_add(1);
+            self.pre_ndl_age_sum_ns = self.pre_ndl_age_sum_ns.saturating_add(i128::from(age_ns));
+            self.pre_ndl_age_min_ns = Some(self.pre_ndl_age_min_ns.map_or(age_ns, |old| old.min(age_ns)));
+            self.pre_ndl_age_max_ns = Some(self.pre_ndl_age_max_ns.map_or(age_ns, |old| old.max(age_ns)));
         }
     }
 
@@ -190,6 +216,10 @@ impl CadenceWindow {
             max_arrival_gap_ns: self.max_arrival_gap_ns,
             repeated_pts: self.repeated_pts,
             backwards_pts: self.backwards_pts,
+            client_queue_samples: self.client_queue_samples,
+            client_queue_sum_ns: self.client_queue_sum_ns,
+            client_queue_min_ns: self.client_queue_min_ns,
+            client_queue_max_ns: self.client_queue_max_ns,
             pre_ndl_age_samples: self.pre_ndl_age_samples,
             pre_ndl_age_sum_ns: self.pre_ndl_age_sum_ns,
             pre_ndl_age_min_ns: self.pre_ndl_age_min_ns,
@@ -206,6 +236,10 @@ impl CadenceWindow {
         self.max_arrival_gap_ns = 0;
         self.repeated_pts = 0;
         self.backwards_pts = 0;
+        self.client_queue_samples = 0;
+        self.client_queue_sum_ns = 0;
+        self.client_queue_min_ns = None;
+        self.client_queue_max_ns = None;
         self.pre_ndl_age_samples = 0;
         self.pre_ndl_age_sum_ns = 0;
         self.pre_ndl_age_min_ns = None;
@@ -225,6 +259,18 @@ impl CadenceSnapshot {
 
     fn mean_delivery_delta_ms(self) -> f64 {
         mean_ms(self.delivery_delta_abs_ns, self.delivery_delta_samples)
+    }
+
+    fn mean_client_queue_ms(self) -> f64 {
+        mean_ms(self.client_queue_sum_ns, self.client_queue_samples)
+    }
+
+    fn min_client_queue_ms(self) -> f64 {
+        self.client_queue_min_ns.map_or(0.0, |ns| ns as f64 / 1_000_000.0)
+    }
+
+    fn max_client_queue_ms(self) -> f64 {
+        self.client_queue_max_ns.map_or(0.0, |ns| ns as f64 / 1_000_000.0)
     }
 
     fn mean_pre_ndl_age_ms(self) -> f64 {
@@ -440,14 +486,13 @@ impl VideoPump {
                 pacing.reanchors,
             );
             // This line is the 4K120 fork in the road. Source ~120 + arrival well below/bursty
-            // points before NDL (transport/FEC/scheduling); source ~120 + arrival ~120 + late
-            // stamps points at the NDL/presentation side. Because `delivery_delta` subtracts each
-            // source interval from the matching arrival interval, real variable game cadence is
-            // not misdiagnosed as network jitter. `pre_ndl_age` says whether that timing mismatch
-            // accumulated into standing latency before this thread even entered the stage.
+            // points before NDL; source ~120 + arrival ~120 + late stamps points at presentation.
+            // `client_queue` then separates core's already-reassembled hand-off from earlier
+            // network/FEC time, while `pre_ndl_age` says how much debt reaches this pump in total.
             tracing::debug!(
                 "cadence: aus={} source={:.2}fps arrival={:.2}fps delivery_delta_mean={:.2}ms \
                  delivery_delta_max={:.2}ms arrival_gap_max={:.2}ms repeated_pts={} backwards_pts={} \
+                 client_queue_mean={:.2}ms min={:.2}ms max={:.2}ms samples={} \
                  pre_ndl_age_mean={:.2}ms min={:.2}ms max={:.2}ms samples={}",
                 cadence.aus,
                 cadence.source_fps(),
@@ -457,6 +502,10 @@ impl VideoPump {
                 cadence.max_arrival_gap_ns as f64 / 1e6,
                 cadence.repeated_pts,
                 cadence.backwards_pts,
+                cadence.mean_client_queue_ms(),
+                cadence.min_client_queue_ms(),
+                cadence.max_client_queue_ms(),
+                cadence.client_queue_samples,
                 cadence.mean_pre_ndl_age_ms(),
                 cadence.min_pre_ndl_age_ms(),
                 cadence.max_pre_ndl_age_ms(),
