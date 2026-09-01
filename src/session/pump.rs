@@ -2,9 +2,9 @@
 //! packets into the audio stage. Everything wire-shaped lives here and nothing else — what a
 //! delivery MEANS is the stages' business.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use punktfunk_core::client::{AudioPacket, NativeClient};
@@ -52,6 +52,15 @@ impl Tick {
     }
 }
 
+/// Current client realtime in nanoseconds, in the same domain `clock_offset_shared()` maps to the
+/// host capture clock. Kept here instead of reusing the stage's submit-time helper because this is
+/// deliberately sampled BEFORE any NDL work: the whole point is to measure how old a frame already
+/// is when it leaves punktfunk-core.
+fn realtime_ns() -> Option<i128> {
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    i128::try_from(since_epoch.as_nanos()).ok()
+}
+
 /// One log-window's source-vs-delivery cadence. Measured on AU HEADS only: slice-progressive
 /// pieces repeat both the frame index and host PTS, and counting their tails would make a 120 Hz
 /// source look arbitrarily faster merely because its pictures happened to span more FEC blocks.
@@ -60,6 +69,11 @@ impl Tick {
 /// in BOTH deltas and therefore cancels, while transport/FEC/scheduler bunching appears only in the
 /// local delivery delta. That lets a 4K120 trace distinguish "host produced ~120, TV received in
 /// bursts" from "TV received clean ~120 but handed NDL late stamps" without a second machine.
+///
+/// `pre_ndl_age` adds the missing standing-latency dimension: client realtime is translated into
+/// the host clock with core's live clock offset and compared directly with the host capture PTS.
+/// If that age grows while NDL backlog stays small, the debt is already in transport/FEC/queues;
+/// if it stays low while `late_stamp` rises, the fault is on the NDL/presentation side.
 #[derive(Default)]
 struct CadenceWindow {
     last_host_pts_ns: Option<u64>,
@@ -75,6 +89,10 @@ struct CadenceWindow {
     max_arrival_gap_ns: u64,
     repeated_pts: u64,
     backwards_pts: u64,
+    pre_ndl_age_samples: u64,
+    pre_ndl_age_sum_ns: i128,
+    pre_ndl_age_min_ns: Option<i64>,
+    pre_ndl_age_max_ns: Option<i64>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -90,10 +108,14 @@ struct CadenceSnapshot {
     max_arrival_gap_ns: u64,
     repeated_pts: u64,
     backwards_pts: u64,
+    pre_ndl_age_samples: u64,
+    pre_ndl_age_sum_ns: i128,
+    pre_ndl_age_min_ns: Option<i64>,
+    pre_ndl_age_max_ns: Option<i64>,
 }
 
 impl CadenceWindow {
-    fn observe(&mut self, frame: &punktfunk_core::session::Frame) {
+    fn observe(&mut self, frame: &punktfunk_core::session::Frame, clock_offset_ns: i64) {
         if frame.part.is_some_and(|part| !part.first) {
             return;
         }
@@ -135,6 +157,22 @@ impl CadenceWindow {
             self.delivery_delta_abs_ns = self.delivery_delta_abs_ns.saturating_add(distortion);
             self.delivery_delta_max_ns = self.delivery_delta_max_ns.max(distortion);
         }
+
+        // A zero offset is core's pre-sync/default value. Skip it rather than publish a giant
+        // epoch-vs-PTS number that looks like real standing latency during session bring-up.
+        if clock_offset_ns != 0 {
+            if let Some(client_realtime_ns) = realtime_ns() {
+                let age_ns = client_realtime_ns
+                    .checked_add(i128::from(clock_offset_ns))
+                    .and_then(|host_now_ns| host_now_ns.checked_sub(i128::from(frame.pts_ns)));
+                if let Some(age_ns) = age_ns.and_then(|ns| i64::try_from(ns).ok()) {
+                    self.pre_ndl_age_samples = self.pre_ndl_age_samples.saturating_add(1);
+                    self.pre_ndl_age_sum_ns = self.pre_ndl_age_sum_ns.saturating_add(i128::from(age_ns));
+                    self.pre_ndl_age_min_ns = Some(self.pre_ndl_age_min_ns.map_or(age_ns, |old| old.min(age_ns)));
+                    self.pre_ndl_age_max_ns = Some(self.pre_ndl_age_max_ns.map_or(age_ns, |old| old.max(age_ns)));
+                }
+            }
+        }
     }
 
     /// Reset only the WINDOW counters. Keep the two previous stamps so the first AU after a log
@@ -152,6 +190,10 @@ impl CadenceWindow {
             max_arrival_gap_ns: self.max_arrival_gap_ns,
             repeated_pts: self.repeated_pts,
             backwards_pts: self.backwards_pts,
+            pre_ndl_age_samples: self.pre_ndl_age_samples,
+            pre_ndl_age_sum_ns: self.pre_ndl_age_sum_ns,
+            pre_ndl_age_min_ns: self.pre_ndl_age_min_ns,
+            pre_ndl_age_max_ns: self.pre_ndl_age_max_ns,
         };
         self.aus = 0;
         self.source_intervals = 0;
@@ -164,6 +206,10 @@ impl CadenceWindow {
         self.max_arrival_gap_ns = 0;
         self.repeated_pts = 0;
         self.backwards_pts = 0;
+        self.pre_ndl_age_samples = 0;
+        self.pre_ndl_age_sum_ns = 0;
+        self.pre_ndl_age_min_ns = None;
+        self.pre_ndl_age_max_ns = None;
         out
     }
 }
@@ -179,6 +225,21 @@ impl CadenceSnapshot {
 
     fn mean_delivery_delta_ms(self) -> f64 {
         mean_ms(self.delivery_delta_abs_ns, self.delivery_delta_samples)
+    }
+
+    fn mean_pre_ndl_age_ms(self) -> f64 {
+        if self.pre_ndl_age_samples == 0 {
+            return 0.0;
+        }
+        self.pre_ndl_age_sum_ns as f64 / self.pre_ndl_age_samples as f64 / 1_000_000.0
+    }
+
+    fn min_pre_ndl_age_ms(self) -> f64 {
+        self.pre_ndl_age_min_ns.map_or(0.0, |ns| ns as f64 / 1_000_000.0)
+    }
+
+    fn max_pre_ndl_age_ms(self) -> f64 {
+        self.pre_ndl_age_max_ns.map_or(0.0, |ns| ns as f64 / 1_000_000.0)
     }
 }
 
@@ -202,6 +263,9 @@ struct VideoPump {
     client: Arc<NativeClient>,
     stage: VideoStage,
     stats: Arc<StreamStats>,
+    /// Live host-minus-client clock skew from core. Kept as the shared atomic rather than
+    /// re-fetching/cloning it for every frame; core re-syncs this cell in place mid-session.
+    clock_offset: Arc<AtomicI64>,
     /// Whether the host's per-content HDR metadata is worth draining. False on every session
     /// where nothing would apply it: an SDR or non-HEVC stream.
     is_hdr: bool,
@@ -225,10 +289,12 @@ struct VideoPump {
 impl VideoPump {
     fn new(client: Arc<NativeClient>, stage: VideoStage, stats: Arc<StreamStats>, is_hdr: bool) -> Self {
         let last_dropped_seen = client.frames_dropped();
+        let clock_offset = client.clock_offset_shared();
         Self {
             client,
             stage,
             stats,
+            clock_offset,
             is_hdr,
             last_dropped_seen,
             drop_credit: 0,
@@ -283,7 +349,8 @@ impl VideoPump {
             boost_hot_threads(&self.client);
             self.hot_threads_boosted = true;
         }
-        self.cadence.observe(frame);
+        self.cadence
+            .observe(frame, self.clock_offset.load(Ordering::Relaxed));
         self.stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
         self.heartbeat();
 
@@ -376,10 +443,12 @@ impl VideoPump {
             // points before NDL (transport/FEC/scheduling); source ~120 + arrival ~120 + late
             // stamps points at the NDL/presentation side. Because `delivery_delta` subtracts each
             // source interval from the matching arrival interval, real variable game cadence is
-            // not misdiagnosed as network jitter.
+            // not misdiagnosed as network jitter. `pre_ndl_age` says whether that timing mismatch
+            // accumulated into standing latency before this thread even entered the stage.
             tracing::debug!(
                 "cadence: aus={} source={:.2}fps arrival={:.2}fps delivery_delta_mean={:.2}ms \
-                 delivery_delta_max={:.2}ms arrival_gap_max={:.2}ms repeated_pts={} backwards_pts={}",
+                 delivery_delta_max={:.2}ms arrival_gap_max={:.2}ms repeated_pts={} backwards_pts={} \
+                 pre_ndl_age_mean={:.2}ms min={:.2}ms max={:.2}ms samples={}",
                 cadence.aus,
                 cadence.source_fps(),
                 cadence.arrival_fps(),
@@ -388,6 +457,10 @@ impl VideoPump {
                 cadence.max_arrival_gap_ns as f64 / 1e6,
                 cadence.repeated_pts,
                 cadence.backwards_pts,
+                cadence.mean_pre_ndl_age_ms(),
+                cadence.min_pre_ndl_age_ms(),
+                cadence.max_pre_ndl_age_ms(),
+                cadence.pre_ndl_age_samples,
             );
             tracing::debug!(
                 "video: {} frames, parts={}, holding={}, dropped={}, backlog={}, plane_lead={}",
