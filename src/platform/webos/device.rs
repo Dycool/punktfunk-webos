@@ -242,18 +242,28 @@ impl DeviceInfo {
     }
 }
 
-/// Nice value every stream-carrying thread is boosted to. Reached at nice 0, a thread that
-/// feeds the decoder or reads a 1 kHz mouse loses the CPU to the vendor's own boosted decode
-/// threads for tens of milliseconds at a stretch on this 3-core `SoC`.
+/// Baseline priority for stream-adjacent threads (audio, clock-plane keepalive, vendor decoder
+/// tasks). This is deliberately ordinary nice, not a realtime scheduler class: a bug in the app
+/// must never be able to starve the TV's compositor or system services.
 pub const HOT_THREAD_NICE: libc::c_int = -10;
+/// Slightly stronger bias for the two threads on the hard 4K120 deadline: core's UDP/FEC worker
+/// and the video pump that immediately feeds NDL. Losing either for one 8.33 ms frame period
+/// creates latency debt upstream of hardware decode; audio and vendor decode keep `HOT_THREAD_NICE`.
+pub const DATA_PLANE_NICE: libc::c_int = -15;
 
-/// Renices `tid` (0 = calling thread) to [`HOT_THREAD_NICE`]; `false` if the kernel refused.
+/// Renices `tid` (0 = calling thread) to `nice`; `false` if the kernel refused.
 ///
-/// Always best-effort: it needs `CAP_SYS_NICE` or a nonzero `RLIMIT_NICE`, present on a rooted
-/// install and absent under a plain Dev-Mode SAM jail.
-pub fn renice(tid: i32) -> bool {
+/// Always best-effort: negative nice needs `CAP_SYS_NICE` or a suitable `RLIMIT_NICE`, present on
+/// a rooted install and absent under a plain Dev-Mode SAM jail. Failure therefore keeps the old
+/// behavior instead of making streaming depend on root.
+pub fn renice_to(tid: i32, nice: libc::c_int) -> bool {
     // SAFETY: plain syscall — tid and priority value only, no pointers.
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, HOT_THREAD_NICE) == 0 }
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) == 0 }
+}
+
+/// Renices `tid` to [`HOT_THREAD_NICE`].
+pub fn renice(tid: i32) -> bool {
+    renice_to(tid, HOT_THREAD_NICE)
 }
 
 /// Boosts the calling thread. See [`renice`].
