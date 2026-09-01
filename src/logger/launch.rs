@@ -13,6 +13,9 @@ struct LaunchParams {
     /// Forces `device::sdk_version`, so a modern TV can exercise the NDL v1 path
     /// (`task deploy WEBOS_SDK=...`).
     webos_sdk: Option<String>,
+    /// Dev/A-B override for slice-progressive AU delivery. `true`/`false` is accepted directly
+    /// from SAM JSON; absent keeps the production capability-based default.
+    frame_parts: Option<bool>,
 }
 
 /// Cache launch params once; argv doesn't change over process lifetime.
@@ -51,4 +54,11 @@ pub fn launch_level_override() -> Option<LogLevelOverride> {
 /// Launch-time override for the detected webOS SDK version; `None` leaves detection untouched.
 pub fn webos_sdk_override() -> Option<&'static str> {
     launch_params().webos_sdk.as_deref().filter(|s| !s.is_empty())
+}
+
+/// Launch-time A/B switch for core's slice-progressive `Frame::part` delivery. `None` leaves the
+/// NDL-generation capability gate untouched. This is deliberately not persisted: it is a probe,
+/// not a user setting, and changing it requires a fresh handshake because it changes wire delivery.
+pub fn frame_parts_override() -> Option<bool> {
+    launch_params().frame_parts
 }
