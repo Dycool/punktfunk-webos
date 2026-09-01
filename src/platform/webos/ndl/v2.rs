@@ -72,6 +72,21 @@ const PLANE_LEAD_MS: i64 = PRIME_LEAD * PRIME_PACKET_MS;
 /// and this is launch-path time, i.e. black screen.
 const PRIME_RETRY: Duration = Duration::from_millis(20);
 
+/// Wait for the next fixed metronome deadline without letting work time accumulate into the
+/// cadence. A plain `sleep(PRIME_RETRY)` runs `work + 20 ms`, so decoder/FFI contention slowly
+/// lengthens the clock-plane period exactly when 4K120 needs the most deterministic pacing.
+/// Missed slots are skipped rather than replayed in a burst; the top-up itself is always computed
+/// from the current player clock, so catching up the timer would buy nothing but extra wakeups.
+fn sleep_to_next_clock_tick(next_tick: &mut Instant) {
+    *next_tick += PRIME_RETRY;
+    let mut now = Instant::now();
+    while *next_tick <= now {
+        *next_tick += PRIME_RETRY;
+        now = Instant::now();
+    }
+    std::thread::sleep(*next_tick - now);
+}
+
 /// How long the clock plane waits for the real stream before feeding the plane itself.
 ///
 /// The test is "no packets at all", never amplitude: a silent game still streams, since the host
@@ -328,17 +343,20 @@ impl NdlVideo {
         Ok(())
     }
 
-    /// Feed silence from `from_ms` up to `target_ms`, returning the last stamp fed.
+    /// Feed silence up to a fixed lead over the player clock, returning the last stamp fed.
     ///
     /// One `lock_ffi` for the whole burst, like [`prime_audio`](Self::prime_audio) — the video feed
     /// shares that guard, so per-packet acquires would be up to 60 of them in the picture's way.
     ///
-    /// The floor is read under the guard, which is also the whole race story: `lock_ffi` is the
-    /// audio plane's only feed path, so no real packet can land mid-burst and read a stale ceiling
-    /// — it either precedes this and is picked up by the floor, or follows the final publish.
-    fn burst_silence(&self, from_ms: i64, target_ms: i64) -> Result<i64> {
+    /// Crucially, the target is sampled *after* acquiring the process-wide NDL lock. At 4K120 the
+    /// video path can legitimately keep this thread waiting behind several submissions; sampling
+    /// before the wait burns that lock latency directly out of the 40 ms pacing lead. Recomputing
+    /// here means a delayed top-up still leaves NDL with the full requested depth once it lands.
+    fn burst_silence(&self, from_ms: i64, base_ms: i64) -> Result<i64> {
         let silence = &OPUS_SILENCE[..];
         let _ffi = lock_ffi();
+        let now_ms = (self.elapsed_ns() / 1_000_000) as i64;
+        let target_ms = base_ms + now_ms + PLANE_LEAD_MS;
         let mut pts_ms = from_ms.max(self.last_audio_pts_ms.load(Ordering::Relaxed));
         while pts_ms < target_ms {
             pts_ms += PRIME_PACKET_MS;
@@ -387,6 +405,7 @@ impl NdlVideo {
         };
         let mut pts_ms = self.last_audio_pts_ms.load(Ordering::Relaxed);
         let mut filling = false;
+        let mut next_tick = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             let now_ms = (self.elapsed_ns() / 1_000_000) as i64;
             if yields_to_real && now_ms - self.last_real_feed_ms.load(Ordering::Relaxed) < REAL_FEED_GRACE_MS {
@@ -394,7 +413,7 @@ impl NdlVideo {
                     tracing::info!("NDL clock plane: host audio resumed at {now_ms}ms — yielding");
                     filling = false;
                 }
-                std::thread::sleep(PRIME_RETRY);
+                sleep_to_next_clock_tick(&mut next_tick);
                 continue;
             }
             if yields_to_real && !filling {
@@ -404,7 +423,7 @@ impl NdlVideo {
                 );
                 filling = true;
             }
-            match self.burst_silence(pts_ms, base_ms + now_ms + PLANE_LEAD_MS) {
+            match self.burst_silence(pts_ms, base_ms) {
                 Ok(fed_to) => pts_ms = fed_to,
                 Err(e) => {
                     // Dead for the session; the picture keeps running unpaced, as it did before
@@ -413,7 +432,7 @@ impl NdlVideo {
                     return;
                 }
             }
-            std::thread::sleep(PRIME_RETRY);
+            sleep_to_next_clock_tick(&mut next_tick);
         }
         tracing::info!("NDL clock plane ending at {pts_ms}ms");
     }
