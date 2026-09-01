@@ -66,6 +66,10 @@ struct VideoPump {
     /// Frame-index gaps pre-cover the reassembler's delayed drop accounting.
     drop_credit: u64,
     drop_credit_expiry: Option<Instant>,
+    /// `punktfunk-core` registers its internal UDP/FEC data-plane worker asynchronously. Its
+    /// `hot_thread_ids()` contract says the set is complete only after the first frame, so the
+    /// one-shot fleet renice is deferred until a returned frame proves that worker exists.
+    hot_threads_boosted: bool,
     heartbeat: Tick,
     video_log: Tick,
 }
@@ -81,6 +85,7 @@ impl VideoPump {
             last_dropped_seen,
             drop_credit: 0,
             drop_credit_expiry: None,
+            hot_threads_boosted: false,
             heartbeat: Tick::new(HEARTBEAT),
             video_log: Tick::new(VIDEO_LOG_INTERVAL),
         }
@@ -119,6 +124,15 @@ impl VideoPump {
     }
 
     fn on_frame(&mut self, frame: &punktfunk_core::session::Frame) {
+        // A returned frame is the synchronization point core documents for its hot-thread
+        // registry: by now the internal UDP receive/FEC worker has registered itself. Boosting
+        // before `next_frame` could miss exactly that throughput-critical thread and leave it at
+        // nice 0 while video/decode ran at -10 — worst at 4K120 where one late FEC burst can spend
+        // a whole 8.33 ms frame budget. Do this once, before any first-frame stage work.
+        if !self.hot_threads_boosted {
+            boost_hot_threads(&self.client);
+            self.hot_threads_boosted = true;
+        }
         self.stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
         self.heartbeat();
 
@@ -294,8 +308,11 @@ pub(super) fn video_pump(
     stats: Arc<StreamStats>,
     is_hdr: bool,
 ) {
+    // Register this thread immediately and boost it directly. The rest of core's hot-thread set is
+    // deliberately boosted only after the first frame in `VideoPump::on_frame`, when core says its
+    // asynchronously spawned UDP/FEC worker has registered too.
     client.register_hot_thread();
-    boost_hot_threads(&client);
+    boost_current_thread();
     spawn_vendor_decode_thread_renicer();
     VideoPump::new(client, stage, stats, is_hdr).run(&stop);
 }
