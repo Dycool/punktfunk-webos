@@ -375,13 +375,70 @@ impl ConfirmDialog {
     }
 }
 
-/// Rising-edge detect on a raw webOS scancode (polled since these sit outside
-/// rust-sdl2's `Scancode` enum). `prev` carries the last-frame state across calls.
-fn scancode_rising_edge(scancode: i32, prev: &mut bool) -> bool {
-    let down = crate::platform::webos::input::webos_scancode_down(scancode);
+/// Fires once when `down` changes from false to true.
+pub(super) fn rising_edge(down: bool, prev: &mut bool) -> bool {
     let fired = down && !*prev;
     *prev = down;
     fired
+}
+
+/// Rising-edge detect on a raw webOS scancode (polled since these sit outside
+/// rust-sdl2's `Scancode` enum). `prev` carries the last-frame state across calls.
+fn scancode_rising_edge(scancode: i32, prev: &mut bool) -> bool {
+    rising_edge(crate::platform::webos::input::webos_scancode_down(scancode), prev)
+}
+
+/// Controls the webOS on-screen keyboard for UI and streaming loops.
+pub(super) struct TextInputController {
+    util: sdl2::keyboard::TextInputUtil,
+    /// Last requested SDL state. The compositor may dismiss the panel independently.
+    active: bool,
+}
+
+impl TextInputController {
+    pub(super) fn new(util: sdl2::keyboard::TextInputUtil) -> Self {
+        Self { util, active: false }
+    }
+
+    pub(super) fn has_screen_keyboard_support(&self) -> bool {
+        self.util.has_screen_keyboard_support()
+    }
+
+    pub(super) fn is_shown(&self, window: &sdl2::video::Window) -> bool {
+        self.util.is_screen_keyboard_shown(window)
+    }
+
+    /// Matches text input state to the active UI screen.
+    pub(super) fn set_active(&mut self, want: bool, rect: Option<sdl2::rect::Rect>) {
+        if want == self.active {
+            return;
+        }
+        self.active = want;
+        if want {
+            if let Some(r) = rect {
+                self.util.set_rect(r);
+            }
+            self.util.start();
+        } else {
+            self.util.stop();
+        }
+        tracing::debug!("text input requested: {want}");
+    }
+
+    /// Raises the panel unconditionally, even if `active` already says it's up — the stream
+    /// loop never polls `is_shown`, so `active` can't tell a still-open panel from one Back
+    /// silently dismissed underneath it. Closing it again is the TV's job — Back dismisses it
+    /// through webOS's own IME, and this app never calls `stop()` in response to that.
+    pub(super) fn raise(&mut self, rect: sdl2::rect::Rect) {
+        self.active = false;
+        self.set_active(true, Some(rect));
+    }
+
+    /// Stops text input at loop exit.
+    pub(super) fn stop(&mut self) {
+        self.util.stop();
+        self.active = false;
+    }
 }
 
 /// The webOS EXIT gesture (a held Back, delivered as `WEBOS_EXIT_SCANCODE`).
