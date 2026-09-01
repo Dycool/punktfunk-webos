@@ -52,6 +52,150 @@ impl Tick {
     }
 }
 
+/// One log-window's source-vs-delivery cadence. Measured on AU HEADS only: slice-progressive
+/// pieces repeat both the frame index and host PTS, and counting their tails would make a 120 Hz
+/// source look arbitrarily faster merely because its pictures happened to span more FEC blocks.
+///
+/// The useful quantity is `delivery_delta - source_delta`: genuine irregular game cadence appears
+/// in BOTH deltas and therefore cancels, while transport/FEC/scheduler bunching appears only in the
+/// local delivery delta. That lets a 4K120 trace distinguish "host produced ~120, TV received in
+/// bursts" from "TV received clean ~120 but handed NDL late stamps" without a second machine.
+#[derive(Default)]
+struct CadenceWindow {
+    last_host_pts_ns: Option<u64>,
+    last_arrival: Option<Instant>,
+    aus: u64,
+    source_intervals: u64,
+    source_ns: u64,
+    arrival_intervals: u64,
+    arrival_ns: u64,
+    delivery_delta_samples: u64,
+    delivery_delta_abs_ns: u64,
+    delivery_delta_max_ns: u64,
+    max_arrival_gap_ns: u64,
+    repeated_pts: u64,
+    backwards_pts: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CadenceSnapshot {
+    aus: u64,
+    source_intervals: u64,
+    source_ns: u64,
+    arrival_intervals: u64,
+    arrival_ns: u64,
+    delivery_delta_samples: u64,
+    delivery_delta_abs_ns: u64,
+    delivery_delta_max_ns: u64,
+    max_arrival_gap_ns: u64,
+    repeated_pts: u64,
+    backwards_pts: u64,
+}
+
+impl CadenceWindow {
+    fn observe(&mut self, frame: &punktfunk_core::session::Frame) {
+        if frame.part.is_some_and(|part| !part.first) {
+            return;
+        }
+        let now = Instant::now();
+        self.aus = self.aus.saturating_add(1);
+
+        let arrival_delta = self.last_arrival.map(|previous| {
+            u64::try_from(now.duration_since(previous).as_nanos()).unwrap_or(u64::MAX)
+        });
+        if let Some(ns) = arrival_delta {
+            self.arrival_intervals = self.arrival_intervals.saturating_add(1);
+            self.arrival_ns = self.arrival_ns.saturating_add(ns);
+            self.max_arrival_gap_ns = self.max_arrival_gap_ns.max(ns);
+        }
+        self.last_arrival = Some(now);
+
+        let source_delta = match self.last_host_pts_ns {
+            Some(previous) if frame.pts_ns > previous => {
+                let ns = frame.pts_ns - previous;
+                self.source_intervals = self.source_intervals.saturating_add(1);
+                self.source_ns = self.source_ns.saturating_add(ns);
+                Some(ns)
+            }
+            Some(previous) if frame.pts_ns == previous => {
+                self.repeated_pts = self.repeated_pts.saturating_add(1);
+                None
+            }
+            Some(_) => {
+                self.backwards_pts = self.backwards_pts.saturating_add(1);
+                None
+            }
+            None => None,
+        };
+        self.last_host_pts_ns = Some(frame.pts_ns);
+
+        if let (Some(arrival_ns), Some(source_ns)) = (arrival_delta, source_delta) {
+            let distortion = arrival_ns.abs_diff(source_ns);
+            self.delivery_delta_samples = self.delivery_delta_samples.saturating_add(1);
+            self.delivery_delta_abs_ns = self.delivery_delta_abs_ns.saturating_add(distortion);
+            self.delivery_delta_max_ns = self.delivery_delta_max_ns.max(distortion);
+        }
+    }
+
+    /// Reset only the WINDOW counters. Keep the two previous stamps so the first AU after a log
+    /// still contributes an interval instead of creating a blind spot every 15 seconds.
+    fn take(&mut self) -> CadenceSnapshot {
+        let out = CadenceSnapshot {
+            aus: self.aus,
+            source_intervals: self.source_intervals,
+            source_ns: self.source_ns,
+            arrival_intervals: self.arrival_intervals,
+            arrival_ns: self.arrival_ns,
+            delivery_delta_samples: self.delivery_delta_samples,
+            delivery_delta_abs_ns: self.delivery_delta_abs_ns,
+            delivery_delta_max_ns: self.delivery_delta_max_ns,
+            max_arrival_gap_ns: self.max_arrival_gap_ns,
+            repeated_pts: self.repeated_pts,
+            backwards_pts: self.backwards_pts,
+        };
+        self.aus = 0;
+        self.source_intervals = 0;
+        self.source_ns = 0;
+        self.arrival_intervals = 0;
+        self.arrival_ns = 0;
+        self.delivery_delta_samples = 0;
+        self.delivery_delta_abs_ns = 0;
+        self.delivery_delta_max_ns = 0;
+        self.max_arrival_gap_ns = 0;
+        self.repeated_pts = 0;
+        self.backwards_pts = 0;
+        out
+    }
+}
+
+impl CadenceSnapshot {
+    fn source_fps(self) -> f64 {
+        rate_hz(self.source_intervals, self.source_ns)
+    }
+
+    fn arrival_fps(self) -> f64 {
+        rate_hz(self.arrival_intervals, self.arrival_ns)
+    }
+
+    fn mean_delivery_delta_ms(self) -> f64 {
+        mean_ms(self.delivery_delta_abs_ns, self.delivery_delta_samples)
+    }
+}
+
+fn rate_hz(intervals: u64, total_ns: u64) -> f64 {
+    if intervals == 0 || total_ns == 0 {
+        return 0.0;
+    }
+    intervals as f64 * 1_000_000_000.0 / total_ns as f64
+}
+
+fn mean_ms(total_ns: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        return 0.0;
+    }
+    total_ns as f64 / samples as f64 / 1_000_000.0
+}
+
 /// Drives the video thread: transport → [`VideoStage`], plus the counters and the loss/HDR
 /// side-channels that ride the same loop.
 struct VideoPump {
@@ -70,6 +214,10 @@ struct VideoPump {
     /// `hot_thread_ids()` contract says the set is complete only after the first frame, so the
     /// one-shot fleet renice is deferred until a returned frame proves that worker exists.
     hot_threads_boosted: bool,
+    cadence: CadenceWindow,
+    /// `PacingHealth::late_stamps` is cumulative; keep the last logged value so each cadence line
+    /// reports the late-stamp RATE for exactly the same 15-second window as source/arrival timing.
+    last_pacing_late_logged: u64,
     heartbeat: Tick,
     video_log: Tick,
 }
@@ -86,6 +234,8 @@ impl VideoPump {
             drop_credit: 0,
             drop_credit_expiry: None,
             hot_threads_boosted: false,
+            cadence: CadenceWindow::default(),
+            last_pacing_late_logged: 0,
             heartbeat: Tick::new(HEARTBEAT),
             video_log: Tick::new(VIDEO_LOG_INTERVAL),
         }
@@ -133,6 +283,7 @@ impl VideoPump {
             boost_hot_threads(&self.client);
             self.hot_threads_boosted = true;
         }
+        self.cadence.observe(frame);
         self.stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
         self.heartbeat();
 
@@ -202,14 +353,41 @@ impl VideoPump {
         // DEBUG, so it costs a telemetry listener or `TELEMETRY_LEVEL=debug` to see — the
         // on-device file sink is INFO-only (`logger::resolved_level`).
         if self.video_log.due() {
+            let cadence = self.cadence.take();
+            let late_window = pacing.late_stamps.saturating_sub(self.last_pacing_late_logged);
+            self.last_pacing_late_logged = pacing.late_stamps;
+            let late_pct = if cadence.aus == 0 {
+                0.0
+            } else {
+                late_window as f64 * 100.0 / cadence.aus as f64
+            };
             // `late_stamp` is the judder, counted: frames NDL was handed too late to pace. The
             // rest describes the loop that produced them (see `session::timeline::PacingHealth`).
             tracing::debug!(
-                "pacing: late_stamp={} jitter={:.1}ms cushion={:.1}ms reanchors={}",
+                "pacing: late_stamp={} (+{} / {:.1}%) jitter={:.1}ms cushion={:.1}ms reanchors={}",
                 pacing.late_stamps,
+                late_window,
+                late_pct,
                 pacing.jitter_ns as f64 / 1e6,
                 pacing.cushion_ns as f64 / 1e6,
                 pacing.reanchors,
+            );
+            // This line is the 4K120 fork in the road. Source ~120 + arrival well below/bursty
+            // points before NDL (transport/FEC/scheduling); source ~120 + arrival ~120 + late
+            // stamps points at the NDL/presentation side. Because `delivery_delta` subtracts each
+            // source interval from the matching arrival interval, real variable game cadence is
+            // not misdiagnosed as network jitter.
+            tracing::debug!(
+                "cadence: aus={} source={:.2}fps arrival={:.2}fps delivery_delta_mean={:.2}ms \
+                 delivery_delta_max={:.2}ms arrival_gap_max={:.2}ms repeated_pts={} backwards_pts={}",
+                cadence.aus,
+                cadence.source_fps(),
+                cadence.arrival_fps(),
+                cadence.mean_delivery_delta_ms(),
+                cadence.delivery_delta_max_ns as f64 / 1e6,
+                cadence.max_arrival_gap_ns as f64 / 1e6,
+                cadence.repeated_pts,
+                cadence.backwards_pts,
             );
             tracing::debug!(
                 "video: {} frames, parts={}, holding={}, dropped={}, backlog={}, plane_lead={}",
