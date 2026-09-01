@@ -11,25 +11,30 @@ use std::time::{Duration, Instant};
 
 use punktfunk_core::client::NativeClient;
 
-use crate::platform::webos::device::{renice, HOT_THREAD_NICE};
+use crate::platform::webos::device::{renice, renice_to, DATA_PLANE_NICE, HOT_THREAD_NICE};
 
 /// Boosts every thread punktfunk-core registered as hot, and logs whether it worked.
 ///
-/// Summarized at info, not left as per-tid debug lines: a session log that doesn't answer "did the
-/// priority boost actually apply here" hides the difference between the two contention regimes
-/// `docs/NOTES.md`'s renice findings were measured under.
+/// These are the video pump plus core's UDP/FEC data-plane worker. They get a small priority edge
+/// over the vendor decode/audio/clock threads rather than sharing one nice value: at 4K120 a late
+/// transport/FEC burst creates queue debt before the hardware decoder can help, while a decode task
+/// that is briefly pre-empted still has NDL's presentation cushion. This remains ordinary `nice`,
+/// never a realtime scheduler class, and is best-effort on unrooted installs.
 pub(super) fn boost_hot_threads(client: &NativeClient) {
     let (mut reniced, mut failed) = (0u32, 0u32);
     for tid in client.hot_thread_ids() {
-        if renice(tid) {
+        if renice_to(tid, DATA_PLANE_NICE) {
             reniced += 1;
         } else {
             failed += 1;
-            tracing::debug!("setpriority(tid={tid}) failed: {}", std::io::Error::last_os_error());
+            tracing::debug!(
+                "setpriority(tid={tid}, nice={DATA_PLANE_NICE}) failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
     tracing::info!(
-        "hot-thread renice: {reniced} boosted, {failed} failed{}",
+        "hot-thread renice: {reniced} boosted to {DATA_PLANE_NICE}, {failed} failed{}",
         if failed > 0 {
             " (no CAP_SYS_NICE — priorities unchanged)"
         } else {
@@ -46,7 +51,7 @@ pub(super) fn boost_hot_threads(client: &NativeClient) {
 /// themselves) and sit at the default nice 0 despite doing real decode work — confirmed
 /// via live `/proc/<pid>/task` sampling during an active NDL stream (its
 /// `lxvideodec1:src`/`video-src:src` threads), a real contention cost against our own
-/// already-boosted video-pump/data-pump threads on this `SoC`'s 3 cores. Matched by
+/// already-boosted video-pump/data-pump threads on low-core-count TV SoCs. Matched by
 /// suffix, not a fixed name list, so it covers whichever elements the pipeline uses.
 const VENDOR_DECODE_THREAD_SUFFIX: &str = ":src";
 /// How long a decode-thread scan may run with no new match before concluding the
@@ -95,11 +100,11 @@ fn renice_vendor_threads(seen: &mut HashSet<i32>) -> (usize, usize) {
     (found, failed)
 }
 
-/// Renices the active backend's vendor-spawned `GStreamer` pad-task threads, same as this
-/// crate's own hot threads (see [`VENDOR_DECODE_THREAD_SUFFIX`]). Runs on its own thread —
-/// these threads spawn asynchronously sometime after the decoder loads, not synchronously
-/// within the load call, so this polls `/proc/self/task` rather than scanning once, and must
-/// not block the video pump from starting to feed frames while it does.
+/// Renices the active backend's vendor-spawned `GStreamer` pad-task threads. Runs on its own
+/// thread — these threads spawn asynchronously sometime after the decoder loads, not synchronously
+/// within the load call, so this polls `/proc/self/task` rather than scanning once, and must not
+/// block the video pump from starting to feed frames while it does. They deliberately stay at
+/// [`HOT_THREAD_NICE`], one tier below the transport/video pair (see [`boost_hot_threads`]).
 pub(super) fn spawn_vendor_decode_thread_renicer() {
     std::thread::spawn(|| {
         let start = Instant::now();
@@ -121,7 +126,7 @@ pub(super) fn spawn_vendor_decode_thread_renicer() {
         // One summarizing line for the same reason as the hot-thread summary above: whether the
         // boost applied at all is the install-mode question a session log has to answer.
         tracing::info!(
-            "vendor decode threads: {} found, {} boosted",
+            "vendor decode threads: {} found, {} boosted to {HOT_THREAD_NICE}",
             seen.len(),
             seen.len().saturating_sub(failed),
         );
