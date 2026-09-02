@@ -51,7 +51,7 @@ pub(super) fn boost_hot_threads(client: &NativeClient) {
 /// themselves) and sit at the default nice 0 despite doing real decode work — confirmed
 /// via live `/proc/<pid>/task` sampling during an active NDL stream (its
 /// `lxvideodec1:src`/`video-src:src` threads), a real contention cost against our own
-/// already-boosted video-pump/data-pump threads on low-core-count TV SoCs. Matched by
+/// already-boosted video-pump/data-pump threads on low-core-count TV `SoCs`. Matched by
 /// suffix, not a fixed name list, so it covers whichever elements the pipeline uses.
 const VENDOR_DECODE_THREAD_SUFFIX: &str = ":src";
 /// How long a decode-thread scan may run with no new match before concluding the
