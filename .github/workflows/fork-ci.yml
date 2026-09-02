@@ -1,0 +1,71 @@
+name: Fork CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fork-ci.yml'
+      - '*.rs'
+      - '*.toml'
+      - '*.lock'
+      - '*.yml'
+      - 'assets/**'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'src/**'
+      - 'taskfiles/**'
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Install Rust + webOS cross target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabi
+          components: clippy,rustfmt
+
+      - name: Cache Cargo and build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.repository }}-fork-ci-armv7
+          workspaces: |
+            . -> target
+            . -> target-clippy
+
+      - name: Cache webOS toolchain
+        uses: actions/cache@v5
+        with:
+          path: .toolchains
+          key: webos-toolchain-${{ runner.os }}-${{ hashFiles('taskfiles/toolchain.yml') }}
+
+      - name: Install task
+        uses: arduino/setup-task@v3
+        with:
+          version: 3
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Cross-target check
+        run: task check
+
+      - name: Cross-target clippy
+        run: task lint
+        env:
+          CARGO_TARGET_DIR: target-clippy
+
+      - name: Release build
+        run: task build
