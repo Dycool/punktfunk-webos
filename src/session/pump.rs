@@ -131,9 +131,9 @@ impl CadenceWindow {
         let pull_realtime_ns = realtime_ns();
         self.aus = self.aus.saturating_add(1);
 
-        let arrival_delta = self.last_arrival.map(|previous| {
-            u64::try_from(now.duration_since(previous).as_nanos()).unwrap_or(u64::MAX)
-        });
+        let arrival_delta = self
+            .last_arrival
+            .map(|previous| u64::try_from(now.duration_since(previous).as_nanos()).unwrap_or(u64::MAX));
         if let Some(ns) = arrival_delta {
             self.arrival_intervals = self.arrival_intervals.saturating_add(1);
             self.arrival_ns = self.arrival_ns.saturating_add(ns);
@@ -395,8 +395,7 @@ impl VideoPump {
             boost_hot_threads(&self.client);
             self.hot_threads_boosted = true;
         }
-        self.cadence
-            .observe(frame, self.clock_offset.load(Ordering::Relaxed));
+        self.cadence.observe(frame, self.clock_offset.load(Ordering::Relaxed));
         self.stats.bytes.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
         self.heartbeat();
 
